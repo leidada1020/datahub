@@ -1,0 +1,39 @@
+# DataWind + DolphinScheduler 元数据采集 Recipe
+# 使用方式: datahub ingest -c datawind_dolphinscheduler_recipe.yml
+
+# ==================== DataWind 采集 ====================
+source:
+  type: "datawind"
+  config:
+    # DataWind OpenAPI 地址 (火山引擎)
+    api_base: "https://datawind.volcengineapi.com"
+    region: "cn-north-1"
+
+    # 应用凭证 (火山引擎控制台 -> DataWind -> 应用管理 -> OpenAPI)
+    app_id: 0  # TODO: 填入真实 app_id
+    client_id: ""  # TODO: 填入真实 client_id
+    client_secret: ""  # TODO: 填入真实 client_secret
+
+    # 可选配置
+    # proxy_user: ""
+    request_timeout_sec: 180
+    max_workers: 8
+    extract_dim_metrics: true
+
+    # 状态化采集 (自动清理已删除的实体)
+    stateful_ingestion:
+      enabled: true
+      remove_stale_metadata: true
+
+# ==================== Sink: 本地 DataHub ====================
+sink:
+  type: "datahub-rest"
+  config:
+    server: "http://localhost:9080"
+
+# ==================== 处理器 ====================
+# processors:
+#   - type: "simple_add_dataset_tags"
+#     config:
+#       tag_urns:
+#         - "urn:li:tag:DataWind"

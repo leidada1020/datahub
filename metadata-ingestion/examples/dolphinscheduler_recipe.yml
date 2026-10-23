@@ -1,0 +1,29 @@
+# DolphinScheduler 元数据采集 Recipe
+# 使用方式: datahub ingest -c dolphinscheduler_recipe.yml
+
+source:
+  type: "dolphinscheduler"
+  config:
+    # DolphinScheduler REST API 地址
+    api_url: "http://localhost:12345/dolphinscheduler"  # TODO: 填入真实地址
+
+    # API 令牌 (DS 安全中心 -> 令牌管理 -> 创建)
+    token: ""  # TODO: 填入真实 token
+
+    # 可选: 指定项目 code, 不填则采集全部
+    # project_codes:
+    #   - 1
+    #   - 2
+
+    request_timeout_sec: 20
+    extract_task_sql_lineage: true
+
+    # 状态化采集
+    stateful_ingestion:
+      enabled: true
+      remove_stale_metadata: true
+
+sink:
+  type: "datahub-rest"
+  config:
+    server: "http://localhost:9080"
