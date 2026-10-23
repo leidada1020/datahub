@@ -25,9 +25,12 @@ from datahub.metadata.schema_classes import (
     FineGrainedLineageClass,
     FineGrainedLineageDownstreamTypeClass,
     FineGrainedLineageUpstreamTypeClass,
+    OtherSchemaClass,
     OwnerClass,
     OwnershipClass,
     OwnershipTypeClass,
+    SchemaFieldClass,
+    SchemaMetadataClass,
     StatusClass,
     UpstreamLineageClass,
     UpstreamClass,
@@ -195,6 +198,39 @@ class DataWindSource(StatefulIngestionSourceBase):
                 },
             ),
         ).as_workunit()
+
+        # 表结构（列信息）— 暂时关闭，后续调试中文字段名/类型兼容性
+        # if fields:
+        #     schema_fields = []
+        #     for f in fields:
+        #         fname = f.get("name")
+        #         if not fname:
+        #             continue
+        #         business = f.get("business")
+        #         if isinstance(business, list):
+        #             business = ", ".join(str(x) for x in business)
+        #         elif business is None:
+        #             business = ""
+        #         schema_fields.append(
+        #             SchemaFieldClass(
+        #                 fieldPath=fname,
+        #                 type=f.get("type") or "unknown",
+        #                 description=str(business),
+        #                 nativeDataType=f.get("type") or "",
+        #             )
+        #         )
+        #     if schema_fields:
+        #         yield MetadataChangeProposalWrapper(
+        #             entityUrn=dataset_urn,
+        #             aspect=SchemaMetadataClass(
+        #                 schemaName=name,
+        #                 platform="urn:li:dataPlatform:datawind",
+        #                 version=0,
+        #                 hash="",
+        #                 platformSchema=OtherSchemaClass(rawSchema=""),
+        #                 fields=schema_fields,
+        #             ),
+        #         ).as_workunit()
 
         owner_email = ds.get("owner")
         if owner_email:
