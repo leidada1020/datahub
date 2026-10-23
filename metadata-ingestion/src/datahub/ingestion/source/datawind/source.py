@@ -21,6 +21,9 @@ from datahub.metadata.schema_classes import (
     ChartInfoClass,
     DashboardInfoClass,
     DatasetPropertiesClass,
+    FineGrainedLineageClass,
+    FineGrainedLineageDownstreamTypeClass,
+    FineGrainedLineageUpstreamTypeClass,
     OwnerClass,
     OwnershipClass,
     OwnerTypeClass,
@@ -28,6 +31,7 @@ from datahub.metadata.schema_classes import (
     UpstreamLineageClass,
     UpstreamClass,
 )
+from datahub.sql_parsing.sqlglot_lineage import create_lineage_sql_parsed_result
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +40,7 @@ class DataWindSourceReport(SourceReport):
     total_datasets: int = 0
     datasets_with_sql: int = 0
     datasets_with_lineage: int = 0
+    datasets_with_column_lineage: int = 0
     folders_discovered: int = 0
     total_dashboards: int = 0
     total_charts: int = 0
@@ -201,9 +206,12 @@ class DataWindSource(StatefulIngestionSourceBase):
                 ),
             ).as_workunit()
 
-        # 上游 Doris 表血缘
+        # --- Upstream Lineage (API sourceTableList + SQLGlot 解析) ---
+        upstream_urn_set: set = set()
+        fine_grained_lineages: List[FineGrainedLineageClass] = []
+
+        # 1) API 直接返回的上游表
         if upstreams_str:
-            upstreams = []
             for tbl in upstreams_str.split(","):
                 tbl = tbl.strip()
                 if not tbl or "." not in tbl:
@@ -212,13 +220,62 @@ class DataWindSource(StatefulIngestionSourceBase):
                 upstream_urn = builder.make_dataset_urn(
                     "doris", f"{db_name}.{table_name}", "PROD"
                 )
-                upstreams.append(UpstreamClass(dataset=upstream_urn, type="TRANSFORMED"))
-            if upstreams:
-                self.report.datasets_with_lineage += 1
-                yield MetadataChangeProposalWrapper(
-                    entityUrn=dataset_urn,
-                    aspect=UpstreamLineageClass(upstreams=upstreams),
-                ).as_workunit()
+                upstream_urn_set.add(upstream_urn)
+
+        # 2) SQLGlot 解析加工 SQL, 补充上游表 + 列级血缘
+        if sql:
+            try:
+                parse_result = create_lineage_sql_parsed_result(
+                    query=sql,
+                    default_db=None,
+                    platform="doris",
+                    platform_instance=None,
+                    env="PROD",
+                    override_dialect="mysql",
+                    generate_column_lineage=True,
+                )
+                # 合并 SQL 解析出的输入表
+                for urn in parse_result.in_tables:
+                    upstream_urn_set.add(str(urn))
+
+                # 列级血缘: Doris 字段 -> DataWind 数据集字段
+                if parse_result.column_lineage:
+                    for cll in parse_result.column_lineage:
+                        upstream_field_urns = []
+                        for up_col in cll.upstreams:
+                            upstream_field_urns.append(str(up_col.table) + "." + up_col.column)
+                        if not upstream_field_urns:
+                            continue
+                        downstream_field_urn = builder.make_schema_field_urn(
+                            dataset_urn, cll.downstream.column
+                        )
+                        fine_grained_lineages.append(
+                            FineGrainedLineageClass(
+                                upstreamType=FineGrainedLineageUpstreamTypeClass.FIELD_SET,
+                                upstreams=upstream_field_urns,
+                                downstreamType=FineGrainedLineageDownstreamTypeClass.FIELD,
+                                downstreams=[downstream_field_urn],
+                            )
+                        )
+                    if fine_grained_lineages:
+                        self.report.datasets_with_column_lineage += 1
+            except Exception as e:
+                logger.debug("SQL lineage parse failed for dataset %s: %s", dsid, e)
+
+        # 生成最终的上游血缘
+        if upstream_urn_set:
+            upstreams = [
+                UpstreamClass(dataset=urn, type="TRANSFORMED")
+                for urn in sorted(upstream_urn_set)
+            ]
+            self.report.datasets_with_lineage += 1
+            yield MetadataChangeProposalWrapper(
+                entityUrn=dataset_urn,
+                aspect=UpstreamLineageClass(
+                    upstreams=upstreams,
+                    fineGrainedLineages=fine_grained_lineages or None,
+                ),
+            ).as_workunit()
 
     # ---------- Dashboard ----------
     def _process_dashboard(
