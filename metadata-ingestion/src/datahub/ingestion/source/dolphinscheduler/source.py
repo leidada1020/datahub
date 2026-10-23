@@ -1,7 +1,6 @@
 import json
 import logging
-import re
-from typing import Iterable, List, Optional, Set, Tuple
+from typing import Iterable, List, Optional
 
 import datahub.emitter.mce_builder as builder
 from datahub.emitter.mcp import MetadataChangeProposalWrapper
@@ -25,6 +24,7 @@ from datahub.metadata.schema_classes import (
     DataJobInputOutputClass,
     StatusClass,
 )
+from datahub.sql_parsing.sqlglot_lineage import create_lineage_sql_parsed_result
 
 logger = logging.getLogger(__name__)
 
@@ -223,20 +223,13 @@ class DolphinSchedulerSource(StatefulIngestionSourceBase):
             ),
         ).as_workunit()
 
-        # --- SQL 血缘解析 ---
-        input_tables: List[str] = []
-        output_tables: List[str] = []
+        # --- SQL 血缘解析 (基于 DataHub SQLGlot) ---
+        input_urns: List[str] = []
+        output_urns: List[str] = []
         if sql and self.config.extract_task_sql_lineage:
-            input_tables, output_tables = self._parse_sql_lineage(sql)
-            if input_tables or output_tables:
+            input_urns, output_urns = self._parse_sql_lineage(sql)
+            if input_urns or output_urns:
                 self.report.jobs_with_sql_lineage += 1
-
-        input_urns = [
-            builder.make_dataset_urn("doris", t, "PROD") for t in input_tables
-        ]
-        output_urns = [
-            builder.make_dataset_urn("doris", t, "PROD") for t in output_tables
-        ]
 
         yield MetadataChangeProposalWrapper(
             entityUrn=job_urn,
@@ -247,44 +240,30 @@ class DolphinSchedulerSource(StatefulIngestionSourceBase):
             ),
         ).as_workunit()
 
-    @staticmethod
-    def _parse_sql_lineage(sql: str) -> Tuple[List[str], List[str]]:
-        """简易 SQL 表级血缘解析: 提取 INSERT/CREATE 的目标表和 FROM/JOIN 的源表。
+    def _parse_sql_lineage(self, sql: str) -> tuple:
+        """使用 DataHub 自带的 SQLGlot 解析器提取 SQL 表级血缘。
 
-        简化实现, 后续可替换为 SQLGlot。
+        返回 (input_urns, output_urns), 元素为 DataHub dataset URN 字符串。
+        解析失败时返回空列表, 不中断采集。
         """
-        inputs: Set[str] = set()
-        outputs: Set[str] = set()
-
-        sql_upper = sql.upper()
-
-        # INSERT INTO table
-        m = re.search(
-            r"INSERT\s+(?:OVERWRITE\s+|INTO\s+|INTO\s+TABLE\s+)([\w.]+)",
-            sql_upper,
-        )
-        if m:
-            outputs.add(m.group(1).lower())
-
-        # CREATE TABLE ... AS
-        m = re.search(
-            r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([\w.]+)",
-            sql_upper,
-        )
-        if m:
-            outputs.add(m.group(1).lower())
-
-        # FROM table
-        for m in re.finditer(r"FROM\s+([\w.]+)", sql_upper):
-            t = m.group(1).lower()
-            if t not in ("select",):
-                inputs.add(t)
-
-        # JOIN table
-        for m in re.finditer(r"JOIN\s+([\w.]+)", sql_upper):
-            inputs.add(m.group(1).lower())
-
-        # 排除输出表不出现在输入中
-        inputs -= outputs
-
-        return sorted(inputs), sorted(outputs)
+        try:
+            result = create_lineage_sql_parsed_result(
+                query=sql,
+                default_db=None,
+                platform="doris",
+                platform_instance=None,
+                env="PROD",
+                override_dialect="mysql",  # Doris 兼容 MySQL 方言
+                generate_column_lineage=False,
+            )
+            # in_tables / out_tables 已经是 URN 对象列表
+            input_urns = [str(urn) for urn in result.in_tables]
+            output_urns = [str(urn) for urn in result.out_tables]
+            logger.debug(
+                "SQL lineage parsed: %d inputs, %d outputs",
+                len(input_urns), len(output_urns),
+            )
+            return input_urns, output_urns
+        except Exception as e:
+            logger.debug("SQL lineage parse failed: %s", e)
+            return [], []
