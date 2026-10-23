@@ -179,6 +179,48 @@ class DataWindClient:
         dims = data.get("dimMetList") or []
         return dims if isinstance(dims, list) else []
 
+    # ---------- 仪表盘 (Dashboard) ----------
+    def list_dashboards(self, root_id: Optional[int] = None) -> List[dict]:
+        """仪表盘列表. root_id: 0=公共, 1=个人, None=全部"""
+        body: dict = {"appId": self.app_id}
+        if root_id is not None:
+            body["rootId"] = root_id
+        r = self._http_json(
+            "/api/v3/open/metadata/dashboardList", "POST", body, timeout=120
+        )
+        return r.get("data") or []
+
+    # ---------- 图表 (Chart/Report) ----------
+    def list_reports(self) -> List[dict]:
+        """图表列表"""
+        r = self._http_json(
+            "/api/v3/open/metadata/reportList",
+            "POST",
+            {"appId": self.app_id},
+            timeout=120,
+        )
+        return r.get("data") or []
+
+    def dashboard_reports(self) -> Dict[str, List[dict]]:
+        """仪表盘 -> 包含的图表映射. 返回 {dashboard_id: [chart, ...]}"""
+        r = self._http_json(
+            "/api/v3/open/metadata/dashboardReport",
+            "POST",
+            {"appId": self.app_id},
+            timeout=120,
+        )
+        return r.get("data") or {}
+
+    def report_datasets(self) -> Dict[str, List[dict]]:
+        """图表 -> 关联的数据集映射. 返回 {report_id: [dataset, ...]}"""
+        r = self._http_json(
+            "/api/v3/open/metadata/reportDataset",
+            "POST",
+            {"appId": self.app_id, "needSyncInfo": False, "needUpstreamInfo": True},
+            timeout=120,
+        )
+        return r.get("data") or {}
+
     # ---------- 并发批量 ----------
     def batch_fetch(self, ids: List[int], fetch_fn) -> Dict[int, Any]:
         out: Dict[int, Any] = {}
