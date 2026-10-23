@@ -26,7 +26,7 @@ from datahub.metadata.schema_classes import (
     FineGrainedLineageUpstreamTypeClass,
     OwnerClass,
     OwnershipClass,
-    OwnerTypeClass,
+    OwnershipTypeClass,
     StatusClass,
     UpstreamLineageClass,
     UpstreamClass,
@@ -49,7 +49,7 @@ class DataWindSourceReport(SourceReport):
 
 @platform_name("DataWind")
 @config_class(DataWindConfig)
-@support_status(SupportStatus.INCUBATING)
+@support_status(SupportStatus.ALPHA)
 class DataWindSource(StatefulIngestionSourceBase):
     """DataWind (火山引擎 BI) 元数据连接器。
 
@@ -78,6 +78,9 @@ class DataWindSource(StatefulIngestionSourceBase):
 
     def get_platform_display_name(self) -> str:
         return "DataWind"
+
+    def get_report(self) -> DataWindSourceReport:
+        return self.report
 
     # ---------- 主入口 ----------
     def get_workunits(self) -> Iterable[MetadataWorkUnit]:
@@ -200,7 +203,7 @@ class DataWindSource(StatefulIngestionSourceBase):
                     owners=[
                         OwnerClass(
                             owner=builder.make_user_urn(owner_email.split("@")[0]),
-                            type=OwnerTypeClass.DATAOWNER,
+                            type=OwnershipTypeClass.DATAOWNER,
                         )
                     ]
                 ),
@@ -351,7 +354,7 @@ class DataWindSource(StatefulIngestionSourceBase):
                         owners=[
                             OwnerClass(
                                 owner=builder.make_user_urn(chart_owner.split("@")[0]),
-                                type=OwnerTypeClass.DATAOWNER,
+                                type=OwnershipTypeClass.DATAOWNER,
                             )
                         ]
                     ),
@@ -379,7 +382,7 @@ class DataWindSource(StatefulIngestionSourceBase):
                     owners=[
                         OwnerClass(
                             owner=builder.make_user_urn(dash_owner.split("@")[0]),
-                            type=OwnerTypeClass.DATAOWNER,
+                            type=OwnershipTypeClass.DATAOWNER,
                         )
                     ]
                 ),

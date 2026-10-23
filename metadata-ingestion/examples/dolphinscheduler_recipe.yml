@@ -5,15 +5,10 @@ source:
   type: "dolphinscheduler"
   config:
     # DolphinScheduler REST API 地址
-    api_url: "http://localhost:12345/dolphinscheduler"  # TODO: 填入真实地址
+    api_url: "http://192.168.2.15:12345/dolphinscheduler"
 
-    # API 令牌 (DS 安全中心 -> 令牌管理 -> 创建)
-    token: ""  # TODO: 填入真实 token
-
-    # 可选: 指定项目 code, 不填则采集全部
-    # project_codes:
-    #   - 1
-    #   - 2
+    # API 令牌
+    token: "25d8cca5b5baa051a9ccadd2e833ba92"
 
     request_timeout_sec: 20
     extract_task_sql_lineage: true
@@ -26,4 +21,4 @@ source:
 sink:
   type: "datahub-rest"
   config:
-    server: "http://localhost:9080"
+    server: "http://localhost:8080"

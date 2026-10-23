@@ -38,7 +38,7 @@ class DolphinSchedulerSourceReport(SourceReport):
 
 @platform_name("DolphinScheduler")
 @config_class(DolphinSchedulerConfig)
-@support_status(SupportStatus.INCUBATING)
+@support_status(SupportStatus.ALPHA)
 class DolphinSchedulerSource(StatefulIngestionSourceBase):
     """DolphinScheduler 调度系统元数据连接器。
 
@@ -65,6 +65,9 @@ class DolphinSchedulerSource(StatefulIngestionSourceBase):
 
     def get_platform_display_name(self) -> str:
         return "DolphinScheduler"
+
+    def get_report(self) -> DolphinSchedulerSourceReport:
+        return self.report
 
     def get_workunits(self) -> Iterable[MetadataWorkUnit]:
         logger.info("Starting DolphinScheduler ingestion...")

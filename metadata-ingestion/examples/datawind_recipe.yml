@@ -6,21 +6,21 @@ source:
   type: "datawind"
   config:
     # DataWind OpenAPI 地址 (火山引擎)
-    api_base: "https://datawind.volcengineapi.com"
-    region: "cn-north-1"
+    api_base: "https://console.volcengine.com/bi/datawind/aeolus"
+    region: "cn-beijing"
 
-    # 应用凭证 (火山引擎控制台 -> DataWind -> 应用管理 -> OpenAPI)
-    app_id: 0  # TODO: 填入真实 app_id
-    client_id: ""  # TODO: 填入真实 client_id
-    client_secret: ""  # TODO: 填入真实 client_secret
+    # 应用凭证
+    app_id: 20074764
+    client_id: "c28c6f2a46766522edab67732e7c1cdf"
+    client_secret: "16vsL5vmVEO0yvxr"
+    proxy_user: "liyunze@2105712913"
 
     # 可选配置
-    # proxy_user: ""
     request_timeout_sec: 180
     max_workers: 8
     extract_dim_metrics: true
 
-    # 状态化采集 (自动清理已删除的实体)
+    # 状态化采集
     stateful_ingestion:
       enabled: true
       remove_stale_metadata: true
@@ -29,7 +29,7 @@ source:
 sink:
   type: "datahub-rest"
   config:
-    server: "http://localhost:9080"
+    server: "http://localhost:8080"
 
 # ==================== 处理器 ====================
 # processors:
