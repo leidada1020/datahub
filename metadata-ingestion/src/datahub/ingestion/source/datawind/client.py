@@ -73,6 +73,7 @@ class DataWindClient:
                 "expire": 3600,
             }
         }
+        print(f"[DEBUG] clientId={self.cfg.client_id}, secret={self.cfg.client_secret.get_secret_value()[:8]}..., proxyUser={self.cfg.proxy_user}")
         r = self._http_json(
             "/api/v3/openapi/jwtToken", "POST", body, timeout=60, with_auth=False
         )

@@ -18,6 +18,7 @@ from datahub.ingestion.source.state.stateful_ingestion_base import (
     StatefulIngestionSourceBase,
 )
 from datahub.metadata.schema_classes import (
+    ChangeAuditStampsClass,
     ChartInfoClass,
     DashboardInfoClass,
     DatasetPropertiesClass,
@@ -335,13 +336,11 @@ class DataWindSource(StatefulIngestionSourceBase):
             yield MetadataChangeProposalWrapper(
                 entityUrn=chart_urn,
                 aspect=ChartInfoClass(
-                    name=chart_name,
                     title=chart_name,
                     description="",
-                    lastModified=chart.get("mtime") or "",
+                    lastModified=ChangeAuditStampsClass(),
                     externalUrl=chart.get("url") or "",
-                    inputDatasets=input_urns,
-                    inputs=[],
+                    inputs=input_urns,
                     access="PUBLIC",
                 ),
             ).as_workunit()
@@ -364,13 +363,13 @@ class DataWindSource(StatefulIngestionSourceBase):
         yield MetadataChangeProposalWrapper(
             entityUrn=dashboard_urn,
             aspect=DashboardInfoClass(
-                name=name,
+                title=name,
                 description="",
                 externalUrl=dash.get("url") or "",
-                datasetUrns=dashboard_dataset_urns,
+                datasets=dashboard_dataset_urns,
                 charts=chart_urns,
                 access="PUBLIC",
-                lastModified=dash.get("mtime") or "",
+                lastModified=ChangeAuditStampsClass(),
             ),
         ).as_workunit()
 

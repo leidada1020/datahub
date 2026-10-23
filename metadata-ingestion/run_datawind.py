@@ -14,9 +14,9 @@ config = {
             "api_base": "https://console.volcengine.com/bi/datawind/aeolus",
             "region": "cn-beijing",
             "app_id": 20074764,
-            "client_id": "c28c6f2a46766522edab67732e7c1cdf",
-            "client_secret": "16vsL5vmVEO0yvxr",
-            "proxy_user": "liyunze",
+            "client_id": "892af4444b6321e72e9ab23bf39e9f07",
+            "client_secret": "f7d85be463dc7560c78c2782c9249312",
+            "proxy_user": "liyunze@2105712913",
             "request_timeout_sec": 180,
             "max_workers": 8,
             "extract_dim_metrics": True,
@@ -31,6 +31,7 @@ config = {
 }
 
 print("Starting DataWind ingestion...")
+print("Config:", config["source"]["config"].get("client_id"), config["source"]["config"].get("client_secret"))
 pipeline = Pipeline.create(config)
 pipeline.run()
 result = pipeline.raise_from_status()
