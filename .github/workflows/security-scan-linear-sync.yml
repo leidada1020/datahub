@@ -684,7 +684,7 @@ jobs:
 
       - name: Install Grype
         id: grype-install
-        uses: anchore/scan-action/download-grype@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2
+        uses: anchore/scan-action/download-grype@27805bf3b4e84b4a5c980df22ed233c00390a439
         with:
           grype-version: ${{ vars.GRYPE_CLI_VERSION || 'v0.111.1' }}
 
