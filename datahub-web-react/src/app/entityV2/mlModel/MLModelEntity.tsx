@@ -1,0 +1,288 @@
+import { Cube } from '@phosphor-icons/react/dist/csr/Cube';
+import { ListBullets } from '@phosphor-icons/react/dist/csr/ListBullets';
+import { TreeStructure } from '@phosphor-icons/react/dist/csr/TreeStructure';
+import { Warning } from '@phosphor-icons/react/dist/csr/Warning';
+import i18next from 'i18next';
+import * as React from 'react';
+
+import { GenericEntityProperties } from '@app/entity/shared/types';
+import { Entity, EntityCapabilityType, IconStyleType, PreviewType } from '@app/entityV2/Entity';
+import { Preview } from '@app/entityV2/mlModel/preview/Preview';
+import { EntityMenuItems } from '@app/entityV2/shared/EntityDropdown/EntityMenuActions';
+import { TYPE_ICON_CLASS_NAME } from '@app/entityV2/shared/components/subtypes';
+import { EntityTabPath } from '@app/entityV2/shared/constants';
+import { getDataForEntityType } from '@app/entityV2/shared/containers/profile/entityData';
+import { lazyProfileComponent } from '@app/entityV2/shared/lazyEntityProfile';
+import {
+    DataProductSection,
+    DocumentationTab,
+    EntityProfile,
+    IncidentTab,
+    LineageTab,
+    PropertiesTab,
+    SidebarAboutSection,
+    SidebarApplicationSection,
+    SidebarDomainSection,
+    SidebarEntityHeader,
+    SidebarGlossaryTermsSection,
+    SidebarNotesSection,
+    SidebarOwnerSection,
+    SidebarStructuredProperties,
+    SidebarTagsSection,
+    StatusSection,
+} from '@app/entityV2/shared/profileChunks';
+import { SidebarTitleActionType, isOutputPort } from '@app/entityV2/shared/utils';
+
+import { useGetMlModelQuery } from '@graphql/mlModel.generated';
+import { EntityType, MlModel, SearchResult } from '@types';
+
+const MLModelGroupsTab = lazyProfileComponent(
+    'MLModelGroupsTab',
+    () => import('@app/entityV2/mlModel/profile/MLModelGroupsTab'),
+);
+const MLModelSummary = lazyProfileComponent(
+    'MLModelSummary',
+    () => import('@app/entityV2/mlModel/profile/MLModelSummary'),
+);
+const MlModelFeaturesTab = lazyProfileComponent(
+    'MlModelFeaturesTab',
+    () => import('@app/entityV2/mlModel/profile/MlModelFeaturesTab'),
+);
+
+const headerDropdownItems = new Set([
+    EntityMenuItems.SHARE,
+    EntityMenuItems.UPDATE_DEPRECATION,
+    EntityMenuItems.RAISE_INCIDENT,
+    EntityMenuItems.ANNOUNCE,
+    EntityMenuItems.LINK_VERSION,
+]);
+
+/**
+ * Definition of the DataHub MlModel entity.
+ */
+export class MLModelEntity implements Entity<MlModel> {
+    type: EntityType = EntityType.Mlmodel;
+
+    icon = (fontSize?: number, styleType?: IconStyleType, color?: string) => {
+        return (
+            <Cube
+                className={TYPE_ICON_CLASS_NAME}
+                size={fontSize || 14}
+                color={color || 'currentColor'}
+                weight={styleType === IconStyleType.HIGHLIGHT ? 'fill' : 'regular'}
+            />
+        );
+    };
+
+    isSearchEnabled = () => true;
+
+    isBrowseEnabled = () => true;
+
+    isLineageEnabled = () => true;
+
+    getAutoCompleteFieldName = () => 'name';
+
+    getGraphName = () => 'mlModel';
+
+    getPathName = () => 'mlModels';
+
+    getEntityName = () => i18next.t('entity.types:mlModel.name');
+
+    getCollectionName = () => i18next.t('entity.types:mlModel.namePlural');
+
+    getOverridePropertiesFromEntity = (mlModel?: MlModel | null): GenericEntityProperties => {
+        return {
+            // eslint-disable-next-line @typescript-eslint/dot-notation
+            name: mlModel && this.displayName(mlModel),
+            externalUrl: mlModel?.properties?.externalUrl,
+        };
+    };
+
+    useEntityQuery = useGetMlModelQuery;
+
+    renderProfile = (urn: string) => (
+        <EntityProfile
+            urn={urn}
+            key={urn}
+            entityType={EntityType.Mlmodel}
+            useEntityQuery={useGetMlModelQuery}
+            getOverrideProperties={this.getOverridePropertiesFromEntity}
+            headerDropdownItems={headerDropdownItems}
+            tabs={[
+                {
+                    name: i18next.t('entity.types:tab.summary'),
+                    path: EntityTabPath.SUMMARY,
+                    component: MLModelSummary,
+                },
+                {
+                    name: i18next.t('entity.types:tab.documentation'),
+                    path: EntityTabPath.DOCUMENTATION,
+                    component: DocumentationTab,
+                },
+                {
+                    name: i18next.t('entity.types:tab.lineage'),
+                    path: EntityTabPath.LINEAGE,
+                    component: LineageTab,
+                    icon: TreeStructure,
+                    supportsFullsize: true,
+                },
+                {
+                    name: i18next.t('entity.types:tab.properties'),
+                    path: EntityTabPath.PROPERTIES,
+                    component: PropertiesTab,
+                },
+                {
+                    name: i18next.t('entity.types:group.name'),
+                    path: EntityTabPath.GROUP,
+                    component: MLModelGroupsTab,
+                },
+                {
+                    name: i18next.t('entity.types:mlFeature.namePlural'),
+                    path: EntityTabPath.FEATURES,
+                    component: MlModelFeaturesTab,
+                },
+                {
+                    name: i18next.t('entity.types:tab.incidents'),
+                    path: EntityTabPath.INCIDENTS,
+                    icon: Warning,
+                    component: IncidentTab,
+                    getCount: (_, mlModel) => {
+                        return mlModel?.mlModel?.activeIncidents?.total;
+                    },
+                },
+            ]}
+            sidebarSections={this.getSidebarSections()}
+            sidebarTabs={this.getSidebarTabs()}
+        />
+    );
+
+    getSidebarSections = () => [
+        {
+            component: SidebarEntityHeader,
+        },
+        {
+            component: SidebarAboutSection,
+        },
+        {
+            component: SidebarNotesSection,
+        },
+        {
+            component: SidebarOwnerSection,
+        },
+        {
+            component: SidebarDomainSection,
+        },
+        {
+            component: SidebarApplicationSection,
+        },
+        {
+            component: DataProductSection,
+        },
+        {
+            component: SidebarTagsSection,
+        },
+        {
+            component: SidebarGlossaryTermsSection,
+        },
+        {
+            component: SidebarStructuredProperties,
+        },
+        {
+            component: StatusSection,
+        },
+    ];
+
+    getSidebarTabs = () => [
+        {
+            name: i18next.t('entity.types:tab.lineage'),
+            component: LineageTab,
+            description: i18next.t('entity.types:sidebar.lineageDescription'),
+            icon: TreeStructure,
+            properties: {
+                actionType: SidebarTitleActionType.LineageExplore,
+            },
+        },
+        {
+            name: i18next.t('entity.types:tab.properties'),
+            component: PropertiesTab,
+            description: i18next.t('entity.types:sidebar.propertiesDescription'),
+            icon: ListBullets,
+        },
+    ];
+
+    renderPreview = (previewType: PreviewType, data: MlModel) => {
+        const genericProperties = this.getGenericEntityProperties(data);
+        return (
+            <Preview
+                data={genericProperties}
+                model={data}
+                headerDropdownItems={headerDropdownItems}
+                previewType={previewType}
+            />
+        );
+    };
+
+    renderSearch = (result: SearchResult) => {
+        const data = result.entity as MlModel;
+        const genericProperties = this.getGenericEntityProperties(data);
+        return (
+            <Preview
+                data={genericProperties}
+                model={data}
+                degree={(result as any).degree}
+                paths={(result as any).paths}
+                isOutputPort={isOutputPort(result)}
+                headerDropdownItems={headerDropdownItems}
+                previewType={PreviewType.SEARCH}
+            />
+        );
+    };
+
+    getLineageVizConfig = (entity: MlModel) => {
+        return {
+            urn: entity.urn,
+            name: entity && this.displayName(entity),
+            type: EntityType.Mlmodel,
+            icon: entity.platform?.properties?.logoUrl || undefined,
+            platform: entity.platform,
+            deprecation: entity?.deprecation,
+        };
+    };
+
+    displayName = (data: MlModel) => {
+        // eslint-disable-next-line @typescript-eslint/dot-notation
+        return data.properties?.['propertiesName'] || data.properties?.name || data.name || data.urn;
+    };
+
+    createdTime = (data: MlModel) => {
+        return data?.properties?.created?.time || data?.properties?.date;
+    };
+
+    getGenericEntityProperties = (mlModel: MlModel) => {
+        return getDataForEntityType({
+            data: mlModel,
+            entityType: this.type,
+            getOverrideProperties: this.getOverridePropertiesFromEntity,
+        });
+    };
+
+    supportedCapabilities = () => {
+        return new Set([
+            EntityCapabilityType.OWNERS,
+            EntityCapabilityType.GLOSSARY_TERMS,
+            EntityCapabilityType.TAGS,
+            EntityCapabilityType.DOMAINS,
+            EntityCapabilityType.DEPRECATION,
+            EntityCapabilityType.SOFT_DELETE,
+            EntityCapabilityType.DATA_PRODUCTS,
+            EntityCapabilityType.LINEAGE,
+            EntityCapabilityType.APPLICATIONS,
+            EntityCapabilityType.RELATED_DOCUMENTS,
+            EntityCapabilityType.FORMS,
+        ]);
+    };
+
+    getPlatformProperties = (data: MlModel) => {
+        return data?.platform;
+    };
+}

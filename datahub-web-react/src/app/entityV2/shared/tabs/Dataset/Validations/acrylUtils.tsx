@@ -1,0 +1,268 @@
+import { Plugs } from '@phosphor-icons/react/dist/csr/Plugs';
+import i18next from 'i18next';
+import React from 'react';
+import styled from 'styled-components';
+
+import { GenericEntityProperties } from '@app/entity/shared/types';
+import { AssertionGroup, AssertionStatusSummary } from '@app/entityV2/shared/tabs/Dataset/Validations/acrylTypes';
+import { sortAssertions } from '@app/entityV2/shared/tabs/Dataset/Validations/assertionUtils';
+import { ASSERTION_TYPE_TO_ICON_MAP } from '@src/app/entityV2/shared/tabs/Dataset/Validations/shared/constant';
+import { GetDatasetAssertionsWithRunEventsQuery } from '@src/graphql/dataset.generated';
+
+import { Assertion, AssertionResultType, AssertionType, EntityType } from '@types';
+
+const StyledApiOutlined = styled(Plugs)`
+    && {
+        margin: 0px;
+        padding: 0px;
+        margin-right: 8px;
+        font-size: 18px;
+    }
+`;
+
+const getStyledIconComponent = (type: AssertionType) => {
+    const IconComponent = ASSERTION_TYPE_TO_ICON_MAP[type];
+
+    // Wrap the JSX element in a styled div
+    const StyledIcon = styled.div`
+        margin: 0;
+        padding: 0;
+        margin-right: 8px;
+        font-size: 18px;
+        display: inline-flex;
+        align-items: center;
+    `;
+
+    // Return the styled wrapper with the icon inside
+    return () => <StyledIcon>{IconComponent}</StyledIcon>;
+};
+
+export const ASSERTION_INFO = [
+    {
+        get name() {
+            return i18next.t('entity.profile.validations:assertionType.freshness');
+        },
+        get description() {
+            return i18next.t('entity.profile.validations:assertionTypeDescription.freshness');
+        },
+        icon: React.createElement(getStyledIconComponent(AssertionType.Freshness)),
+        type: AssertionType.Freshness,
+        entityTypes: [EntityType.Dataset],
+    },
+    {
+        get name() {
+            return i18next.t('entity.profile.validations:assertionType.volume');
+        },
+        get description() {
+            return i18next.t('entity.profile.validations:assertionTypeDescription.volume');
+        },
+        icon: React.createElement(getStyledIconComponent(AssertionType.Volume)),
+        type: AssertionType.Volume,
+        entityTypes: [EntityType.Dataset],
+    },
+    {
+        get name() {
+            return i18next.t('entity.profile.validations:assertionType.column');
+        },
+        get description() {
+            return i18next.t('entity.profile.validations:assertionTypeDescription.column');
+        },
+        icon: React.createElement(getStyledIconComponent(AssertionType.Field)),
+        type: AssertionType.Field,
+        entityTypes: [EntityType.Dataset],
+    },
+    {
+        get name() {
+            return i18next.t('entity.profile.validations:assertionType.schema');
+        },
+        get description() {
+            return i18next.t('entity.profile.validations:assertionTypeDescription.schema');
+        },
+        icon: React.createElement(getStyledIconComponent(AssertionType.DataSchema)),
+        type: AssertionType.DataSchema,
+        entityTypes: [EntityType.Dataset],
+    },
+    {
+        get name() {
+            return i18next.t('entity.profile.validations:assertionType.sql');
+        },
+        get description() {
+            return i18next.t('entity.profile.validations:assertionTypeDescription.sql');
+        },
+        icon: React.createElement(getStyledIconComponent(AssertionType.Sql)),
+        type: AssertionType.Sql,
+        entityTypes: [EntityType.Dataset],
+    },
+    {
+        get name() {
+            return i18next.t('entity.profile.validations:assertionType.custom');
+        },
+        get description() {
+            return i18next.t('entity.profile.validations:assertionTypeDescription.custom');
+        },
+        icon: React.createElement(getStyledIconComponent(AssertionType.Custom)),
+        type: AssertionType.Custom,
+        entityTypes: [EntityType.Dataset],
+    },
+    {
+        get name() {
+            return i18next.t('entity.profile.validations:assertionType.other');
+        },
+        get description() {
+            return i18next.t('entity.profile.validations:assertionTypeDescription.other');
+        },
+        icon: React.createElement(getStyledIconComponent(AssertionType.Dataset)),
+        type: AssertionType.Dataset,
+        entityTypes: [EntityType.Dataset],
+    },
+];
+
+const ASSERTION_TYPE_TO_INFO = new Map();
+ASSERTION_INFO.forEach((info) => {
+    ASSERTION_TYPE_TO_INFO.set(info.type, info);
+});
+
+export const getAssertionGroupName = (type: string): string => {
+    return ASSERTION_TYPE_TO_INFO.has(type) ? ASSERTION_TYPE_TO_INFO.get(type).name : type;
+};
+
+export const getAssertionGroupTypeIcon = (type: string) => {
+    return ASSERTION_TYPE_TO_INFO.has(type) ? ASSERTION_TYPE_TO_INFO.get(type).icon : <StyledApiOutlined />;
+};
+
+export const extractAssertionsFromQuery = (
+    queryData?: GetDatasetAssertionsWithRunEventsQuery,
+): Assertion[] | undefined => {
+    return queryData?.dataset?.assertions?.assertions?.map((assertion) => ({
+        ...(assertion as Assertion),
+    }));
+};
+
+/**
+ * Returns a status summary for the assertions associated with a Dataset.
+ *
+ * @param assertions The assertions to extract the summary for
+ */
+export const getAssertionsSummary = (assertions: Assertion[]): AssertionStatusSummary => {
+    const summary = {
+        passing: 0,
+        failing: 0,
+        erroring: 0,
+        initializing: 0,
+        notRunning: 0,
+        total: 0,
+        totalAssertions: assertions.length,
+    };
+    assertions.forEach((assertion) => {
+        if ((assertion.runEvents?.runEvents?.length || 0) > 0) {
+            const mostRecentRun = assertion.runEvents?.runEvents?.[0];
+            const resultType = mostRecentRun?.result?.type;
+            if (AssertionResultType.Success === resultType) {
+                summary.passing++;
+            }
+            if (AssertionResultType.Failure === resultType) {
+                summary.failing++;
+            }
+            if (AssertionResultType.Error === resultType) {
+                summary.erroring++;
+            }
+            if (AssertionResultType.Init === resultType) {
+                summary.initializing++;
+            }
+            if (AssertionResultType.Init !== resultType) {
+                summary.total++; // only count assertions for which there is one completed run event, ignoring INIT statuses!
+            }
+        } else {
+            summary.notRunning++;
+        }
+    });
+    return summary;
+};
+
+export const getAssertionType = (assertion: Assertion): string | undefined => {
+    return assertion?.info?.customAssertion?.type?.toUpperCase() || assertion?.info?.type?.toUpperCase();
+};
+
+/**
+ * Returns a list of assertion groups, where assertions are grouped
+ * by their "type" or "category". Each group includes the assertions inside, along with
+ * a summary of passing and failing assertions for the group.
+ *
+ * @param assertions The assertions to group
+ */
+export const createAssertionGroups = (assertions: Array<Assertion>): AssertionGroup[] => {
+    // Pre-sort the list of assertions based on which has been most recently executed.
+    assertions.sort(sortAssertions);
+
+    const typeToAssertions = new Map();
+    assertions
+        .filter((assertion) => assertion.info?.type)
+        .forEach((assertion) => {
+            const assertionType: string | undefined = getAssertionType(assertion);
+            const assertionGroup: string = assertionType || 'Unknown';
+            const groupedAssertions = typeToAssertions.get(assertionGroup) || [];
+            groupedAssertions.push(assertion);
+            typeToAssertions.set(assertionGroup, groupedAssertions);
+        });
+
+    // Now, create summary for each type and build the AssertionGroup object
+    const assertionGroups: AssertionGroup[] = [];
+    typeToAssertions.forEach((groupedAssertions, type) => {
+        const newGroup: AssertionGroup = {
+            name: getAssertionGroupName(type),
+            icon: getAssertionGroupTypeIcon(type),
+            assertions: groupedAssertions,
+            summary: getAssertionsSummary(groupedAssertions),
+            type,
+        };
+        assertionGroups.push(newGroup);
+    });
+
+    return assertionGroups;
+};
+
+export const getEntityUrnForAssertion = (assertion: Assertion) => {
+    if (assertion.info?.type === AssertionType.Dataset) {
+        return assertion.info?.datasetAssertion?.datasetUrn;
+    }
+    if (assertion.info?.type === AssertionType.Freshness) {
+        return assertion.info?.freshnessAssertion?.entityUrn;
+    }
+    if (assertion.info?.type === AssertionType.Volume) {
+        return assertion.info?.volumeAssertion?.entityUrn;
+    }
+    if (assertion.info?.type === AssertionType.Field) {
+        return assertion.info?.fieldAssertion?.entityUrn;
+    }
+    if (assertion.info?.type === AssertionType.Sql) {
+        return assertion.info?.sqlAssertion?.entityUrn;
+    }
+    if (assertion.info?.type === AssertionType.DataSchema) {
+        return assertion.info?.schemaAssertion?.entityUrn;
+    }
+    if (assertion.info?.type === AssertionType.Custom) {
+        return assertion.info?.customAssertion?.entityUrn;
+    }
+    console.error(`Unable to extract entity urn from unrecognized assertion with type ${assertion.info?.type}`);
+    return undefined;
+};
+
+/**
+ * Attempts to extract the sibling entity associated with a given urn.
+ */
+export const getSiblingWithUrn = (entityData: GenericEntityProperties, urn: string) => {
+    if (entityData.urn === urn) {
+        return entityData;
+    }
+    return entityData?.siblingsSearch?.searchResults
+        ?.map((result) => result.entity)
+        .find((entity) => entity?.urn === urn);
+};
+
+/**
+ * Extract the siblings for an entity
+ */
+export const getSiblings = (entityData: GenericEntityProperties | null): GenericEntityProperties[] => {
+    if (!entityData) return [];
+    return entityData?.siblingsSearch?.searchResults?.map((result) => result.entity) || [];
+};

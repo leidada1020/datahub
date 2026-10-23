@@ -1,0 +1,13 @@
+namespace com.linkedin.metadata.run
+
+record DeleteEntityResponse {
+    urn: string
+    rows: long
+    timeseriesRows: optional long
+
+    /**
+     * True when the delete was queued to run later. The counts are then what existed when it was
+     * queued, not what was deleted.
+     */
+    queued: optional boolean
+}

@@ -1,0 +1,249 @@
+import random
+from typing import (
+    Any,
+    Dict,
+    Generic,
+    Iterable,
+    Iterator,
+    List,
+    Set,
+    SupportsIndex,
+    TypeVar,
+    Union,
+    overload,
+)
+
+T = TypeVar("T")
+_KT = TypeVar("_KT")
+_VT = TypeVar("_VT")
+
+
+class LossySentinel(str):
+    """Marks a lossy-collection truncation summary.
+
+    ``str`` subclass so it renders naturally in pprint/JSON but can be
+    distinguished from real entries via ``isinstance``.
+    """
+
+    pass
+
+
+class LossyList(List[T], Generic[T]):
+    """A list that performs reservoir sampling of a much larger list"""
+
+    def __init__(self, max_elements: int = 10) -> None:
+        super().__init__()
+        self.max_elements = max_elements
+        self.total_elements = 0
+        self.sampled = False
+
+    def append(self, __object: T) -> None:
+        try:
+            if self.total_elements >= self.max_elements:
+                i = random.choice(range(0, self.total_elements + 1))
+                if i < self.max_elements:
+                    self.sampled = True
+                    return super().__setitem__(i, (self.total_elements, __object))  # type: ignore
+                else:
+                    return
+
+            return super().append((self.total_elements, __object))  # type: ignore
+        finally:
+            self.total_elements += 1
+
+    def extend(self, __iterable: Iterable[T]) -> None:
+        for item in __iterable:
+            self.append(item)
+
+    @overload
+    def __getitem__(self, index: SupportsIndex) -> T: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> List[T]: ...
+
+    def __getitem__(self, index: Union[SupportsIndex, slice]) -> Union[T, List[T]]:
+        """
+        Override to unwrap stored tuples when accessing by index.
+
+        Internally, items are stored as (index, item) tuples for reservoir sampling.
+        This method unwraps them to return just the item, maintaining the List[T] abstraction.
+        """
+        result: Any = super().__getitem__(index)
+        if isinstance(index, slice):
+            # For slices, unwrap each tuple in the slice
+            return [item[1] for item in result]
+        else:
+            # For single index, unwrap the tuple
+            return result[1]
+
+    def __len__(self) -> int:
+        return self.total_elements
+
+    def __iter__(self) -> Iterator[T]:
+        yield from [elem[1] for elem in sorted(super().__iter__())]  # type: ignore
+
+    def __contains__(self, item: object) -> bool:
+        # list.__contains__ would compare against the (index, item) tuples
+        # used for reservoir sampling; iterate self to unwrap via __iter__.
+        return any(elem == item for elem in self)
+
+    def __repr__(self) -> str:
+        return repr(self.as_obj())
+
+    def __str__(self) -> str:
+        return repr(self)
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source_type, handler):  # type: ignore
+        from pydantic_core import core_schema
+
+        return core_schema.no_info_after_validator_function(cls, handler(list))
+
+    def as_obj(self) -> List[Union[T, str]]:
+        from datahub.ingestion.api.report import Report
+
+        base_list: List[Union[T, str]] = [
+            Report.to_pure_python_obj(value) for value in list(self.__iter__())
+        ]
+        if self.sampled:
+            base_list.append(
+                LossySentinel(f"... sampled of {self.total_elements} total elements")
+            )
+        return base_list
+
+    def set_total(self, total: int) -> None:
+        self.total_elements = total
+        self.sampled = self.total_elements > self.max_elements
+
+    def resize(self, max_elements: int) -> None:
+        """Change max_elements, pruning excess entries if shrinking.
+
+        Growing is lossless. Shrinking drops random entries (consistent with
+        the reservoir-sampling behavior used elsewhere in this class) and
+        marks the list as sampled. Once sampled, the flag is never cleared —
+        dropped entries cannot be recovered by a subsequent grow.
+
+        Note: total_elements (and therefore len()) is not adjusted — it always
+        reflects the count of all ever-appended items, not the current retained
+        count.
+        """
+        if max_elements < 1:
+            raise ValueError(f"max_elements must be >= 1, got {max_elements}")
+        if max_elements == self.max_elements:
+            return
+        self.max_elements = max_elements
+        current_len = super().__len__()
+        if current_len > max_elements:
+            indices_to_drop = random.sample(
+                range(current_len), current_len - max_elements
+            )
+            for i in sorted(indices_to_drop, reverse=True):
+                super().__delitem__(i)
+            self.sampled = True
+
+
+class LossySet(Set[T], Generic[T]):
+    """A set that only preserves a sample of elements in a set. Currently this is a very simple greedy sampling set"""
+
+    def __init__(self, max_elements: int = 10) -> None:
+        super().__init__()
+        self.max_elements = max_elements
+        self.sampled = False
+        self._items_removed = 0
+        self._items_ignored = 0
+
+    def add(self, __element: T) -> None:
+        if (
+            not super().__contains__(__element)
+            and super().__len__() >= self.max_elements
+        ):
+            self.sampled = True
+            i = random.choice(range(0, super().__len__()))
+            if i < self.max_elements:
+                super().remove(list(super().__iter__())[i])
+                self._items_removed += 1
+                return super().add(__element)
+            else:
+                self._items_ignored += 1
+                return None
+        return super().add(__element)
+
+    def __repr__(self) -> str:
+        return repr(self.as_obj())
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+    def as_obj(self) -> List[Union[T, str]]:
+        base_list: List[Union[T, str]] = list(self.__iter__())
+        if self.sampled:
+            base_list.append(
+                f"... sampled with at most {self._items_removed} elements missing."
+            )
+        return base_list
+
+
+class LossyDict(Dict[_KT, _VT], Generic[_KT, _VT]):
+    """A structure that only preserves a sample of elements in a dictionary using reservoir sampling."""
+
+    def __init__(self, max_elements: int = 10) -> None:
+        super().__init__()
+        self.max_elements = max_elements
+        self.sampled = False
+        self._overflow = 0
+        self._items_removed = 0
+        self._items_ignored = 0
+
+    def __getitem__(self, __k: _KT) -> _VT:
+        return super().__getitem__(__k)
+
+    def __setitem__(self, __k: _KT, __v: _VT) -> None:
+        if not super().__contains__(__k) and super().__len__() >= self.max_elements:
+            self.sampled = True
+            self._overflow += 1
+            i = random.choice(range(0, super().__len__() + self._overflow))
+            if i < self.max_elements:
+                super().pop(list(super().__iter__())[i])
+                self._items_removed += 1
+                return super().__setitem__(__k, __v)
+            else:
+                self._items_ignored += 1
+                return None
+        else:
+            return super().__setitem__(__k, __v)
+
+    def __repr__(self) -> str:
+        return repr(self.as_obj())
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+    def as_obj(self) -> Dict[Union[_KT, str], Union[_VT, str]]:
+        base_dict: Dict[Union[_KT, str], Union[_VT, str]] = super().copy()  # type: ignore
+        if self.sampled:
+            base_dict["sampled"] = (
+                f"{len(self.keys())} sampled of at most {self.total_key_count()} entries."
+            )
+        return base_dict
+
+    def resize(self, max_elements: int) -> None:
+        """Change max_elements, pruning excess entries if needed."""
+        if max_elements < 1:
+            raise ValueError(f"max_elements must be >= 1, got {max_elements}")
+        self.max_elements = max_elements
+        excess = super().__len__() - max_elements
+        if excess > 0:
+            keys_to_drop = random.sample(list(super().__iter__()), excess)
+            for k in keys_to_drop:
+                super().pop(k)
+                self._items_removed += 1
+            self._overflow += excess
+            self.sampled = True
+
+    def total_key_count(self) -> int:
+        """Returns the total number of keys that have been added to this dictionary."""
+        return super().__len__() + self._overflow
+
+    def dropped_keys_count(self) -> int:
+        """Returns the number of keys that have been dropped from this dictionary."""
+        return self._overflow

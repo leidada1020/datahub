@@ -1,0 +1,108 @@
+import { SquaresFour } from '@phosphor-icons/react/dist/csr/SquaresFour';
+import React, { useEffect } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useHistory } from 'react-router';
+import styled from 'styled-components';
+
+import { useEntityContext, useEntityData } from '@app/entity/shared/EntityContext';
+import ContentSectionLoading from '@app/entityV2/domain/summary/ContentSectionLoading';
+import {
+    getContentsSummary,
+    getDomainEntitiesFilterUrl,
+    navigateToDomainEntities,
+} from '@app/entityV2/shared/containers/profile/sidebar/Domain/utils';
+import {
+    SectionContainer,
+    SummaryTabHeaderTitle,
+    SummaryTabHeaderWrapper,
+} from '@app/entityV2/shared/summary/HeaderComponents';
+import { getContentTypeIcon } from '@app/entityV2/shared/summary/IconComponents';
+import { EntityCountCard } from '@app/sharedV2/cards/EntityCountCard';
+import { Carousel } from '@app/sharedV2/carousel/Carousel';
+import { useEntityRegistry } from '@app/useEntityRegistry';
+
+import { useGetDomainEntitySummaryQuery } from '@graphql/domain.generated';
+
+const ViewAllButton = styled.div`
+    color: ${(props) => props.theme.colors.textTertiary};
+    padding: 2px;
+    :hover {
+        cursor: pointer;
+        color: ${(props) => props.theme.colors.textSecondary};
+        text-decoration: underline;
+    }
+`;
+
+export const ContentsSection = () => {
+    const { t } = useTranslation('entity.types');
+    const { t: tc } = useTranslation('common.actions');
+    const { entityState } = useEntityContext();
+    const history = useHistory();
+    const entityRegistry = useEntityRegistry();
+    const { urn, entityType } = useEntityData();
+    const { data, loading, refetch } = useGetDomainEntitySummaryQuery({
+        variables: {
+            urn,
+        },
+    });
+
+    const contentsSummary = data?.aggregateAcrossEntities && getContentsSummary(data.aggregateAcrossEntities as any);
+    const contentsCount = contentsSummary?.total || 0;
+    const hasContents = contentsCount > 0;
+
+    const shouldRefetch = entityState?.shouldRefetchContents;
+    useEffect(() => {
+        if (shouldRefetch) {
+            refetch();
+            entityState?.setShouldRefetchContents(false);
+        }
+    }, [shouldRefetch, entityState, refetch]);
+
+    if (!hasContents) {
+        return null;
+    }
+
+    return (
+        <SectionContainer>
+            <SummaryTabHeaderWrapper>
+                <SummaryTabHeaderTitle
+                    icon={<SquaresFour />}
+                    title={t('shared.assetsCountTitle', { count: contentsCount })}
+                />
+                <ViewAllButton onClick={() => navigateToDomainEntities(urn, entityType, history, entityRegistry)}>
+                    {tc('viewAll')}
+                </ViewAllButton>
+            </SummaryTabHeaderWrapper>
+            {loading && <ContentSectionLoading />}
+            <Carousel>
+                {!loading &&
+                    contentsSummary?.types?.map((summary) => {
+                        const { type, count, entityType: summaryEntityType } = summary;
+                        const typeName = (
+                            type ||
+                            entityRegistry.getEntityName(summaryEntityType) ||
+                            summaryEntityType
+                        ).toLocaleLowerCase();
+                        const link = getDomainEntitiesFilterUrl(
+                            urn,
+                            entityType,
+                            entityRegistry,
+                            [summary.entityType],
+                            summary.type ? [summary.type] : undefined,
+                        );
+                        return (
+                            <EntityCountCard
+                                key={typeName}
+                                type={typeName}
+                                name={typeName}
+                                count={summary.count}
+                                icon={getContentTypeIcon(entityRegistry, summary.entityType, summary.type)}
+                                tooltipDescriptor={t('shared.assetTypeNameCount', { count, type: typeName })}
+                                link={link}
+                            />
+                        );
+                    })}
+            </Carousel>
+        </SectionContainer>
+    );
+};

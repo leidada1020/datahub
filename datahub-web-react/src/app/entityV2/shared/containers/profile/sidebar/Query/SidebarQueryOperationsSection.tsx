@@ -1,0 +1,134 @@
+import React, { useContext } from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { CodeBlock } from '@components/components/CodeBlock';
+
+import { SidebarSection } from '@app/entityV2/shared/containers/profile/sidebar/SidebarSection';
+import EntitySidebarContext, { FineGrainedOperation } from '@app/sharedV2/EntitySidebarContext';
+
+// eslint-disable-next-line i18next/no-literal-string -- syntax highlighting language identifier, not UI text
+const DEFAULT_LANGUAGE = 'sql';
+
+export default function SidebarQueryOperationsSection() {
+    const { t } = useTranslation('entity.shared.containers');
+    const { fineGrainedOperations } = useContext(EntitySidebarContext);
+
+    if (!fineGrainedOperations?.length) {
+        return null;
+    }
+
+    return (
+        <>
+            {fineGrainedOperations.map((operation: FineGrainedOperation, index) => (
+                <SidebarSection
+                    title={t('sidebar.query.operationIndexedTitle', { index: index + 1 })}
+                    /* eslint-disable-next-line react/no-array-index-key */
+                    key={index}
+                    content={<SidebarQueryOperation operation={operation} />}
+                />
+            ))}{' '}
+        </>
+    );
+}
+
+const OperationContainer = styled.div`
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+`;
+
+const Section = styled.div`
+    display: flex;
+    flex-direction: column;
+    align-items: start;
+    justify-content: start;
+    margin-bottom: 6px;
+    text-wrap: wrap;
+`;
+
+const SectionHeader = styled.div`
+    display: flex;
+    height: 20px;
+    color: ${(props) => props.theme.colors.textSecondary};
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 20px;
+    letter-spacing: 0.04em;
+`;
+
+const HeaderColumn = styled.th`
+    padding: 0 0.5em 0 0;
+    text-align: left;
+    vertical-align: top;
+    font-weight: normal;
+    color: ${(props) => props.theme.colors.textSecondary};
+`;
+
+const TextColumn = styled.td`
+    text-wrap: wrap;
+    font-family: 'Roboto Mono', monospace;
+`;
+
+const PreviewCode = styled(CodeBlock)`
+    max-width: 100%;
+`;
+
+function SidebarQueryOperation({ operation }: { operation: FineGrainedOperation }) {
+    const { t } = useTranslation('entity.shared.containers');
+    return (
+        <OperationContainer>
+            {operation.transformOperation && (
+                <Section key="logic">
+                    <SectionHeader>{t('sidebar.query.logicLabel')}</SectionHeader>
+                    <PreviewCode
+                        code={operation.transformOperation}
+                        language={DEFAULT_LANGUAGE}
+                        variant="embedded"
+                        showHeader={false}
+                        showCopy={false}
+                        showFormat={false}
+                        hideLineNumbers
+                        wrap
+                        maxHeight={150}
+                        overflow="hidden"
+                    />
+                </Section>
+            )}
+            {/* eslint-disable i18next/no-literal-string -- (untranslated-text) used as programmatic key and display value */}
+            {operation.inputColumns?.length && (
+                <OperationInputsOrOutputs title="inputs" columns={operation.inputColumns} />
+            )}
+            {operation.outputColumns?.length && (
+                <OperationInputsOrOutputs title="outputs" columns={operation.outputColumns} />
+            )}
+            {/* eslint-enable i18next/no-literal-string */}
+        </OperationContainer>
+    );
+}
+
+function OperationInputsOrOutputs({ title, columns }: { title: string; columns: Array<[string, string]> }) {
+    const { t } = useTranslation('entity.shared.containers');
+    const tables = Array.from(new Set(columns.map(([name]) => name)));
+    return (
+        <Section key={title}>
+            <SectionHeader>{title.toLocaleUpperCase()}</SectionHeader>
+            <div>
+                <table cellSpacing={0} cellPadding={0}>
+                    <tbody>
+                        <tr>
+                            <HeaderColumn>{t('sidebar.query.tablesLabel')}</HeaderColumn>
+                            {/* eslint-disable-next-line i18next/no-literal-string -- comma separator in technical data list, not UI text */}
+                            <TextColumn>{tables.join(', ')}</TextColumn>
+                        </tr>
+                        <tr>
+                            <HeaderColumn>{t('sidebar.query.columnsLabel')}</HeaderColumn>
+                            {/* eslint-disable-next-line i18next/no-literal-string -- technical data column reference format, not UI text */}
+                            <TextColumn>{columns.map(([table, col]) => `${table}.${col}`).join(', ')}</TextColumn>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </Section>
+    );
+}

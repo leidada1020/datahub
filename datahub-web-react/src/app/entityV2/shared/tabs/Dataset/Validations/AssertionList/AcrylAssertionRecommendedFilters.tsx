@@ -1,0 +1,95 @@
+import React, { useEffect, useState } from 'react';
+import styled from 'styled-components';
+
+interface FilterItem {
+    name: string;
+    displayName: string;
+    category: string;
+    count: number;
+}
+
+interface AcrylAssertionRecommendedFiltersProps {
+    filters: FilterItem[];
+    appliedFilters: FilterItem[];
+    onFilterChange: (updatedFilters: FilterItem[]) => void;
+}
+
+const FilterContainer = styled.div`
+    display: flex;
+    flex-direction: row;
+    padding: 8px 0px 20px 0px;
+    gap: 10px;
+    overflow: auto;
+`;
+
+const FilterItemRow = styled.div<{ selected: boolean }>`
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 0 8px;
+    height: 30px;
+    font-size: 14px;
+    border-radius: 20px;
+    min-width: fit-content;
+    cursor: pointer;
+    color: ${({ selected, theme }) => (selected ? theme.colors.bg : theme.colors.textSecondary)};
+    background-color: ${({ selected, theme }) => (selected ? theme.colors.buttonFillBrand : theme.colors.bgSurface)};
+
+    &:hover {
+        background-color: ${(props) => props.theme.colors.buttonFillBrand};
+        color: ${(props) => props.theme.colors.bg};
+        box-shadow: none;
+    }
+    box-shadow: none;
+`;
+
+const FilterName = styled.span``;
+const FilterCount = styled.span``;
+
+export const AcrylAssertionRecommendedFilters: React.FC<AcrylAssertionRecommendedFiltersProps> = ({
+    filters,
+    appliedFilters,
+    onFilterChange,
+}) => {
+    const [visibleFilters, setVisibleFilters] = useState<FilterItem[]>([]);
+    const handleFilterClick = (filter: FilterItem) => {
+        const isSelected = appliedFilters.some(
+            (appliedFilter) => appliedFilter.name === filter.name && appliedFilter.category === filter.category,
+        );
+        const updatedFilters = isSelected
+            ? appliedFilters.filter(
+                  (appliedFilter) => appliedFilter.name !== filter.name || appliedFilter.category !== filter.category,
+              )
+            : [...appliedFilters, filter];
+
+        onFilterChange(updatedFilters);
+    };
+
+    useEffect(() => {
+        const transformedAppliedFilters = appliedFilters.map((filter) => filter.name);
+        const newVisibleFilters = filters.filter(
+            (filter: FilterItem) =>
+                filter.category !== 'column' &&
+                filter.category !== 'tags' &&
+                (filter.count || transformedAppliedFilters.includes(filter.name)),
+        );
+        setVisibleFilters(newVisibleFilters);
+    }, [filters, appliedFilters]);
+    return (
+        <FilterContainer>
+            {visibleFilters.map((filter) => (
+                <FilterItemRow
+                    key={`${filter.category}-${filter.name}`}
+                    selected={appliedFilters.some(
+                        (appliedFilter) =>
+                            appliedFilter.name === filter.name && appliedFilter.category === filter.category,
+                    )}
+                    onClick={() => handleFilterClick(filter)}
+                >
+                    <FilterName>{filter.displayName}</FilterName>
+                    <FilterCount>({filter.count})</FilterCount>
+                </FilterItemRow>
+            ))}
+        </FilterContainer>
+    );
+};

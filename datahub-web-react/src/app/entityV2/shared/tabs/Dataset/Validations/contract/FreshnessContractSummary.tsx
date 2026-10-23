@@ -1,0 +1,90 @@
+import { Clock } from '@phosphor-icons/react/dist/csr/Clock';
+import { Divider } from 'antd';
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { DataContractSummaryFooter } from '@app/entityV2/shared/tabs/Dataset/Validations/contract/DataContractSummaryFooter';
+import { FreshnessScheduleSummary } from '@app/entityV2/shared/tabs/Dataset/Validations/contract/FreshnessScheduleSummary';
+
+import { FreshnessContract } from '@types';
+
+const Container = styled.div`
+    padding: 28px;
+`;
+
+const TitleText = styled.div`
+    color: ${(props) => props.theme.colors.textTertiary};
+    margin-bottom: 20px;
+    letter-spacing: 1px;
+`;
+
+const ThinDivider = styled(Divider)`
+    && {
+        padding: 0px;
+        margin: 0px;
+    }
+`;
+
+const Header = styled.div`
+    color: ${(props) => props.theme.colors.textSecondary};
+    letter-spacing; 4px;
+    padding-top: 8px;
+    padding: 12px;
+    background-color: ${(props) => props.theme.colors.bgSurface};
+`;
+
+const Body = styled.div`
+    padding: 12px;
+`;
+
+const Footer = styled.div`
+    padding-top: 8px;
+    padding: 12px;
+    background-color: ${(props) => props.theme.colors.bgSurface};
+`;
+
+const SummaryContainer = styled.div`
+    width: 100%;
+    border-radius: 8px;
+    box-shadow: ${(props) => props.theme.colors.shadowXs};
+`;
+
+type Props = {
+    contracts: FreshnessContract[];
+    showAction?: boolean;
+};
+
+export const FreshnessContractSummary = ({ contracts, showAction = false }: Props) => {
+    const { t } = useTranslation('entity.profile.validations');
+    // TODO: Support multiple per-asset contracts.
+    const firstContract = (contracts.length && contracts[0]) || undefined;
+    const assertionDefinition = firstContract?.assertion?.info?.freshnessAssertion?.schedule;
+
+    return (
+        <Container>
+            <TitleText>{t('contractSection.freshness')}</TitleText>
+            <SummaryContainer>
+                <Header>
+                    <Clock style={{ marginRight: 8 }} />
+                    {t('freshnessContract.updateFrequency')}
+                </Header>
+                <Body>
+                    {!assertionDefinition && <>{t('freshnessContract.noContractFound')}</>}
+                    <b>{assertionDefinition && <FreshnessScheduleSummary definition={assertionDefinition} />}</b>
+                </Body>
+                <ThinDivider />
+                <Footer>
+                    <DataContractSummaryFooter
+                        assertions={(firstContract && [firstContract?.assertion]) || []}
+                        passingText={t('contractStatus.passingText.freshness')}
+                        failingText={t('contractStatus.failingText.freshness')}
+                        errorText={t('contractStatus.errorText.freshness')}
+                        actionText={t('contractStatus.action.viewFreshness')}
+                        showAction={showAction}
+                    />
+                </Footer>
+            </SummaryContainer>
+        </Container>
+    );
+};

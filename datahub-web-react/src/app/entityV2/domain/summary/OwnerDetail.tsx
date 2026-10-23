@@ -1,0 +1,53 @@
+import { Avatar, Tooltip } from '@components';
+import React from 'react';
+import styled from 'styled-components';
+
+import { AvatarType } from '@components/components/AvatarStack/types';
+
+import { useEntityRegistry } from '@app/useEntityRegistry';
+
+import { EntityType, Owner } from '@types';
+
+const Details = styled.div`
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    color: ${(props) => props.theme.colors.text};
+    font-size: 14px;
+    font-weight: 500;
+`;
+
+const OwnerName = styled.div`
+    width: 110px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+`;
+
+interface Props {
+    owner: Owner;
+}
+
+const OwnerDetail = ({ owner }: Props) => {
+    const entityRegistry = useEntityRegistry();
+
+    const ownerName = entityRegistry.getDisplayName(owner.owner.type, owner.owner);
+    const ownerPictureLink =
+        ('editableProperties' in owner.owner && owner.owner.editableProperties?.pictureLink) || undefined;
+    const avatarType = owner.owner.type === EntityType.CorpGroup ? AvatarType.group : AvatarType.user;
+
+    return (
+        <>
+            {!!ownerName && (
+                <Details>
+                    <Avatar name={ownerName} imageUrl={ownerPictureLink} type={avatarType} />
+                    <Tooltip title={ownerName}>
+                        <OwnerName>{ownerName}</OwnerName>
+                    </Tooltip>
+                </Details>
+            )}
+        </>
+    );
+};
+
+export default OwnerDetail;

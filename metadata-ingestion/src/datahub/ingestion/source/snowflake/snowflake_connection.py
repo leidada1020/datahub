@@ -1,0 +1,660 @@
+import logging
+import threading
+import warnings
+from typing import Any, Dict, Final, Literal, Optional
+
+import pydantic
+import snowflake.connector
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
+from pydantic import field_validator, model_validator
+from snowflake.connector import SnowflakeConnection as NativeSnowflakeConnection
+from snowflake.connector.cursor import DictCursor
+from snowflake.connector.network import (
+    DEFAULT_AUTHENTICATOR,
+    EXTERNAL_BROWSER_AUTHENTICATOR,
+    KEY_PAIR_AUTHENTICATOR,
+    OAUTH_AUTHENTICATOR,
+    WORKLOAD_IDENTITY_AUTHENTICATOR,
+)
+from tenacity import (
+    Retrying,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
+from tenacity.before_sleep import before_sleep_log
+
+from datahub.configuration.common import (
+    ConfigModel,
+    ConfigurationError,
+    ConfigurationWarning,
+    HiddenFromDocs,
+    MetaError,
+    TransparentSecretStr,
+)
+from datahub.configuration.connection_resolver import auto_connection_resolver
+from datahub.configuration.validate_field_rename import pydantic_renamed_field
+from datahub.ingestion.api.closeable import Closeable
+from datahub.ingestion.source.snowflake.constants import (
+    CLIENT_PREFETCH_THREADS,
+    CLIENT_SESSION_KEEP_ALIVE,
+    DEFAULT_SNOWFLAKE_DOMAIN,
+)
+from datahub.ingestion.source.snowflake.oauth_config import (
+    OAuthConfiguration,
+    OAuthIdentityProvider,
+)
+from datahub.ingestion.source.snowflake.oauth_generator import OAuthTokenGenerator
+from datahub.ingestion.source.sql.sqlalchemy_uri import make_sqlalchemy_uri
+from datahub.utilities.config_clean import (
+    remove_protocol,
+    remove_suffix,
+    remove_trailing_slashes,
+)
+
+logger = logging.getLogger(__name__)
+
+_APPLICATION_NAME: str = "acryl_datahub"
+
+_VALID_AUTH_TYPES: Dict[str, str] = {
+    "DEFAULT_AUTHENTICATOR": DEFAULT_AUTHENTICATOR,
+    "EXTERNAL_BROWSER_AUTHENTICATOR": EXTERNAL_BROWSER_AUTHENTICATOR,
+    "KEY_PAIR_AUTHENTICATOR": KEY_PAIR_AUTHENTICATOR,
+    "OAUTH_AUTHENTICATOR": OAUTH_AUTHENTICATOR,
+    "OAUTH_AUTHENTICATOR_TOKEN": OAUTH_AUTHENTICATOR,
+    "WORKLOAD_IDENTITY_AUTHENTICATOR": WORKLOAD_IDENTITY_AUTHENTICATOR,
+}
+
+# Snowflake is deprecating username + password (DEFAULT_AUTHENTICATOR) auth
+# during its Strong Authentication rollout (Phase 3: Aug-Oct 2026, account-
+# specific enforcement dates).
+SNOWFLAKE_PASSWORD_AUTH_DEPRECATION_URL: Final = "https://docs.datahub.com/docs/quick-ingestion-guides/snowflake/migrate-to-key-pair-auth"
+
+# report.warning() requires LiteralString so identical warnings group in the
+# report; the URL goes in `context`, not the message.
+SNOWFLAKE_PASSWORD_AUTH_DEPRECATION_TITLE: Final = "Snowflake password auth deprecation"
+SNOWFLAKE_PASSWORD_AUTH_DEPRECATION_MESSAGE: Final = (
+    "Snowflake is deprecating username + password authentication "
+    "(DEFAULT_AUTHENTICATOR) as part of its Strong Authentication rollout. "
+    "Password auth will stop working on an account-specific enforcement date "
+    "during Phase 3 (Aug-Oct 2026). Switch this recipe to key-pair "
+    "authentication (KEY_PAIR_AUTHENTICATOR) before your account's enforcement date."
+)
+
+
+def get_password_auth_deprecation_warning() -> str:
+    """Full warning text (with URL) for warnings.warn, which reaches
+    --test-source-connection (that path prints neither the summary nor the
+    source report)."""
+    return (
+        f"{SNOWFLAKE_PASSWORD_AUTH_DEPRECATION_MESSAGE} "
+        f"See the migration guide: {SNOWFLAKE_PASSWORD_AUTH_DEPRECATION_URL}"
+    )
+
+
+class SnowflakePermissionError(MetaError):
+    """A permission error has happened"""
+
+
+class SnowflakeConnectionConfig(ConfigModel):
+    # Note: this config model is also used by the snowflake-usage source.
+
+    _connection = auto_connection_resolver()
+
+    options: dict = pydantic.Field(
+        default_factory=dict,
+        description="Any options specified here will be passed to [SQLAlchemy.create_engine](https://docs.sqlalchemy.org/en/20/core/engines.html#sqlalchemy.create_engine) as kwargs.",
+    )
+
+    scheme: HiddenFromDocs[str] = "snowflake"
+    username: Optional[str] = pydantic.Field(
+        default=None, description="Snowflake username."
+    )
+    password: Optional[TransparentSecretStr] = pydantic.Field(
+        default=None, exclude=True, description="Snowflake password."
+    )
+    private_key: Optional[TransparentSecretStr] = pydantic.Field(
+        default=None,
+        exclude=True,
+        description="Private key in a form of '-----BEGIN PRIVATE KEY-----\\nprivate-key\\n-----END PRIVATE KEY-----\\n' if using key pair authentication. Encrypted version of private key will be in a form of '-----BEGIN ENCRYPTED PRIVATE KEY-----\\nencrypted-private-key\\n-----END ENCRYPTED PRIVATE KEY-----\\n' See: https://docs.snowflake.com/en/user-guide/key-pair-auth.html",
+    )
+
+    private_key_path: Optional[str] = pydantic.Field(
+        default=None,
+        description="The path to the private key if using key pair authentication. Ignored if `private_key` is set. See: https://docs.snowflake.com/en/user-guide/key-pair-auth.html",
+    )
+    private_key_password: Optional[TransparentSecretStr] = pydantic.Field(
+        default=None,
+        exclude=True,
+        description="Password for your private key. Required if using key pair authentication with encrypted private key.",
+    )
+
+    oauth_config: Optional[OAuthConfiguration] = pydantic.Field(
+        default=None,
+        description="oauth configuration - https://docs.snowflake.com/en/user-guide/python-connector-example.html#connecting-with-oauth",
+    )
+    authentication_type: str = pydantic.Field(
+        default="DEFAULT_AUTHENTICATOR",
+        description='The type of authenticator to use when connecting to Snowflake. Supports "DEFAULT_AUTHENTICATOR", "OAUTH_AUTHENTICATOR", "EXTERNAL_BROWSER_AUTHENTICATOR", "KEY_PAIR_AUTHENTICATOR" and "WORKLOAD_IDENTITY_AUTHENTICATOR".',
+    )
+    account_id: str = pydantic.Field(
+        description="Snowflake account identifier. e.g. xy12345,  xy12345.us-east-2.aws, xy12345.us-central1.gcp, xy12345.central-us.azure, xy12345.us-west-2.privatelink. Refer [Account Identifiers](https://docs.snowflake.com/en/user-guide/admin-account-identifier.html#format-2-legacy-account-locator-in-a-region) for more details.",
+    )
+    warehouse: Optional[str] = pydantic.Field(
+        default=None, description="Snowflake warehouse."
+    )
+    role: Optional[str] = pydantic.Field(default=None, description="Snowflake role.")
+    connect_args: Optional[Dict[str, Any]] = pydantic.Field(
+        default=None,
+        description="Connect args to pass to Snowflake SqlAlchemy driver",
+        exclude=True,
+    )
+    token: Optional[TransparentSecretStr] = pydantic.Field(
+        default=None,
+        description="OAuth token from external identity provider. Not recommended for most use cases because it will not be able to refresh once expired.",
+    )
+    workload_identity_provider: Optional[Literal["AWS", "AZURE", "GCP"]] = (
+        pydantic.Field(
+            default=None,
+            description="Cloud provider whose workload identity attests this connection to Snowflake. Required when `authentication_type` is `WORKLOAD_IDENTITY_AUTHENTICATOR`. The ingestion process must run on that cloud (EC2/ECS/EKS with an IAM role, an Azure VM or Function with a managed identity, or GCE/Cloud Run/GKE with an attached service account). See https://docs.snowflake.com/en/user-guide/workload-identity-federation",
+        )
+    )
+    snowflake_domain: str = pydantic.Field(
+        default=DEFAULT_SNOWFLAKE_DOMAIN,
+        description="Snowflake domain. Use 'snowflakecomputing.com' for most regions or 'snowflakecomputing.cn' for China (cn-northwest-1) region.",
+    )
+
+    def get_account(self) -> str:
+        assert self.account_id
+        return self.account_id
+
+    rename_host_port_to_account_id = pydantic_renamed_field("host_port", "account_id")  # type: ignore[pydantic-field]
+
+    @field_validator("account_id", mode="after")
+    @classmethod
+    def validate_account_id(cls, account_id: str, info: pydantic.ValidationInfo) -> str:
+        account_id = remove_protocol(account_id)
+        account_id = remove_trailing_slashes(account_id)
+        # Get the domain from config, fallback to default
+        domain = info.data.get("snowflake_domain", DEFAULT_SNOWFLAKE_DOMAIN)
+        snowflake_host_suffix = f".{domain}"
+        account_id = remove_suffix(account_id, snowflake_host_suffix)
+        return account_id
+
+    @field_validator("authentication_type", mode="before")
+    @classmethod
+    def authenticator_type_is_valid(cls, v: Any, info: pydantic.ValidationInfo) -> Any:
+        if v not in _VALID_AUTH_TYPES:
+            raise ValueError(
+                f"unsupported authenticator type '{v}' was provided,"
+                f" use one of {list(_VALID_AUTH_TYPES.keys())}"
+            )
+        if (
+            info.data.get("private_key") is not None
+            or info.data.get("private_key_path") is not None
+        ) and v != "KEY_PAIR_AUTHENTICATOR":
+            raise ValueError(
+                f"Either `private_key` and `private_key_path` is set but `authentication_type` is {v}. "
+                f"Should be set to 'KEY_PAIR_AUTHENTICATOR' when using key pair authentication"
+            )
+        if v == "KEY_PAIR_AUTHENTICATOR":
+            # If we are using key pair auth, we need the private key path and password to be set
+            if (
+                info.data.get("private_key") is None
+                and info.data.get("private_key_path") is None
+            ):
+                raise ValueError(
+                    f"Both `private_key` and `private_key_path` are none. "
+                    f"At least one should be set when using {v} authentication"
+                )
+        elif v == "OAUTH_AUTHENTICATOR":
+            cls._check_oauth_config(info.data.get("oauth_config"))
+        logger.info(f"using authenticator type '{v}'")
+        return v
+
+    @field_validator("token", mode="before")
+    @classmethod
+    def validate_token_oauth_config(cls, v: Any, info: pydantic.ValidationInfo) -> Any:
+        auth_type = info.data.get("authentication_type")
+        if auth_type == "OAUTH_AUTHENTICATOR_TOKEN":
+            if not v:
+                raise ValueError("Token required for OAUTH_AUTHENTICATOR_TOKEN.")
+        elif v is not None:
+            raise ValueError(
+                "Token can only be provided when using OAUTH_AUTHENTICATOR_TOKEN"
+            )
+        return v
+
+    @field_validator("workload_identity_provider", mode="before")
+    @classmethod
+    def _uppercase_workload_identity_provider(cls, v: Any) -> Any:
+        # Accept "aws" / "Aws" in the recipe and normalize to the connector's spelling.
+        return v.upper() if isinstance(v, str) else v
+
+    @model_validator(mode="after")
+    def validate_authentication_config(self):
+        """Validate authentication configuration consistency."""
+        # Check token requirement for OAUTH_AUTHENTICATOR_TOKEN
+        if self.authentication_type == "OAUTH_AUTHENTICATOR_TOKEN":
+            if not self.token:
+                raise ValueError("Token required for OAUTH_AUTHENTICATOR_TOKEN.")
+
+        # Check private key authentication consistency
+        if self.private_key is not None or self.private_key_path is not None:
+            if self.authentication_type != "KEY_PAIR_AUTHENTICATOR":
+                raise ValueError(
+                    f"Either `private_key` and `private_key_path` is set but `authentication_type` is {self.authentication_type}. "
+                    f"Should be set to 'KEY_PAIR_AUTHENTICATOR' when using key pair authentication"
+                )
+
+        # Check workload identity federation consistency
+        if self.authentication_type == "WORKLOAD_IDENTITY_AUTHENTICATOR":
+            if self.workload_identity_provider is None:
+                raise ValueError(
+                    "`workload_identity_provider` is required when `authentication_type` is "
+                    "WORKLOAD_IDENTITY_AUTHENTICATOR. Set it to one of AWS, AZURE or GCP."
+                )
+        elif self.workload_identity_provider is not None:
+            raise ValueError(
+                f"`workload_identity_provider` can only be set when `authentication_type` is "
+                f"WORKLOAD_IDENTITY_AUTHENTICATOR, not {self.authentication_type}."
+            )
+
+        # warnings.warn reaches --test-source-connection, which prints neither
+        # the summary nor the source report. SnowflakeV2Source mirrors this in
+        # its structured report for the UI. add_global_warning was dropped
+        # because Pipeline.run() clears global warnings in its finally block,
+        # before pretty_print_summary() reads them.
+        if self.is_using_password_auth():
+            warnings.warn(
+                get_password_auth_deprecation_warning(),
+                ConfigurationWarning,
+                stacklevel=2,
+            )
+
+        return self
+
+    def is_using_password_auth(self) -> bool:
+        """True when configured for username+password (DEFAULT_AUTHENTICATOR) auth.
+
+        bool(SecretStr("")) is True (the wrapper is always truthy), so read
+        get_secret_value() first to treat an empty password as unset.
+        """
+        return self.authentication_type == "DEFAULT_AUTHENTICATOR" and bool(
+            self.password and self.password.get_secret_value()
+        )
+
+    @staticmethod
+    def _check_oauth_config(oauth_config: Optional[OAuthConfiguration]) -> None:
+        if oauth_config is None:
+            raise ValueError(
+                "'oauth_config' is none but should be set when using OAUTH_AUTHENTICATOR authentication"
+            )
+        if oauth_config.use_certificate is True:
+            if oauth_config.provider == OAuthIdentityProvider.OKTA:
+                raise ValueError(
+                    "Certificate authentication is not supported for Okta."
+                )
+            if oauth_config.encoded_oauth_private_key is None:
+                raise ValueError(
+                    "'base64_encoded_oauth_private_key' was none "
+                    "but should be set when using certificate for oauth_config"
+                )
+            if oauth_config.encoded_oauth_public_key is None:
+                raise ValueError(
+                    "'base64_encoded_oauth_public_key' was none"
+                    "but should be set when using use_certificate true for oauth_config"
+                )
+        elif oauth_config.client_secret is None:
+            raise ValueError(
+                "'oauth_config.client_secret' was none "
+                "but should be set when using use_certificate false for oauth_config"
+            )
+
+    def get_sql_alchemy_url(self, database: Optional[str] = None) -> str:
+        # Workload identity never uses a password, so a leftover one from a password
+        # recipe must not end up in the URL (the profiler logs it at DEBUG).
+        password = (
+            self.password.get_secret_value()
+            if self.password
+            and self.authentication_type != "WORKLOAD_IDENTITY_AUTHENTICATOR"
+            else None
+        )
+        return make_sqlalchemy_uri(
+            self.scheme,
+            self.username,
+            password,
+            self.account_id,
+            f'"{database}"' if database is not None else database,
+            uri_opts={
+                # Drop the options if value is None.
+                key: value
+                for (key, value) in {
+                    "authenticator": _VALID_AUTH_TYPES.get(self.authentication_type),
+                    "warehouse": self.warehouse,
+                    "role": self.role,
+                    "application": _APPLICATION_NAME,
+                }.items()
+                if value
+            },
+        )
+
+    _computed_connect_args: Optional[dict] = None
+
+    def get_connect_args(self) -> dict:
+        """
+        Builds connect args, adding defaults and reading a private key from the file if needed.
+        Caches the results in a private instance variable to avoid reading the file multiple times.
+        """
+
+        if self._computed_connect_args is not None:
+            return self._computed_connect_args
+
+        connect_args: Dict[str, Any] = {
+            # Improves performance and avoids timeout errors for larger query result
+            CLIENT_PREFETCH_THREADS: 10,
+            CLIENT_SESSION_KEEP_ALIVE: True,
+            # Let user override the default config values
+            **(self.connect_args or {}),
+        }
+
+        if (
+            "private_key" not in connect_args
+            and self.authentication_type == "KEY_PAIR_AUTHENTICATOR"
+        ):
+            if self.private_key is not None:
+                pkey_bytes = (
+                    self.private_key.get_secret_value().replace("\\n", "\n").encode()
+                )
+            else:
+                assert self.private_key_path, (
+                    "missing required private key path to read key from"
+                )
+                with open(self.private_key_path, "rb") as key:
+                    pkey_bytes = key.read()
+
+            p_key = serialization.load_pem_private_key(
+                pkey_bytes,
+                password=(
+                    self.private_key_password.get_secret_value().encode()
+                    if self.private_key_password is not None
+                    else None
+                ),
+                backend=default_backend(),
+            )
+
+            pkb: bytes = p_key.private_bytes(
+                encoding=serialization.Encoding.DER,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption(),
+            )
+
+            connect_args["private_key"] = pkb
+
+        if self.authentication_type == "WORKLOAD_IDENTITY_AUTHENTICATOR":
+            # The connector converts these plain strings into its own AttestationProvider
+            # enum, so we must not import that private symbol here.
+            # setdefault keeps an explicit `connect_args` override winning, like the
+            # `private_key` guard above.
+            connect_args.setdefault(
+                "workload_identity_provider", self.workload_identity_provider
+            )
+
+        self._computed_connect_args = connect_args
+        return connect_args
+
+    def get_options(self) -> dict:
+        options_connect_args: Dict = self.get_connect_args()
+        options_connect_args.update(self.options.get("connect_args", {}))
+        self.options["connect_args"] = options_connect_args
+        return self.options
+
+    # Overrides the SQLAlchemy answer inherited from SQLCommonConfig: this
+    # connector probes through its own client, not a second engine. Inheriting it
+    # would advertise six typed getters that provider does not have.
+    @classmethod
+    def probe_provider_class(cls) -> type:
+        from datahub.ingestion.source.snowflake.snowflake_probe import (
+            SnowflakeMetadataProbe,
+        )
+
+        return SnowflakeMetadataProbe
+
+    def get_oauth_connection(self) -> NativeSnowflakeConnection:
+        assert self.oauth_config, (
+            "oauth_config should be provided if using oauth based authentication"
+        )
+        generator = OAuthTokenGenerator(
+            client_id=self.oauth_config.client_id,
+            authority_url=self.oauth_config.authority_url,
+            provider=self.oauth_config.provider,
+            username=self.username,
+            password=self.password,
+        )
+        if self.oauth_config.use_certificate:
+            response = generator.get_token_with_certificate(
+                private_key_content=str(self.oauth_config.encoded_oauth_public_key),
+                public_key_content=self.oauth_config.encoded_oauth_private_key.get_secret_value()
+                if self.oauth_config.encoded_oauth_private_key
+                else "",
+                scopes=self.oauth_config.scopes,
+            )
+        else:
+            assert self.oauth_config.client_secret
+            response = generator.get_token_with_secret(
+                secret=str(self.oauth_config.client_secret.get_secret_value()),
+                scopes=self.oauth_config.scopes,
+            )
+        try:
+            token = response["access_token"]
+        except KeyError:
+            raise ValueError(
+                f"access_token not found in response {response}. "
+                "Please check your OAuth configuration."
+            ) from None
+        connect_args = self.get_options()["connect_args"]
+        return snowflake.connector.connect(
+            user=self.username,
+            account=self.account_id,
+            token=token,
+            role=self.role,
+            warehouse=self.warehouse,
+            authenticator=_VALID_AUTH_TYPES.get(self.authentication_type),
+            application=_APPLICATION_NAME,
+            host=f"{self.account_id}.{self.snowflake_domain}",
+            **connect_args,
+        )
+
+    def get_key_pair_connection(self) -> NativeSnowflakeConnection:
+        return self._get_authenticator_connection()
+
+    def _get_authenticator_connection(self) -> NativeSnowflakeConnection:
+        # Shared by the auth types whose credential travels in connect_args or is
+        # obtained by the connector itself (key pair, workload identity): no password
+        # or token is passed here.
+        connect_args = self.get_options()["connect_args"]
+
+        return snowflake.connector.connect(
+            user=self.username,
+            account=self.account_id,
+            warehouse=self.warehouse,
+            role=self.role,
+            authenticator=_VALID_AUTH_TYPES.get(self.authentication_type),
+            application=_APPLICATION_NAME,
+            host=f"{self.account_id}.{self.snowflake_domain}",
+            **connect_args,
+        )
+
+    def get_native_connection(self) -> NativeSnowflakeConnection:
+        connect_args = self.get_options()["connect_args"]
+        if self.authentication_type == "DEFAULT_AUTHENTICATOR":
+            return snowflake.connector.connect(
+                user=self.username,
+                password=self.password.get_secret_value() if self.password else None,
+                account=self.account_id,
+                warehouse=self.warehouse,
+                role=self.role,
+                application=_APPLICATION_NAME,
+                host=f"{self.account_id}.{self.snowflake_domain}",
+                **connect_args,
+            )
+        elif self.authentication_type == "OAUTH_AUTHENTICATOR_TOKEN":
+            return snowflake.connector.connect(
+                user=self.username,
+                account=self.account_id,
+                authenticator="oauth",
+                token=self.token.get_secret_value()
+                if self.token
+                else None,  # Token generated externally and provided directly to the recipe
+                warehouse=self.warehouse,
+                role=self.role,
+                application=_APPLICATION_NAME,
+                host=f"{self.account_id}.{self.snowflake_domain}",
+                **connect_args,
+            )
+        elif self.authentication_type == "OAUTH_AUTHENTICATOR":
+            return self.get_oauth_connection()
+        elif self.authentication_type == "KEY_PAIR_AUTHENTICATOR":
+            return self.get_key_pair_connection()
+        elif self.authentication_type == "WORKLOAD_IDENTITY_AUTHENTICATOR":
+            # No password, key or token is sent: the connector obtains a short-lived
+            # attestation from the cloud's instance-metadata service.
+            return self._get_authenticator_connection()
+        elif self.authentication_type == "EXTERNAL_BROWSER_AUTHENTICATOR":
+            return snowflake.connector.connect(
+                user=self.username,
+                password=self.password.get_secret_value() if self.password else None,
+                account=self.account_id,
+                warehouse=self.warehouse,
+                role=self.role,
+                authenticator=_VALID_AUTH_TYPES.get(self.authentication_type),
+                application=_APPLICATION_NAME,
+                host=f"{self.account_id}.{self.snowflake_domain}",
+                **connect_args,
+            )
+        else:
+            # not expected to be here
+            raise Exception("Not expected to be here.")
+
+    def get_connection(self) -> "SnowflakeConnection":
+        try:
+            return SnowflakeConnection(self.get_native_connection())
+        except Exception as e:
+            logger.debug(e, exc_info=e)
+
+            if "not granted to this user" in str(e):
+                raise SnowflakePermissionError(
+                    f"Permissions error when connecting to snowflake: {e}"
+                ) from e
+
+            raise ConfigurationError(
+                f"Failed to connect to snowflake instance: {e}"
+            ) from e
+
+
+class SnowflakeConnection(Closeable):
+    _connection: NativeSnowflakeConnection
+
+    def __init__(self, connection: NativeSnowflakeConnection):
+        self._connection = connection
+
+        self._query_num_lock = threading.Lock()
+        self._query_num = 1
+
+    def native_connection(self) -> NativeSnowflakeConnection:
+        return self._connection
+
+    def get_query_no(self) -> int:
+        with self._query_num_lock:
+            no = self._query_num
+            self._query_num += 1
+            return no
+
+    def _execute_query_with_retry(self, query: str, query_num: int) -> Any:
+        """
+        Execute a query with retry logic for transient ACCOUNT_USAGE errors.
+
+        Snowflake's ACCOUNT_USAGE system views can be temporarily unavailable during refresh.
+        We retry up to 4 times with exponential backoff (20, 40, 60 seconds). All other queries
+        execute normally without retry.
+
+        This retry is specific because write-based retries could lead to side effects. ACCOUNT_USAGE has read-only views,
+        so it is safe to retry them.
+        """
+        retryer = Retrying(
+            retry=retry_if_exception(
+                lambda e: _is_retryable_account_usage_error(e, query)
+            ),
+            stop=stop_after_attempt(4),
+            wait=wait_exponential(multiplier=10, min=20, max=60),
+            before_sleep=before_sleep_log(logger, logging.WARNING),
+            reraise=True,
+        )
+
+        for attempt in retryer:
+            with attempt:
+                resp = self._connection.cursor(DictCursor).execute(query)
+                if resp is not None and resp.rowcount is not None:
+                    logger.info(
+                        f"Query #{query_num} got {resp.rowcount} row(s) back from Snowflake"
+                    )
+                return resp
+
+    def query(self, query: str) -> Any:
+        try:
+            # We often run multiple queries in parallel across multiple threads,
+            # so we need to number them to help with log readability.
+            query_num = self.get_query_no()
+            logger.info(f"Query #{query_num}: {query.rstrip()}")
+
+            return self._execute_query_with_retry(query, query_num)
+
+        except Exception as e:
+            if _is_permission_error(e):
+                raise SnowflakePermissionError(e) from e
+            raise
+
+    def is_closed(self) -> bool:
+        return self._connection.is_closed()
+
+    def close(self):
+        self._connection.close()
+
+
+def _is_permission_error(e: Exception) -> bool:
+    msg = str(e)
+    # 002003 (02000): SQL compilation error: Database/SCHEMA 'XXXX' does not exist or not authorized.
+    # Insufficient privileges to operate on database 'XXXX'
+    return "Insufficient privileges" in msg or "not authorized" in msg
+
+
+def _is_retryable_account_usage_error(e: BaseException, query: str) -> bool:
+    """
+    Check if a Snowflake error should be retried.
+
+    Returns True ONLY if BOTH conditions are met:
+    1. Query accesses ACCOUNT_USAGE schema (from query text)
+    2. Error is "002003: does not exist or not authorized" (from error message)
+
+    This targets the known intermittent unavailability of Snowflake's ACCOUNT_USAGE
+    system views during refresh, as confirmed by Snowflake support. All other errors
+    return False to avoid masking real problems.
+
+    Args:
+        e: The exception raised by Snowflake
+        query: The SQL query that was executed
+
+    Returns:
+        True if both conditions are met, False otherwise
+    """
+    msg = str(e).upper()
+    query_upper = query.upper()
+
+    is_account_usage_query = "ACCOUNT_USAGE" in query_upper
+
+    is_permission_error = (
+        "NOT AUTHORIZED" in msg or "DOES NOT EXIST" in msg
+    ) and "002003" in msg
+
+    return is_account_usage_query and is_permission_error

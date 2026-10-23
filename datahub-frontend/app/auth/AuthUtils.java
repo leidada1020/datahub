@@ -1,0 +1,210 @@
+package auth;
+
+import com.linkedin.common.urn.CorpuserUrn;
+import com.nimbusds.jwt.JWTClaimsSet;
+import com.nimbusds.jwt.JWTParser;
+import java.time.Duration;
+import java.time.temporal.ChronoUnit;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Optional;
+import java.util.regex.Pattern;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+import lombok.extern.slf4j.Slf4j;
+import play.mvc.Http;
+
+@Slf4j
+public class AuthUtils {
+
+  /**
+   * The config path that determines whether Metadata Service Authentication is enabled.
+   *
+   * <p>When enabled, the frontend server will proxy requests to the Metadata Service without
+   * requiring them to have a valid frontend-issued Session Cookie. This effectively means
+   * delegating the act of authentication to the Metadata Service. It is critical that if Metadata
+   * Service authentication is enabled at the frontend service layer, it is also enabled in the
+   * Metadata Service itself. Otherwise, unauthenticated traffic may reach the Metadata itself.
+   *
+   * <p>When disabled, the frontend server will require that all requests have a valid Session
+   * Cookie associated with them. Otherwise, requests will be denied with an Unauthorized error.
+   */
+  public static final String METADATA_SERVICE_AUTH_ENABLED_CONFIG_PATH =
+      "metadataService.auth.enabled";
+
+  /** The attribute inside session cookie representing a GMS-issued access token */
+  public static final String SESSION_COOKIE_GMS_TOKEN_NAME = "token";
+
+  /**
+   * An ID used to identify system callers that are internal to DataHub. Provided via configuration.
+   */
+  public static final String SYSTEM_CLIENT_ID_CONFIG_PATH = "systemClientId";
+
+  /**
+   * An Secret used to authenticate system callers that are internal to DataHub. Provided via
+   * configuration.
+   */
+  public static final String SYSTEM_CLIENT_SECRET_CONFIG_PATH = "systemClientSecret";
+
+  /** Cookie name for redirect url that is manually separated from the session to reduce size */
+  public static final String REDIRECT_URL_COOKIE_NAME = "REDIRECT_URL";
+
+  public static final CorpuserUrn DEFAULT_ACTOR_URN = new CorpuserUrn("datahub");
+
+  public static final String LOGIN_ROUTE = "/login";
+  public static final String USER_NAME = "username";
+  public static final String PASSWORD = "password";
+  public static final String ACTOR = "actor";
+  public static final String ACCESS_TOKEN = "token";
+  public static final String FULL_NAME = "fullName";
+  public static final String EMAIL = "email";
+  public static final String TITLE = "title";
+  public static final String INVITE_TOKEN = "inviteToken";
+  public static final String RESET_TOKEN = "resetToken";
+  public static final String BASE_URL = "baseUrl";
+  public static final String OIDC_ENABLED = "oidcEnabled";
+  public static final String CLIENT_ID = "clientId";
+  public static final String CLIENT_SECRET = "clientSecret";
+  public static final String DISCOVERY_URI = "discoveryUri";
+
+  public static final String USER_NAME_CLAIM = "userNameClaim";
+  public static final String USER_NAME_CLAIM_REGEX = "userNameClaimRegex";
+  public static final String SCOPE = "scope";
+  public static final String CLIENT_NAME = "clientName";
+  public static final String CLIENT_AUTHENTICATION_METHOD = "clientAuthenticationMethod";
+  public static final String JIT_PROVISIONING_ENABLED = "jitProvisioningEnabled";
+  public static final String PRE_PROVISIONING_REQUIRED = "preProvisioningRequired";
+  public static final String EXTRACT_GROUPS_ENABLED = "extractGroupsEnabled";
+  public static final String GROUPS_CLAIM = "groupsClaim";
+  public static final String RESPONSE_TYPE = "responseType";
+  public static final String RESPONSE_MODE = "responseMode";
+  public static final String USE_NONCE = "useNonce";
+  public static final String READ_TIMEOUT = "readTimeout";
+  public static final String CONNECT_TIMEOUT = "connectTimeout";
+  public static final String EXTRACT_JWT_ACCESS_TOKEN_CLAIMS = "extractJwtAccessTokenClaims";
+  // Retained for backwards compatibility
+  public static final String PREFERRED_JWS_ALGORITHM = "preferredJwsAlgorithm";
+  public static final String PREFERRED_JWS_ALGORITHM_2 = "preferredJwsAlgorithm2";
+  public static final String REQUIRED_GROUPS = "requiredGroups";
+  public static final String ACCESS_DENIED_MESSAGE = "accessDeniedMessage";
+  public static final String ACCESS_DENIED_REDIRECT_URL = "accessDeniedRedirectUrl";
+
+  /** Scheme prefix of a bearer-token Authorization header value; matched case-insensitively. */
+  private static final String BEARER_PREFIX = "Bearer ";
+
+  /**
+   * A token id is echoed back to the caller as a response header, and the token it was read from is
+   * never verified here, so the value is untrusted input. Restrict it to characters that cannot
+   * split a header or a log line, and bound its length. GMS issues UUIDs and external OAuth
+   * providers issue alphanumeric / base64url ids, so real tokens pass this filter.
+   */
+  private static final Pattern SAFE_TOKEN_ID = Pattern.compile("[A-Za-z0-9._~:+/=-]{1,256}");
+
+  /**
+   * Determines whether the inbound request should be forward to downstream Metadata Service. Today,
+   * this simply checks for the presence of an "Authorization" header or the presence of a valid
+   * session cookie issued by the frontend.
+   *
+   * <p>Note that this method DOES NOT actually verify the authentication token of an inbound
+   * request. That will be handled by the downstream Metadata Service. Until then, the request
+   * should be treated as UNAUTHENTICATED.
+   *
+   * <p>Returns true if the request is eligible to be forwarded to GMS, false otherwise.
+   */
+  public static boolean isEligibleForForwarding(Http.Request req) {
+    return hasValidSessionCookie(req) || hasAuthHeader(req);
+  }
+
+  /**
+   * Returns true if a request has a valid session cookie issued by the frontend server. Note that
+   * this DOES NOT verify whether the token within the session cookie will be accepted by the
+   * downstream GMS service.
+   *
+   * <p>Note that we depend on the presence of 2 cookies, one accessible to the browser and one not,
+   * as well as their agreement to determine authentication status.
+   */
+  public static boolean hasValidSessionCookie(final Http.Request req) {
+    Map<String, String> sessionCookie = req.session().data();
+    return sessionCookie.containsKey(ACCESS_TOKEN)
+        && sessionCookie.containsKey(ACTOR)
+        && req.getCookie(ACTOR).isPresent()
+        && req.session().data().get(ACTOR).equals(req.getCookie(ACTOR).get().value());
+  }
+
+  /** Returns true if a request includes the Authorization header, false otherwise */
+  public static boolean hasAuthHeader(final Http.Request req) {
+    return req.getHeaders().contains(Http.HeaderNames.AUTHORIZATION);
+  }
+
+  /**
+   * Extracts the JWT ID ("jti") claim from a bearer-token Authorization header value. GMS stamps a
+   * random UUID as the jti of every token it issues, so the jti identifies a token in access logs
+   * without exposing the token itself and without being usable to authenticate.
+   *
+   * <p>The signature is deliberately not verified: the token either came out of the frontend's own
+   * signed session cookie or will be verified by GMS when the request is proxied. This is a
+   * best-effort read for observability and must never fail the request it is attached to.
+   *
+   * @return the jti, or empty when the value is absent, is not a bearer token, is not a parseable
+   *     JWT, carries no jti, or carries a jti that is not safe to place in a header
+   */
+  public static Optional<String> extractTokenId(@Nullable final String authorizationHeaderValue) {
+    if (authorizationHeaderValue == null
+        || !authorizationHeaderValue.regionMatches(
+            true, 0, BEARER_PREFIX, 0, BEARER_PREFIX.length())) {
+      return Optional.empty();
+    }
+    final String token = authorizationHeaderValue.substring(BEARER_PREFIX.length()).trim();
+    try {
+      final JWTClaimsSet claims = JWTParser.parse(token).getJWTClaimsSet();
+      return Optional.ofNullable(claims == null ? null : claims.getJWTID())
+          .filter(id -> SAFE_TOKEN_ID.matcher(id).matches());
+    } catch (Exception e) {
+      // Opaque or malformed bearer tokens are legitimate input here; GMS decides whether to accept
+      // them. Catch broadly so that reading a claim for logging can never break proxying.
+      log.debug("Bearer token is not a parseable JWT; no token id extracted", e);
+      return Optional.empty();
+    }
+  }
+
+  /**
+   * Creates a client authentication cookie (actor cookie) with a specified TTL in hours.
+   *
+   * @param actorUrn the urn of the authenticated actor, e.g. "urn:li:corpuser:datahub"
+   * @param ttlInHours the number of hours until the actor cookie expires after being set
+   */
+  public static Http.Cookie createActorCookie(
+      @Nonnull final String actorUrn,
+      @Nonnull final Integer ttlInHours,
+      @Nonnull final String sameSite,
+      final boolean isSecure) {
+    return Http.Cookie.builder(ACTOR, actorUrn)
+        .withHttpOnly(false)
+        .withMaxAge(Duration.of(ttlInHours, ChronoUnit.HOURS))
+        .withSameSite(convertSameSiteValue(sameSite))
+        .withSecure(isSecure)
+        .build();
+  }
+
+  public static Map<String, String> createSessionMap(
+      final String userUrnStr, final String accessToken) {
+    final Map<String, String> sessionAttributes = new HashMap<>();
+    sessionAttributes.put(ACTOR, userUrnStr);
+    sessionAttributes.put(ACCESS_TOKEN, accessToken);
+    return sessionAttributes;
+  }
+
+  private AuthUtils() {}
+
+  private static Http.Cookie.SameSite convertSameSiteValue(@Nonnull final String sameSiteValue) {
+    try {
+      return Http.Cookie.SameSite.valueOf(sameSiteValue);
+    } catch (IllegalArgumentException e) {
+      log.warn(
+          String.format(
+              "Invalid AUTH_COOKIE_SAME_SITE value: %s. Using LAX instead.", sameSiteValue),
+          e);
+      return Http.Cookie.SameSite.LAX;
+    }
+  }
+}

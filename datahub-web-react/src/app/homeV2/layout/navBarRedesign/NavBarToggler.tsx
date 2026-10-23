@@ -1,0 +1,47 @@
+import { Sidebar } from '@phosphor-icons/react/dist/csr/Sidebar';
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { useNavBarContext } from '@app/homeV2/layout/navBarRedesign/NavBarContext';
+import { NAV_SIDEBAR_COLLAPSE_TRANSITION_MS } from '@app/sharedV2/constants';
+import analytics, { EventType } from '@src/app/analytics';
+
+const Toggler = styled.button<{ $isCollapsed?: boolean }>`
+    cursor: pointer;
+    margin: 0 0 0 auto;
+    padding: 4px;
+    border-radius: 6px;
+    border: none;
+    display: flex;
+    transition:
+        left ${NAV_SIDEBAR_COLLAPSE_TRANSITION_MS}ms ease-out,
+        background 300ms ease-in;
+    background: ${(props) => props.theme.colors.bgSurfaceNewNav};
+
+    &: hover {
+        background: ${(props) => props.theme.colors.bgHover}80;
+    }
+
+    & svg {
+        height: 20px;
+        width: 20px;
+        color: ${(props) => props.theme.colors.icon};
+    }
+`;
+
+export default function NavBarToggler() {
+    const { toggle, isCollapsed } = useNavBarContext();
+    const { t } = useTranslation('home.v2');
+
+    function handleToggle() {
+        analytics.event({ type: EventType.NavBarExpandCollapse, isExpanding: isCollapsed });
+        toggle();
+    }
+
+    return (
+        <Toggler onClick={handleToggle} aria-label={t('navBar.togglerAriaLabel')} data-testid="nav-bar-toggler">
+            <Sidebar />
+        </Toggler>
+    );
+}

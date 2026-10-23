@@ -1,0 +1,457 @@
+import json
+import os
+import subprocess
+import time
+from pathlib import Path
+from typing import Any, List
+from unittest import mock
+from unittest.mock import MagicMock, patch
+
+import pytest
+import time_machine
+import yaml
+from sqlalchemy import exc
+
+from datahub.ingestion.source.sql.oracle import (
+    OracleInspectorObjectWrapper,
+    OracleSource,
+)
+from datahub.ingestion.source.sql.sql_report import SQLSourceReport
+from datahub.testing import mce_helpers
+from tests.integration.oracle.common import (  # type: ignore[import-untyped]
+    OracleSourceMockDataBase,
+    OracleTestCaseBase,
+)
+from tests.test_helpers.click_helpers import run_datahub_cmd
+
+FROZEN_TIME = "2022-02-03 07:00:00"
+
+# Staging tables in STAGING_SCHEMA that may have volatile V$SQL queries
+# These are populated by INSERT operations during test setup
+VOLATILE_STAGING_TABLES = {
+    "urn:li:dataset:(urn:li:dataPlatform:oracle,xepdb1.staging_schema.employee_backup,PROD)",
+    "urn:li:dataset:(urn:li:dataPlatform:oracle,xepdb1.staging_schema.daily_revenue,PROD)",
+}
+
+
+def filter_volatile_vsql_queries(metadata_json: List[dict]) -> List[dict]:
+    """
+    Filter out volatile V$SQL query entities and their related lineage.
+
+    V$SQL is a cache, not a persistent log. DML queries from test setup
+    may or may not be present when the connector runs, depending on:
+    - Oracle cache flush timing
+    - Memory pressure
+    - Query execution timing
+
+    This function removes entities related to staging tables that are populated
+    by volatile INSERT queries, making tests deterministic regardless of cache state.
+    """
+    filtered = []
+    volatile_query_urns = set()
+
+    # First pass: collect query URNs that reference volatile staging tables
+    for entity in metadata_json:
+        if entity.get("entityType") == "query":
+            # Check if query references any volatile staging tables
+            aspect_json = entity.get("aspect", {}).get("json", {})
+            query_subjects = aspect_json.get("subjects", [])
+            if any(
+                subject.get("entity") in VOLATILE_STAGING_TABLES
+                for subject in query_subjects
+            ):
+                volatile_query_urns.add(entity.get("entityUrn", ""))
+
+    # Second pass: filter out volatile queries, staging datasets, and their lineage
+    for entity in metadata_json:
+        entity_urn = entity.get("entityUrn", "")
+
+        # Skip query entities that reference volatile staging tables
+        if entity.get("entityType") == "query" and entity_urn in volatile_query_urns:
+            continue
+
+        # Skip all aspects of staging table datasets (they only exist due to volatile queries)
+        if (
+            entity.get("entityType") == "dataset"
+            and entity_urn in VOLATILE_STAGING_TABLES
+        ):
+            continue
+
+        # Skip upstreamLineage that references volatile queries
+        if entity.get("aspectName") == "upstreamLineage":
+            aspect_json = entity.get("aspect", {}).get("json", {})
+            upstreams = aspect_json.get("upstreams", [])
+            fine_grained = aspect_json.get("fineGrainedLineages", [])
+
+            # Check if this lineage references a volatile query
+            has_volatile_query = any(
+                upstream.get("query") in volatile_query_urns for upstream in upstreams
+            ) or any(fg.get("query") in volatile_query_urns for fg in fine_grained)
+
+            if has_volatile_query:
+                continue
+
+        filtered.append(entity)
+
+    return filtered
+
+
+# TCPS. 1521 is not published. The listener keeps it on 0.0.0.0 so the
+# instance can register.
+ORACLE_PORT = 2484
+
+
+def _wait_for_ready_file(ready_file: Path, timeout: float = 600) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if ready_file.is_file():
+            return
+        time.sleep(0.5)
+    detail = _setup_failure_detail(ready_file)
+    raise TimeoutError(
+        f"Oracle TCPS setup did not finish within {timeout:.0f}s; expected {ready_file}\n{detail}"
+    )
+
+
+def _setup_failure_detail(ready_file: Path) -> str:
+    parts: List[str] = []
+    log = ready_file.parent / "setup.log"
+    if log.is_file():
+        parts.append(log.read_text(errors="replace")[-4000:])
+    else:
+        parts.append("startup script wrote no setup.log")
+    try:
+        logs = subprocess.run(
+            ["docker", "logs", "--tail", "80", "testoracle"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        blob = f"{logs.stdout or ''}{logs.stderr or ''}".strip()
+        if blob:
+            parts.append(blob[-4000:])
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        parts.append(f"docker logs failed: {exc}")
+    return "\n".join(parts)
+
+
+def _oracle_tls_connect_args(port: int) -> dict:
+    return {
+        "dsn": (
+            "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=localhost)"
+            f"(PORT={port}))(CONNECT_DATA=(SERVICE_NAME=XEPDB1)))"
+        ),
+        # ewallet.pem in this directory is the self-signed server cert the
+        # container exported. Hostname match is off: orapki does not put a
+        # SAN on that cert, and the wallet still pins which cert we trust.
+        "wallet_location": os.environ["ORACLE_WALLET"],
+        "ssl_server_dn_match": False,
+    }
+
+
+@pytest.fixture(scope="module")
+def oracle_runner(docker_compose_runner, pytestconfig, request):
+    test_resources_dir = pytestconfig.rootpath / "tests/integration/oracle"
+    # Compose interpolates ORACLE_TLS_DIR when it starts. The startup script
+    # runs as oracle and writes ewallet.pem plus a ready file into this tree.
+    tls_dir = test_resources_dir / ".tls"
+    wallet_dir = tls_dir / "wallet"
+    wallet_dir.mkdir(parents=True, exist_ok=True)
+    # The runner owns these directories. 0755 rejects the wallet export from
+    # the container uid.
+    tls_dir.chmod(0o777)
+    wallet_dir.chmod(0o777)
+    ready_file = tls_dir / "ready"
+    ready_file.unlink(missing_ok=True)
+    mp = pytest.MonkeyPatch()
+    mp.setenv("ORACLE_TLS_DIR", str(tls_dir))
+    mp.setenv("ORACLE_WALLET", str(wallet_dir))
+    request.addfinalizer(mp.undo)
+    with docker_compose_runner(
+        test_resources_dir / "docker-compose.yml", "oracle"
+    ) as docker_services:
+        # The ready file appears only after XEPDB1 is registered. 2484 itself
+        # opens earlier, at lsnrctl start. Cold XE creation plus the startup
+        # SQL needs longer than the old TCP wait.
+        _wait_for_ready_file(ready_file)
+
+        # The compose file exposes the listener port ephemerally, so a leaked
+        # container from a prior run can never hold onto the port a fresh run
+        # needs. Recipe ymls in this directory pick it up via ${ORACLE_PORT}.
+        oracle_port = docker_services.port_for("testoracle", ORACLE_PORT)
+        mp.setenv("ORACLE_PORT", str(oracle_port))
+
+        yield oracle_port
+
+
+SOURCE_FILES_PATH = "./tests/integration/oracle/source_files"
+config_files = [f for f in os.listdir(SOURCE_FILES_PATH) if f.endswith(".yml")]
+
+
+@pytest.mark.parametrize("config_file", config_files)
+@time_machine.travel(FROZEN_TIME, tick=False)
+@pytest.mark.integration
+def test_oracle_ingest(oracle_runner, pytestconfig, tmp_path, mock_time, config_file):
+    test_resources_dir = pytestconfig.rootpath / "tests/integration/oracle"
+    # Run the metadata ingestion pipeline.
+    config_file_path = (test_resources_dir / f"source_files/{config_file}").resolve()
+    run_datahub_cmd(
+        ["ingest", "-c", f"{config_file_path}"], tmp_path=tmp_path, check_result=True
+    )
+
+    output_path = tmp_path / "oracle_mces.json"
+    golden_path = (
+        test_resources_dir
+        / f"golden_files/golden_mces_{config_file.replace('.yml', '.json')}"
+    )
+
+    # auditStamp.time comes from V$SQL LAST_ACTIVE_TIME, not Python's clock
+    ignore_paths = [
+        r"root\[\d+\]\['aspect'\]\['json'\]\['upstreams'\]\[\d+\]\['auditStamp'\]\['time'\]",
+    ]
+
+    if "query_usage" in config_file:
+        with open(output_path) as f:
+            output_data = json.load(f)
+        with open(golden_path) as f:
+            golden_data = json.load(f)
+
+        output_filtered = filter_volatile_vsql_queries(output_data)
+        golden_filtered = filter_volatile_vsql_queries(golden_data)
+
+        filtered_output_path = tmp_path / "oracle_mces_filtered.json"
+        with open(filtered_output_path, "w") as f:
+            json.dump(output_filtered, f, indent=4)
+
+        filtered_golden_path = tmp_path / "oracle_golden_filtered.json"
+        with open(filtered_golden_path, "w") as f:
+            json.dump(golden_filtered, f, indent=4)
+
+        mce_helpers.check_golden_file(
+            pytestconfig,
+            output_path=filtered_output_path,
+            golden_path=filtered_golden_path,
+            ignore_paths=ignore_paths,
+        )
+    else:
+        mce_helpers.check_golden_file(
+            pytestconfig,
+            output_path=output_path,
+            golden_path=golden_path,
+            ignore_paths=ignore_paths,
+        )
+
+
+@pytest.mark.integration
+def test_oracle_test_connection(oracle_runner):
+    """Test Oracle connection using the test_connection method."""
+    config_dict = {
+        "username": "system",
+        "password": "example",
+        "host_port": f"localhost:{oracle_runner}",
+        "service_name": "XEPDB1",
+        "options": {"connect_args": _oracle_tls_connect_args(oracle_runner)},
+    }
+
+    report = OracleSource.test_connection(config_dict)
+    assert report.basic_connectivity is not None
+    assert report.basic_connectivity.capable
+    assert report.basic_connectivity.failure_reason is None
+
+
+@pytest.mark.integration
+def test_oracle_connect_args_dsn_failover(oracle_runner):
+    """The documented HA pattern: a multi-address descriptor in
+    options.connect_args.dsn overrides host_port and fails over past an
+    unreachable first address."""
+    tls_args = _oracle_tls_connect_args(oracle_runner)
+    recipe = yaml.safe_load(
+        Path(SOURCE_FILES_PATH, "oracle_to_file_with_all_tables.yml").read_text()
+    )["source"]["config"]
+    config_dict = {
+        "username": recipe["username"],
+        "password": recipe["password"],
+        # Required by the config but unused: connect_args.dsn takes precedence.
+        "host_port": "unused:1521",
+        "options": {
+            "connect_args": {
+                **tls_args,
+                "dsn": (
+                    "(DESCRIPTION=(FAILOVER=on)(LOAD_BALANCE=off)(ADDRESS_LIST="
+                    # Nothing listens on port 1, so the driver must move on.
+                    "(ADDRESS=(PROTOCOL=TCPS)(HOST=localhost)(PORT=1))"
+                    f"(ADDRESS=(PROTOCOL=TCPS)(HOST=localhost)(PORT={oracle_runner})))"
+                    "(CONNECT_DATA=(SERVICE_NAME=XEPDB1)))"
+                ),
+            }
+        },
+    }
+
+    report = OracleSource.test_connection(config_dict)
+    assert report.basic_connectivity is not None
+    assert report.basic_connectivity.capable, report.basic_connectivity.failure_reason
+
+
+class OracleErrorHandlingMockData(OracleSourceMockDataBase):
+    def get_data(self, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(args[0], str) and "sys_context" in args[0]:
+            raise exc.DatabaseError("statement", [], Exception("Mock DB Error"))
+        return super().get_data(*args, **kwargs)
+
+
+class OracleIntegrationTestCase(OracleTestCaseBase):
+    def apply_mock_data(self, mock_create_engine, mock_inspect, mock_event):
+        mock_event.listen.return_value = None
+
+        connection_magic_mock = MagicMock()
+        connection_magic_mock.execute.side_effect = self.get_mock_data
+
+        inspector_magic_mock = MagicMock()
+        inspector_magic_mock.bind = connection_magic_mock
+        inspector_magic_mock.engine.url.database = self.get_database_name()
+        inspector_magic_mock.dialect.normalize_name.side_effect = lambda x: x
+        inspector_magic_mock.dialect.denormalize_name.side_effect = lambda x: x
+        inspector_magic_mock.dialect.server_version_info = (
+            self.get_server_version_info()
+        )
+        inspector_magic_mock.dialect.type_compiler.process = lambda x: "NUMBER"
+        # SQLAlchemy 2.0 renders column types via dialect.type_compiler_instance.
+        inspector_magic_mock.dialect.type_compiler_instance.process = lambda x: "NUMBER"
+
+        mock_inspect.return_value = inspector_magic_mock
+        mock_create_engine.connect.return_value = connection_magic_mock
+
+    @mock.patch("datahub.ingestion.source.sql.sql_common.create_engine")
+    @mock.patch("datahub.ingestion.source.sql.sql_common.inspect")
+    @mock.patch("datahub.ingestion.source.sql.oracle.event")
+    def apply(self, mock_create_engine, mock_inspect, mock_event):
+        self.apply_mock_data(mock_create_engine, mock_inspect, mock_event)
+        super().apply()
+
+
+class TestOracleSourceErrorHandling(OracleIntegrationTestCase):
+    def __init__(self, pytestconfig, tmp_path):
+        super().__init__(
+            pytestconfig=pytestconfig,
+            tmp_path=tmp_path,
+            golden_file_name="golden_files/golden_test_error_handling.json",
+            output_file_name="oracle_mce_output_error_handling.json",
+            add_database_name_to_urn=False,
+        )
+        self.default_mock_data = OracleErrorHandlingMockData()
+
+    def test_get_db_name_error_handling(self):
+        inspector = MagicMock()
+        inspector.bind.execute.side_effect = exc.DatabaseError(
+            "statement", [], Exception("Mock DB Error")
+        )
+        inspector_wrapper = OracleInspectorObjectWrapper(inspector, SQLSourceReport())
+
+        db_name = inspector_wrapper.get_db_name()
+
+        assert db_name == ""
+        assert len(inspector_wrapper.report.failures) == 1
+        error = inspector_wrapper.report.failures[0]
+        assert error.message == "database_fetch_error"
+
+    def test_get_pk_constraint_error_handling(self):
+        inspector = MagicMock()
+        inspector.dialect.normalize_name.side_effect = lambda x: x
+        inspector.dialect.denormalize_name.side_effect = lambda x: x
+        inspector_wrapper = OracleInspectorObjectWrapper(inspector, SQLSourceReport())
+
+        with patch.object(
+            inspector_wrapper, "_get_constraint_data"
+        ) as mock_get_constraint:
+            mock_get_constraint.side_effect = Exception("Mock constraint error")
+
+            result = inspector_wrapper.get_pk_constraint("test_table", "test_schema")
+
+            assert result == {"constrained_columns": [], "name": None}
+            assert len(inspector_wrapper.report.failures) == 1
+
+    def test_get_foreign_keys_missing_table_warning(self):
+        inspector = MagicMock()
+        inspector.dialect.normalize_name.side_effect = lambda x: x
+        inspector.dialect.denormalize_name.side_effect = lambda x: x
+        inspector_wrapper = OracleInspectorObjectWrapper(inspector, SQLSourceReport())
+
+        mock_data = [
+            (
+                "FK1",
+                "R",
+                "local_col",
+                None,
+                "remote_col",
+                "remote_owner",
+                1,
+                1,
+                None,
+                "NO ACTION",
+            )
+        ]
+
+        with patch.object(
+            inspector_wrapper, "_get_constraint_data"
+        ) as mock_get_constraint:
+            mock_get_constraint.return_value = mock_data
+
+            inspector_wrapper.get_foreign_keys("test_table", "test_schema")
+
+            assert len(inspector_wrapper.report.warnings) == 1
+            warning = inspector_wrapper.report.warnings[0]
+            assert warning.message == "Unable to query table_name from dba_cons_columns"
+
+    def test_get_table_comment_with_cast(self):
+        inspector = MagicMock()
+        inspector.dialect.normalize_name.side_effect = lambda x: x
+        inspector.dialect.denormalize_name.side_effect = lambda x: x
+        inspector_wrapper = OracleInspectorObjectWrapper(inspector, SQLSourceReport())
+
+        mock_comment = "Test table comment"
+        inspector.bind.execute.return_value.scalar.return_value = mock_comment
+
+        result = inspector_wrapper.get_table_comment("test_table", "test_schema")
+
+        assert result == {"text": mock_comment}
+        execute_args = inspector.bind.execute.call_args[0]
+        sql_text = str(execute_args[0])
+        assert "CAST(:table_name AS VARCHAR(128))" in sql_text
+        assert "CAST(:schema_name AS VARCHAR(128))" in sql_text
+
+
+@time_machine.travel(FROZEN_TIME, tick=False)
+@pytest.mark.integration
+def test_oracle_source_integration_with_out_database(pytestconfig, tmp_path):
+    oracle_source_integration_test = OracleIntegrationTestCase(
+        pytestconfig=pytestconfig,
+        tmp_path=tmp_path,
+        golden_file_name="golden_files/golden_test_ingest_with_out_database.json",
+        output_file_name="oracle_mce_output_with_out_database.json",
+        add_database_name_to_urn=False,
+    )
+    oracle_source_integration_test.apply()
+
+
+@time_machine.travel(FROZEN_TIME, tick=False)
+@pytest.mark.integration
+def test_oracle_source_integration_with_database(pytestconfig, tmp_path):
+    oracle_source_integration_test = OracleIntegrationTestCase(
+        pytestconfig=pytestconfig,
+        tmp_path=tmp_path,
+        golden_file_name="golden_files/golden_test_ingest_with_database.json",
+        output_file_name="oracle_mce_output_with_database.json",
+        add_database_name_to_urn=True,
+    )
+    oracle_source_integration_test.apply()
+
+
+@time_machine.travel(FROZEN_TIME, tick=False)
+@pytest.mark.integration
+def test_oracle_source_error_handling(pytestconfig, tmp_path):
+    test_case = TestOracleSourceErrorHandling(
+        pytestconfig=pytestconfig,
+        tmp_path=tmp_path,
+    )
+    test_case.apply()

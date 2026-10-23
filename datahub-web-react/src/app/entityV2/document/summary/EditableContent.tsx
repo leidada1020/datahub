@@ -1,0 +1,436 @@
+import { Button } from '@components';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { Editor } from '@components/components/Editor';
+import useClickOutside from '@components/components/Utils/ClickOutside/useClickOutside';
+
+import { useContextLayout } from '@app/context/ContextLayoutContext';
+import { useDocumentPermissions } from '@app/document/hooks/useDocumentPermissions';
+import { useExtractMentions } from '@app/document/hooks/useExtractMentions';
+import { useUpdateDocument } from '@app/document/hooks/useUpdateDocument';
+import { categorizeUrns, extractUrnsFromMarkdown, isAllowedRelatedAssetUrn } from '@app/document/utils/documentUtils';
+import { useRefetch } from '@app/entity/shared/EntityContext';
+import { RelatedSection } from '@app/entityV2/document/summary/RelatedSection';
+import { useDiscardUnsavedChangesConfirmationContext } from '@app/sharedV2/confirmation/DiscardUnsavedChangesConfirmationContext';
+import useFileUpload from '@app/sharedV2/hooks/useFileUpload';
+import useFileUploadAnalyticsCallbacks from '@app/sharedV2/hooks/useFileUploadAnalyticsCallbacks';
+import { useIsDocumentExplicitSaveEnabled } from '@app/useAppConfig';
+
+import { DocumentRelatedAsset, DocumentRelatedDocument, UploadDownloadScenario } from '@types';
+
+const ContentWrapper = styled.div`
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+`;
+
+const EditorSection = styled.div`
+    width: 100%;
+    position: relative;
+`;
+
+const StyledEditor = styled(Editor)<{ $hideToolbar?: boolean; $isEmpty?: boolean }>`
+    border: none;
+    &&& {
+        .remirror-editor {
+            padding: 0px 0;
+            ${(props) => props.$isEmpty && `min-height: 460px;`}
+        }
+        .remirror-editor.ProseMirror,
+        .datahub-editor-content {
+            font-size: 15px;
+            line-height: 1.7;
+            color: ${(props) => props.theme.colors.text};
+        }
+        p:last-of-type {
+            margin-bottom: 0;
+        }
+    }
+
+    /* Hide toolbar completely when not focused - must come before animations */
+    ${(props) =>
+        props.$hideToolbar &&
+        `
+        .remirror-theme > div:first-child,
+        .remirror-editor-wrapper > div:first-child:not(.remirror-editor) {
+            display: none !important;
+        }
+        padding-bottom: 0 !important;
+    `}
+
+    /* Animate toolbar appearance - only on show, not hide */
+    ${(props) =>
+        !props.$hideToolbar &&
+        `
+        .remirror-theme > div:first-child,
+        .remirror-editor-wrapper > div:first-child:not(.remirror-editor) {
+            animation: fadeIn 0.3s ease-out;
+        }
+    `}
+
+    @keyframes fadeIn {
+        from {
+            opacity: 0;
+        }
+        to {
+            opacity: 1;
+        }
+    }
+`;
+
+const SaveActions = styled.div`
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    width: 100%;
+`;
+
+/** State passed to SaaS-only actions on the explicit-save bar, such as Propose. */
+export type DocumentExplicitSaveState = {
+    content: string;
+    isDirty: boolean;
+    isSaving: boolean;
+};
+
+export type DocumentEditorAcrylProps = {
+    renderSaveBarActions?: (state: DocumentExplicitSaveState) => React.ReactNode;
+};
+
+interface EditableContentProps {
+    documentUrn: string;
+    initialContent: string;
+    relatedAssets?: DocumentRelatedAsset[];
+    relatedDocuments?: DocumentRelatedDocument[];
+    /** SaaS-only inputs. OSS leaves this unset. */
+    acrylProps?: DocumentEditorAcrylProps;
+}
+
+/**
+ * With explicit save enabled, unsaved edits are reported to the nearest
+ * DiscardUnsavedChangesConfirmationProvider so the owning surface (document profile page or
+ * DocumentModal) can prompt before navigating away or closing.
+ */
+export const EditableContent: React.FC<EditableContentProps> = ({
+    documentUrn,
+    initialContent,
+    relatedAssets,
+    relatedDocuments,
+    acrylProps,
+}) => {
+    const { t } = useTranslation('entity.types');
+    const { t: tActions } = useTranslation('common.actions');
+    const explicitSaveEnabled = useIsDocumentExplicitSaveEnabled();
+    const { setIsDirty } = useDiscardUnsavedChangesConfirmationContext();
+    const [content, setContent] = useState(initialContent || '');
+    const [savedContent, setSavedContent] = useState(initialContent || '');
+    const [isSaving, setIsSaving] = useState(false);
+    const [isEditorFocused, setIsEditorFocused] = useState(false);
+    const [editorVersion, setEditorVersion] = useState(0);
+    const lastSavedContentRef = React.useRef<string>(initialContent || '');
+    const editorSectionRef = useRef<HTMLDivElement>(null);
+    const { canEditContents } = useDocumentPermissions(documentUrn);
+    const { updateContents, updateRelatedEntities } = useUpdateDocument();
+    const refetch = useRefetch();
+    // Extract mentions from content (currently unused, but hook needs to run)
+    useExtractMentions(content);
+
+    // Get layout context for toolbar positioning (only available in Context Documents layout)
+    const contextLayout = useContextLayout();
+
+    // Calculate toolbar styles to center on content area when sidebar is present
+    const toolbarStyles = useMemo((): React.CSSProperties | undefined => {
+        if (!contextLayout) return undefined;
+
+        // Offset the toolbar center by half the sidebar width
+        const offset = contextLayout.sidebarWidth / 2;
+        return {
+            left: `calc(50% + ${offset}px)`,
+            transform: `translateX(-40%)`,
+        };
+    }, [contextLayout]);
+
+    const uploadFileAnalyticsCallbacks = useFileUploadAnalyticsCallbacks({
+        scenario: UploadDownloadScenario.AssetDocumentation,
+        assetUrn: documentUrn,
+    });
+
+    const { uploadFile } = useFileUpload({
+        scenario: UploadDownloadScenario.AssetDocumentation,
+        assetUrn: documentUrn,
+    });
+
+    // Detect when initialContent changes externally (e.g., version restore, not from our save)
+    useEffect(() => {
+        const newContent = initialContent || '';
+
+        // If content changed and it's NOT from our own save, increment version to remount editor
+        if (newContent !== lastSavedContentRef.current && newContent !== content) {
+            setContent(newContent);
+            setSavedContent(newContent);
+            setEditorVersion((v) => v + 1);
+        }
+
+        // Update the ref to track the latest server content
+        lastSavedContentRef.current = newContent;
+    }, [initialContent, content]);
+
+    // Save function that can be reused
+    const saveDocument = useCallback(
+        async (contentToSave: string) => {
+            if (isSaving || contentToSave === initialContent || !canEditContents) {
+                return;
+            }
+
+            setIsSaving(true);
+            try {
+                // Extract URNs from markdown links — balanced-parenthesis parser handles
+                // nested URNs like dataJob:(dataFlow:(...),task)
+                const extractedUrns = extractUrnsFromMarkdown(contentToSave).filter(
+                    (urn) => urn.includes(':document:') || isAllowedRelatedAssetUrn(urn),
+                );
+                const { documentUrns: documentUrnsToSave, assetUrns: assetUrnsToSave } = categorizeUrns(extractedUrns);
+
+                // Merge extracted URNs with existing ones (additive, not replacement)
+                const existingAssetUrns = new Set(relatedAssets?.map((ra) => ra.asset.urn) || []);
+                const existingDocumentUrns = new Set(relatedDocuments?.map((rd) => rd.document.urn) || []);
+
+                assetUrnsToSave.forEach((urn) => existingAssetUrns.add(urn));
+                documentUrnsToSave.forEach((urn) => existingDocumentUrns.add(urn));
+
+                const finalAssetUrns = Array.from(existingAssetUrns);
+                const finalDocumentUrns = Array.from(existingDocumentUrns);
+
+                const updated = await updateContents({
+                    urn: documentUrn,
+                    contents: { text: contentToSave },
+                });
+                if (!updated) return;
+
+                await updateRelatedEntities({
+                    urn: documentUrn,
+                    relatedAssets: finalAssetUrns,
+                    relatedDocuments: finalDocumentUrns,
+                });
+                lastSavedContentRef.current = contentToSave;
+                setSavedContent(contentToSave);
+                await refetch();
+            } catch (error) {
+                console.error('[EditableContent] Failed to save document:', error);
+            } finally {
+                setIsSaving(false);
+            }
+        },
+        [
+            isSaving,
+            initialContent,
+            canEditContents,
+            updateContents,
+            updateRelatedEntities,
+            documentUrn,
+            refetch,
+            relatedAssets,
+            relatedDocuments,
+        ],
+    );
+
+    const isDirty = explicitSaveEnabled && canEditContents && content !== savedContent;
+
+    useEffect(() => {
+        setIsDirty(isDirty);
+        return () => setIsDirty(false);
+    }, [isDirty, setIsDirty]);
+
+    // Auto-save after 3 seconds of no typing, unless explicit save is on.
+    useEffect(() => {
+        if (!explicitSaveEnabled && content !== initialContent && canEditContents && !isSaving) {
+            const timer = setTimeout(() => {
+                saveDocument(content);
+            }, 3000);
+
+            return () => clearTimeout(timer);
+        }
+        return undefined;
+    }, [content, initialContent, canEditContents, isSaving, saveDocument, explicitSaveEnabled]);
+
+    // Save on blur (clicking away from the editor) when the editor auto-saves.
+    const handleBlur = useCallback(() => {
+        if (explicitSaveEnabled) {
+            return;
+        }
+        if (content !== initialContent) {
+            saveDocument(content);
+        }
+    }, [content, initialContent, saveDocument, explicitSaveEnabled]);
+
+    const handleClickOutside = useCallback(() => {
+        setIsEditorFocused(false);
+        handleBlur();
+    }, [handleBlur]);
+
+    const clickOutsideOptions = useMemo(
+        () => ({
+            wrappers: [editorSectionRef],
+            ignoreSelector: '.ant-dropdown',
+        }),
+        [],
+    );
+
+    useClickOutside(handleClickOutside, clickOutsideOptions);
+
+    // Save before navigating away. Explicit save uses the discard confirmation instead.
+    useEffect(() => {
+        if (explicitSaveEnabled) {
+            return undefined;
+        }
+
+        const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+            if (content !== initialContent && canEditContents && !isSaving) {
+                // Attempt to save synchronously
+                saveDocument(content);
+
+                // Show browser warning if there are unsaved changes
+                e.preventDefault();
+                e.returnValue = '';
+            }
+        };
+
+        window.addEventListener('beforeunload', handleBeforeUnload);
+        return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+    }, [content, initialContent, canEditContents, isSaving, saveDocument, explicitSaveEnabled]);
+
+    // Handle updating related entities (supports both adding and removing)
+    // The passed URNs represent the final desired list after user selections/deselections
+    const handleAddEntities = useCallback(
+        async (assetUrns: string[], documentUrns: string[]) => {
+            // The URNs passed here are the final list (after user selections/deselections in the dropdown)
+            // So we replace the entire list, which handles both additions and removals
+            await updateRelatedEntities({
+                urn: documentUrn,
+                relatedAssets: assetUrns,
+                relatedDocuments: documentUrns,
+            });
+
+            // Refetch to get updated data
+            await refetch();
+        },
+        [documentUrn, updateRelatedEntities, refetch],
+    );
+
+    // Handle removing a single related entity
+    const handleRemoveEntity = useCallback(
+        async (urnToRemove: string) => {
+            // Get existing URNs
+            const existingAssetUrns = relatedAssets?.map((ra) => ra.asset.urn) || [];
+            const existingDocumentUrns = relatedDocuments?.map((rd) => rd.document.urn) || [];
+
+            // Remove the URN from the appropriate list
+            const isDocument = urnToRemove.includes(':document:');
+            const finalAssetUrns = isDocument
+                ? existingAssetUrns
+                : existingAssetUrns.filter((urn) => urn !== urnToRemove);
+            const finalDocumentUrns = isDocument
+                ? existingDocumentUrns.filter((urn) => urn !== urnToRemove)
+                : existingDocumentUrns;
+
+            await updateRelatedEntities({
+                urn: documentUrn,
+                relatedAssets: finalAssetUrns,
+                relatedDocuments: finalDocumentUrns,
+            });
+
+            // Refetch to get updated data
+            await refetch();
+        },
+        [documentUrn, updateRelatedEntities, refetch, relatedAssets, relatedDocuments],
+    );
+
+    // Unsaved edits keep the toolbar open so Save stays reachable after the editor loses focus.
+    const showToolbar = isEditorFocused || isDirty;
+
+    const handleCancel = () => {
+        setContent(savedContent);
+        setEditorVersion((v) => v + 1);
+        setIsEditorFocused(false);
+    };
+
+    const saveActions = isDirty ? (
+        <SaveActions data-testid="document-save-bar">
+            <Button
+                variant="text"
+                color="gray"
+                size="sm"
+                disabled={isSaving}
+                onClick={handleCancel}
+                data-testid="document-cancel-button"
+            >
+                {tActions('cancel')}
+            </Button>
+            {acrylProps?.renderSaveBarActions?.({ content, isDirty, isSaving })}
+            <Button
+                size="sm"
+                isLoading={isSaving}
+                disabled={isSaving}
+                onClick={() => saveDocument(content)}
+                data-testid="document-save-button"
+            >
+                {tActions('save')}
+            </Button>
+        </SaveActions>
+    ) : undefined;
+
+    return (
+        <ContentWrapper>
+            <EditorSection
+                ref={editorSectionRef}
+                data-testid="document-editor-section"
+                onFocus={() => setIsEditorFocused(true)}
+            >
+                {canEditContents ? (
+                    <StyledEditor
+                        data-testid="document-content-editor"
+                        key={`editor-${documentUrn}-${editorVersion}`}
+                        content={content}
+                        onChange={setContent}
+                        placeholder={t('document.writeAboutAnythingPlaceholder')}
+                        hideBorder
+                        doNotFocus
+                        $hideToolbar={!showToolbar}
+                        $isEmpty={!content.trim()}
+                        fixedBottomToolbar={showToolbar}
+                        toolbarStyles={toolbarStyles}
+                        belowToolbar={saveActions}
+                        uploadFileProps={{
+                            onFileUpload: uploadFile,
+                            ...uploadFileAnalyticsCallbacks,
+                        }}
+                    />
+                ) : (
+                    <StyledEditor
+                        data-testid="document-content-editor-readonly"
+                        key={`editor-readonly-${documentUrn}-${editorVersion}`}
+                        content={content}
+                        readOnly
+                        placeholder={t('document.noContentPlaceholder')}
+                        hideBorder
+                        $isEmpty={!content.trim()}
+                    />
+                )}
+            </EditorSection>
+
+            {!isEditorFocused && (
+                <RelatedSection
+                    relatedAssets={relatedAssets}
+                    relatedDocuments={relatedDocuments}
+                    documentUrn={documentUrn}
+                    onAddEntities={handleAddEntities}
+                    onRemoveEntity={handleRemoveEntity}
+                    canEdit={canEditContents}
+                />
+            )}
+        </ContentWrapper>
+    );
+};

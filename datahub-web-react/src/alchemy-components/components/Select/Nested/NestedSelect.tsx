@@ -1,0 +1,370 @@
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+
+import { Dropdown } from '@components/components/Dropdown';
+import { NestedOption } from '@components/components/Select/Nested/NestedOption';
+import { NestedSelectOption } from '@components/components/Select/Nested/types';
+import { filterNestedSelectOptions } from '@components/components/Select/Nested/utils';
+import {
+    Container,
+    DropdownContainer,
+    OptionList,
+    Required,
+    SelectBase,
+    SelectLabel,
+} from '@components/components/Select/components';
+import DropdownFooterActions from '@components/components/Select/private/DropdownFooterActions';
+import DropdownSearchBar from '@components/components/Select/private/DropdownSearchBar';
+import SelectActionButtons from '@components/components/Select/private/SelectActionButtons';
+import SelectLabelRenderer from '@components/components/Select/private/SelectLabelRenderer/SelectLabelRenderer';
+import useSelectDropdown from '@components/components/Select/private/hooks/useSelectDropdown';
+import { CustomOptionRenderer, SelectLabelProps, SelectSizeOptions } from '@components/components/Select/types';
+import { getFooterButtonSize } from '@components/components/Select/utils';
+
+const NO_PARENT_VALUE = 'no_parent_value';
+
+export interface SelectProps<OptionType extends NestedSelectOption = NestedSelectOption> {
+    options: OptionType[];
+    label?: string;
+    value?: string;
+    initialValues?: OptionType[];
+    onCancel?: () => void;
+    onUpdate?: (selectedValues: OptionType[]) => void;
+    size?: SelectSizeOptions;
+    showSearch?: boolean;
+    isDisabled?: boolean;
+    isReadOnly?: boolean;
+    isRequired?: boolean;
+    isMultiSelect?: boolean;
+    areParentsSelectable?: boolean;
+    loadData?: (node: OptionType) => void;
+    onSearch?: (query: string) => void;
+    width?: number | 'full' | 'fit-content';
+    minWidth?: string;
+    height?: number;
+    placeholder?: string;
+    searchPlaceholder?: string;
+    isLoadingParentChildList?: boolean;
+    showClear?: boolean;
+    shouldAlwaysSyncParentValues?: boolean;
+    hideParentCheckbox?: boolean;
+    implicitlySelectChildren?: boolean;
+    selectChildrenWithParent?: boolean;
+    shouldDisplayConfirmationFooter?: boolean;
+    selectLabelProps?: SelectLabelProps;
+    renderCustomOptionText?: CustomOptionRenderer<OptionType>;
+    renderCustomSelectedValue?: (option: OptionType) => React.ReactNode;
+    dataTestId?: string;
+}
+
+const selectDefaults: SelectProps = {
+    options: [],
+    label: '',
+    size: 'md',
+    showSearch: false,
+    isDisabled: false,
+    isReadOnly: false,
+    isRequired: false,
+    isMultiSelect: true,
+    width: 255,
+    height: 425,
+    shouldDisplayConfirmationFooter: false,
+};
+
+export const NestedSelect = <OptionType extends NestedSelectOption = NestedSelectOption>({
+    options = [],
+    label = selectDefaults.label,
+    initialValues = [],
+    onUpdate,
+    loadData,
+    onSearch,
+    showSearch = selectDefaults.showSearch,
+    isDisabled = selectDefaults.isDisabled,
+    isReadOnly = selectDefaults.isReadOnly,
+    isRequired = selectDefaults.isRequired,
+    isMultiSelect = selectDefaults.isMultiSelect,
+    size = selectDefaults.size,
+    areParentsSelectable = true,
+    placeholder,
+    searchPlaceholder,
+    height = selectDefaults.height,
+    isLoadingParentChildList = false,
+    showClear = false,
+    shouldAlwaysSyncParentValues = false,
+    hideParentCheckbox = false,
+    implicitlySelectChildren = true,
+    selectChildrenWithParent = true,
+    shouldDisplayConfirmationFooter = selectDefaults.shouldDisplayConfirmationFooter,
+    selectLabelProps,
+    renderCustomOptionText,
+    renderCustomSelectedValue,
+    dataTestId,
+    ...props
+}: SelectProps<OptionType>) => {
+    const { t } = useTranslation('alchemy');
+    const [searchQuery, setSearchQuery] = useState('');
+    const [selectedOptions, setSelectedOptions] = useState<OptionType[]>(initialValues);
+    const [stagedOptions, setStagedOptions] = useState<OptionType[]>(initialValues);
+    const selectRef = useRef<HTMLDivElement>(null);
+    const dropdownRef = useRef<HTMLDivElement>(null);
+    const previousInitialValueKeysRef = useRef<string>(
+        (initialValues ?? [])
+            .map((value) => value.value)
+            .sort()
+            .join(','),
+    );
+    const {
+        isOpen,
+        isVisible,
+        close: closeDropdown,
+        toggle: toggleDropdown,
+    } = useSelectDropdown(false, selectRef, dropdownRef);
+
+    useEffect(() => {
+        if (!shouldAlwaysSyncParentValues) {
+            return;
+        }
+
+        const initialValueKeys = (initialValues ?? [])
+            .map((value) => value.value)
+            .sort()
+            .join(',');
+        if (initialValueKeys === previousInitialValueKeysRef.current) {
+            return;
+        }
+
+        previousInitialValueKeysRef.current = initialValueKeys;
+        setSelectedOptions(initialValues ?? []);
+        setStagedOptions(initialValues ?? []);
+    }, [initialValues, shouldAlwaysSyncParentValues]);
+
+    const handleSelectClick = useCallback(() => {
+        if (!isDisabled && !isReadOnly) {
+            toggleDropdown();
+        }
+    }, [toggleDropdown, isDisabled, isReadOnly]);
+
+    const handleSearch = useCallback(
+        (query: string) => {
+            setSearchQuery(query);
+            onSearch?.(query);
+        },
+        [onSearch],
+    );
+
+    const filteredOptions = useMemo(() => {
+        return filterNestedSelectOptions(options, searchQuery);
+    }, [options, searchQuery]);
+
+    // Instead of calling the update function individually whenever selectedOptions changes,
+    // we use the useEffect hook to trigger the onUpdate function automatically when selectedOptions is updated.
+    useEffect(() => {
+        if (onUpdate && !shouldDisplayConfirmationFooter) {
+            onUpdate(selectedOptions);
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [selectedOptions, shouldDisplayConfirmationFooter]);
+
+    // Sync staged and selected options automaticly when shouldDisplayConfirmationFooter disabled
+    useEffect(() => {
+        if (!shouldDisplayConfirmationFooter) setSelectedOptions(stagedOptions);
+    }, [shouldDisplayConfirmationFooter, stagedOptions]);
+
+    const onClickUpdateButton = useCallback(() => {
+        setSelectedOptions(stagedOptions); // update selected options
+        onUpdate?.(stagedOptions);
+        closeDropdown();
+        handleSearch('');
+    }, [closeDropdown, stagedOptions, handleSearch, onUpdate]);
+
+    const onClickCancelButton = useCallback(() => {
+        setStagedOptions(selectedOptions); // reset staged options
+        closeDropdown();
+        handleSearch('');
+    }, [closeDropdown, selectedOptions, handleSearch]);
+
+    const handleOptionChange = useCallback(
+        (option: OptionType) => {
+            let newStagedOptions: OptionType[];
+            if (stagedOptions.find((o) => o.value === option.value)) {
+                newStagedOptions = stagedOptions.filter((o) => o.value !== option.value);
+            } else if (!isMultiSelect) {
+                // Single selection: replace all options with just this one
+                newStagedOptions = [option];
+            } else {
+                // Multi selection: add to existing options
+                newStagedOptions = [...stagedOptions, option];
+            }
+            setStagedOptions(newStagedOptions);
+            if (!isMultiSelect && !shouldDisplayConfirmationFooter) {
+                closeDropdown();
+            }
+        },
+        [closeDropdown, stagedOptions, isMultiSelect, shouldDisplayConfirmationFooter],
+    );
+
+    const addOptions = useCallback(
+        (optionsToAdd: OptionType[]) => {
+            if (!isMultiSelect) {
+                // Single selection: take only the first option
+                const firstOption = optionsToAdd[0];
+                if (firstOption) {
+                    setStagedOptions([firstOption]);
+                }
+            } else {
+                // Multi selection: add to existing options
+                const existingValues = new Set(stagedOptions.map((option) => option.value));
+                const filteredOptionsToAdd = optionsToAdd.filter((option) => !existingValues.has(option.value));
+                if (filteredOptionsToAdd.length) {
+                    const newStagedOptions = [...stagedOptions, ...filteredOptionsToAdd];
+                    setStagedOptions(newStagedOptions);
+                }
+            }
+        },
+        [stagedOptions, isMultiSelect],
+    );
+
+    const removeOptions = useCallback(
+        (optionsToRemove: OptionType[], syncWithSelectedOptions?: boolean) => {
+            const newValues = stagedOptions.filter(
+                (selectedOption) => !optionsToRemove.find((o) => o.value === selectedOption.value),
+            );
+            setStagedOptions(newValues);
+            if (syncWithSelectedOptions) setSelectedOptions(newValues);
+        },
+        [stagedOptions],
+    );
+
+    const handleClearSelection = useCallback(() => {
+        setStagedOptions([]);
+        setSelectedOptions([]);
+        closeDropdown();
+        if (onUpdate) {
+            onUpdate([]);
+        }
+    }, [closeDropdown, onUpdate]);
+
+    const onDropdownOpenChange = useCallback(
+        (open: boolean) => {
+            // reset staged options on dropdown's closing when shouldDisplayConfirmationFooter enabled
+            if (shouldDisplayConfirmationFooter && !open) {
+                setStagedOptions(selectedOptions);
+            }
+        },
+        [selectedOptions, shouldDisplayConfirmationFooter],
+    );
+
+    useEffect(() => {
+        onDropdownOpenChange(isOpen);
+    }, [isOpen, onDropdownOpenChange]);
+
+    // generate map for options to quickly fetch children
+    const parentValueToOptions: { [parentValue: string]: OptionType[] } = {};
+    filteredOptions.forEach((o) => {
+        const parentValue = o.parentValue || NO_PARENT_VALUE;
+        parentValueToOptions[parentValue] = parentValueToOptions[parentValue]
+            ? [...parentValueToOptions[parentValue], o]
+            : [o];
+    });
+
+    const rootOptions = parentValueToOptions[NO_PARENT_VALUE] || [];
+
+    return (
+        <Container ref={selectRef} size={size || 'md'} width={props.width || 255} $minWidth={props.minWidth}>
+            {label && (
+                <SelectLabel onClick={handleSelectClick}>
+                    {label} {isRequired && <Required>*</Required>}
+                </SelectLabel>
+            )}
+            {isVisible && (
+                <Dropdown
+                    open={isOpen}
+                    disabled={isDisabled}
+                    placement="bottomRight"
+                    dropdownRender={() => (
+                        <DropdownContainer
+                            ref={dropdownRef}
+                            style={{ maxHeight: height, overflow: 'auto' }}
+                            data-testid={dataTestId ? `${dataTestId}-dropdown` : undefined}
+                        >
+                            {showSearch && (
+                                <DropdownSearchBar
+                                    placeholder={searchPlaceholder}
+                                    value={searchQuery}
+                                    onChange={(value) => handleSearch(value)}
+                                    size={size}
+                                />
+                            )}
+                            <OptionList>
+                                {rootOptions.map((option) => {
+                                    const isParentOptionLabelExpanded = stagedOptions.find(
+                                        (opt) => opt.parentValue === option.value,
+                                    );
+                                    return (
+                                        <NestedOption
+                                            key={option.value}
+                                            selectedOptions={stagedOptions}
+                                            option={option}
+                                            parentValueToOptions={parentValueToOptions}
+                                            handleOptionChange={handleOptionChange}
+                                            addOptions={addOptions}
+                                            removeOptions={removeOptions}
+                                            loadData={loadData}
+                                            isMultiSelect={isMultiSelect}
+                                            setSelectedOptions={setStagedOptions}
+                                            areParentsSelectable={areParentsSelectable}
+                                            isLoadingParentChildList={isLoadingParentChildList}
+                                            hideParentCheckbox={hideParentCheckbox}
+                                            isParentOptionLabelExpanded={!!isParentOptionLabelExpanded}
+                                            implicitlySelectChildren={implicitlySelectChildren}
+                                            selectChildrenWithParent={selectChildrenWithParent}
+                                            renderCustomOptionText={renderCustomOptionText}
+                                        />
+                                    );
+                                })}
+                            </OptionList>
+                            {shouldDisplayConfirmationFooter && (
+                                <DropdownFooterActions
+                                    onUpdate={onClickUpdateButton}
+                                    onCancel={onClickCancelButton}
+                                    size={getFooterButtonSize(size)}
+                                />
+                            )}
+                        </DropdownContainer>
+                    )}
+                >
+                    <SelectBase
+                        isDisabled={isDisabled}
+                        isReadOnly={isReadOnly}
+                        isRequired={isRequired}
+                        isOpen={isOpen}
+                        onClick={handleSelectClick}
+                        fontSize={size}
+                        data-testid={dataTestId ? `${dataTestId}-base` : undefined}
+                        width={props.width}
+                        {...props}
+                    >
+                        <SelectLabelRenderer
+                            selectedValues={selectedOptions.map((o) => o.value)}
+                            options={options}
+                            placeholder={placeholder || t('select.placeholder')}
+                            isMultiSelect={isMultiSelect}
+                            removeOption={(option) => removeOptions([option], true)}
+                            renderCustomSelectedValue={renderCustomSelectedValue}
+                            {...(selectLabelProps || {})}
+                        />
+                        <SelectActionButtons
+                            hasSelectedValues={selectedOptions.length > 0}
+                            isOpen={isOpen}
+                            isDisabled={!!isDisabled}
+                            isReadOnly={!!isReadOnly}
+                            handleClearSelection={handleClearSelection}
+                            fontSize={size}
+                            showClear={showClear}
+                        />
+                    </SelectBase>
+                </Dropdown>
+            )}
+        </Container>
+    );
+};

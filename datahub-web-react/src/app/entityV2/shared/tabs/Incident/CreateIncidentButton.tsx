@@ -1,0 +1,90 @@
+import { Dropdown, toast } from '@components';
+import { Plus } from '@phosphor-icons/react/dist/csr/Plus';
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+
+import { CreateButton, SiblingSelectionDropdownLink } from '@app/entityV2/shared/tabs/Incident/styledComponents';
+import { CreateIncidentButtonProps, EntityStagedForIncident } from '@app/entityV2/shared/tabs/Incident/types';
+import { useSiblingOptionsForIncidentBuilder } from '@app/entityV2/shared/tabs/Incident/utils';
+import { Tooltip } from '@src/alchemy-components';
+import { useEntityData } from '@src/app/entity/shared/EntityContext';
+import { useIsSeparateSiblingsMode } from '@src/app/entity/shared/siblingUtils';
+import PlatformIcon from '@src/app/sharedV2/icons/PlatformIcon';
+
+export const CreateIncidentButton = ({ privileges, setShowIncidentBuilder, setEntity }: CreateIncidentButtonProps) => {
+    const { t } = useTranslation('entity.profile.incident');
+    const { t: tc } = useTranslation('common.actions');
+    const { entityData, urn: entityUrn, entityType: dataEntityType, loading } = useEntityData();
+
+    const isHideSiblingMode = useIsSeparateSiblingsMode();
+
+    const isSiblingMode = !!entityData?.siblingsSearch?.total && !isHideSiblingMode;
+
+    const siblingOptionsToAuthorOn = useSiblingOptionsForIncidentBuilder(entityData, entityUrn, dataEntityType) ?? [];
+
+    const canEditIncidents = privileges?.canEditIncidents || false;
+
+    const onCreateIncidentForEntity = ({ urn, platform, entityType }: Partial<EntityStagedForIncident>) => {
+        if (!urn || !platform || !entityType) {
+            console.error(`Params missing necessary data to author incidents:`, { urn, platform, entityType });
+            toast.error(t('toast.platformLoadFailed'));
+            return;
+        }
+        if (!canEditIncidents) return;
+        setEntity({
+            urn,
+            entityType,
+            platform,
+        });
+        setShowIncidentBuilder(true);
+    };
+
+    const siblingSelectionOptions = siblingOptionsToAuthorOn.map((option) => ({
+        key: option.title,
+        label: (
+            <SiblingSelectionDropdownLink
+                style={{ opacity: option.disabled ? 0.5 : 1 }}
+                onClick={() => onCreateIncidentForEntity(option)}
+            >
+                {option.platform ? (
+                    <PlatformIcon platform={option.platform} size={16} styles={{ marginRight: 4 }} />
+                ) : null}
+                {option.title}
+            </SiblingSelectionDropdownLink>
+        ),
+    }));
+
+    // Dynamic test IDs based on loading state
+    const getTestId = () => {
+        if (loading) return 'create-incident-btn-loading';
+        if (isSiblingMode) return 'create-incident-btn-main-with-siblings';
+        return 'create-incident-btn-main';
+    };
+
+    return (
+        <>
+            {isSiblingMode ? (
+                <Dropdown placement="bottom" menu={{ items: siblingSelectionOptions }}>
+                    <CreateButton
+                        disabled={!canEditIncidents}
+                        data-testid={getTestId()}
+                        className="create-incident-button"
+                    >
+                        <Plus size={14} /> {tc('create')}
+                    </CreateButton>
+                </Dropdown>
+            ) : (
+                <Tooltip showArrow={false} title={!canEditIncidents ? t('permission.noEditIncidents') : null}>
+                    <CreateButton
+                        onClick={() => setShowIncidentBuilder(true)}
+                        disabled={!canEditIncidents}
+                        data-testid={getTestId()}
+                        className="create-incident-button"
+                    >
+                        <Plus size={14} /> {tc('create')}
+                    </CreateButton>
+                </Tooltip>
+            )}
+        </>
+    );
+};

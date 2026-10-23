@@ -1,0 +1,1074 @@
+import functools
+import logging
+import pathlib
+import re
+import tempfile
+from datetime import datetime, timedelta, timezone
+from typing import Collection, Dict, Iterable, List, Optional, Set, Tuple, Union
+
+import sqlglot
+from google.cloud.bigquery import Client
+from pydantic import Field, PositiveInt, model_validator
+from sqlglot.tokens import Token, TokenType
+from typing_extensions import NotRequired, TypedDict
+
+from datahub.configuration.common import AllowDenyPattern, HiddenFromDocs
+from datahub.configuration.time_window_config import (
+    BaseTimeWindowConfig,
+    get_time_bucket,
+)
+from datahub.ingestion.api.closeable import Closeable
+from datahub.ingestion.api.source import SourceReport
+from datahub.ingestion.api.source_helpers import auto_workunit
+from datahub.ingestion.api.workunit import MetadataWorkUnit
+from datahub.ingestion.graph.client import DataHubGraph
+from datahub.ingestion.source.bigquery_v2.bigquery_audit import (
+    BigqueryTableIdentifier,
+    BigQueryTableRef,
+)
+from datahub.ingestion.source.bigquery_v2.bigquery_config import (
+    CAPTURE_JOB_LABELS_DESCRIPTION,
+    DEFAULT_REGION_QUALIFIERS,
+    BigQueryBaseConfig,
+)
+from datahub.ingestion.source.bigquery_v2.bigquery_report import (
+    BigQueryQueriesExtractorReport,
+)
+from datahub.ingestion.source.bigquery_v2.bigquery_schema import (
+    BigqueryProject,
+    BigQuerySchemaApi,
+    get_projects,
+)
+from datahub.ingestion.source.bigquery_v2.common import (
+    BQ_DATETIME_FORMAT,
+    BigQueryFilter,
+    BigQueryIdentifierBuilder,
+)
+from datahub.ingestion.source.state.redundant_run_skip_handler import (
+    RedundantQueriesRunSkipHandler,
+)
+from datahub.ingestion.source.usage.usage_common import (
+    DEFAULT_QUERIES_CHARACTER_LIMIT,
+    BaseUsageConfig,
+    validate_top_n_queries_character_budget,
+)
+from datahub.metadata.urns import CorpUserUrn
+from datahub.sql_parsing.schema_resolver import SchemaResolver
+from datahub.sql_parsing.sql_parsing_aggregator import (
+    ObservedQuery,
+    SqlParsingAggregator,
+)
+from datahub.sql_parsing.sqlglot_utils import get_dialect, get_query_fingerprint
+from datahub.utilities.file_backed_collections import (
+    ConnectionWrapper,
+    FileBackedDict,
+    FileBackedList,
+)
+from datahub.utilities.progress_timer import ProgressTimer
+from datahub.utilities.time import datetime_to_ts_millis
+
+logger = logging.getLogger(__name__)
+
+
+class BigQueryTableReference(TypedDict):
+    project_id: str
+    dataset_id: str
+    table_id: str
+
+
+class DMLJobStatistics(TypedDict):
+    inserted_row_count: int
+    deleted_row_count: int
+    updated_row_count: int
+
+
+class BigQueryJobLabel(TypedDict):
+    key: str
+    value: str
+
+
+class BigQueryJob(TypedDict):
+    job_id: str
+    project_id: str
+    creation_time: datetime
+    user_email: str
+    query: str
+    session_id: Optional[str]
+    query_hash: Optional[str]
+
+    statement_type: str
+    destination_table: Optional[BigQueryTableReference]
+    referenced_tables: List[BigQueryTableReference]
+    # Only selected when capture_job_labels_as_query_properties is enabled.
+    labels: NotRequired[List[BigQueryJobLabel]]
+    # NOTE: This does not capture referenced_view unlike GCP Logging Event
+
+
+class BigQueryQueriesExtractorConfig(BigQueryBaseConfig):
+    # TODO: Support stateful ingestion for the time windows.
+    window: BaseTimeWindowConfig = BaseTimeWindowConfig()
+
+    local_temp_path: HiddenFromDocs[Optional[pathlib.Path]] = Field(
+        # TODO: For now, this is simply an advanced config to make local testing easier.
+        # Eventually, we will want to store date-specific files in the directory and use it as a cache.
+        default=None,
+        description="Local path to store the audit log.",
+    )
+
+    user_email_pattern: AllowDenyPattern = Field(
+        default=AllowDenyPattern.allow_all(),
+        description="Regex patterns for user emails to filter in usage. Applied client-side.",
+    )
+
+    pushdown_deny_usernames: List[str] = Field(
+        default=[],
+        description="List of user email patterns (SQL LIKE syntax, e.g., 'bot_%', '%@%.iam.gserviceaccount.com') "
+        "to exclude from extraction. Uses case-insensitive LIKE for server-side filtering.",
+    )
+
+    pushdown_allow_usernames: List[str] = Field(
+        default=[],
+        description="List of user email patterns (SQL LIKE syntax, e.g., 'analyst_%@company.com') "
+        "to include in extraction. Uses case-insensitive LIKE for server-side filtering. "
+        "If empty, all users not in deny list are included.",
+    )
+
+    top_n_queries: PositiveInt = Field(
+        default=10, description="Number of top queries to save to each table."
+    )
+
+    format_sql_queries: bool = Field(
+        default=False, description="Whether to format the SQL queries."
+    )
+
+    include_top_n_queries: bool = Field(
+        default=True, description="Whether to ingest the top_n_queries."
+    )
+
+    queries_character_limit: HiddenFromDocs[int] = Field(
+        default=DEFAULT_QUERIES_CHARACTER_LIMIT,
+        description="Total character limit for all queries in a single database call. This is a "
+        "low-level config property which should be touched with care. "
+        "Queries will be truncated to length `queries_character_limit / top_n_queries`.",
+    )
+
+    include_lineage: bool = True
+    include_queries: bool = True
+    include_usage_statistics: bool = True
+    include_query_usage_statistics: bool = True
+    include_operations: bool = True
+    capture_job_labels_as_query_properties: bool = Field(
+        default=False,
+        description=CAPTURE_JOB_LABELS_DESCRIPTION,
+    )
+
+    region_qualifiers: List[str] = Field(
+        default_factory=lambda: list(DEFAULT_REGION_QUALIFIERS),
+        description="BigQuery regions to be scanned for bigquery jobs. "
+        "See [this](https://cloud.google.com/bigquery/docs/information-schema-jobs#scope_and_syntax) for details.",
+    )
+
+    region_qualifiers_auto_discovery: bool = Field(
+        default=False,
+        description="When True, automatically extends `region_qualifiers` with any BigQuery "
+        "regions detected from dataset locations during schema ingestion. "
+        "Defaults to False to avoid unexpected query cost increases. "
+        "Set to True if your project has datasets in regions beyond `region-us` and `region-eu`.",
+    )
+
+    @model_validator(mode="after")
+    def check_top_n_queries_character_budget(self) -> "BigQueryQueriesExtractorConfig":
+        # The main BigQuery source builds this config from an already-validated
+        # BigQueryUsageConfig (which shares this check via BaseUsageConfig), but the
+        # standalone bigquery-queries source constructs this class directly, so it
+        # needs its own copy of the check to fail at recipe parse time rather than
+        # mid-ingestion inside BaseUsageConfig(...).
+        validate_top_n_queries_character_budget(
+            top_n_queries=self.top_n_queries,
+            queries_character_limit=self.queries_character_limit,
+        )
+        return self
+
+
+class BigQueryQueriesExtractor(Closeable):
+    """
+    Extracts query audit log and generates usage/lineage/operation workunits.
+
+    Some notable differences in this wrt older usage extraction method are:
+    1. For every lineage/operation workunit, corresponding query id is also present
+    2. Operation aspect for a particular query is emitted at max once(last occurence) for a day
+    3. "DROP" operation accounts for usage here
+    4. userEmail is not populated in datasetUsageStatistics aspect, only user urn
+
+    """
+
+    def __init__(
+        self,
+        connection: Client,
+        schema_api: BigQuerySchemaApi,
+        config: BigQueryQueriesExtractorConfig,
+        structured_report: SourceReport,
+        filters: BigQueryFilter,
+        identifiers: BigQueryIdentifierBuilder,
+        redundant_run_skip_handler: Optional[RedundantQueriesRunSkipHandler] = None,
+        graph: Optional[DataHubGraph] = None,
+        schema_resolver: Optional[SchemaResolver] = None,
+        discovered_tables: Optional[Collection[str]] = None,
+        discovered_locations: Optional[Collection[str]] = None,
+    ):
+        self.connection = connection
+
+        self.config = config
+        self.filters = filters
+        self.identifiers = identifiers
+        self.schema_api = schema_api
+        self.report = BigQueryQueriesExtractorReport()
+        self.discovered_tables = (
+            set(
+                map(
+                    self.identifiers.standardize_identifier_case,
+                    discovered_tables,
+                )
+            )
+            if discovered_tables
+            else None
+        )
+        self.effective_region_qualifiers = _resolve_region_qualifiers(
+            configured=self.config.region_qualifiers,
+            region_qualifiers_auto_discovery=self.config.region_qualifiers_auto_discovery,
+            discovered_locations=discovered_locations,
+            report=self.report,
+            structured_report=structured_report,
+        )
+
+        self.structured_report = structured_report
+        self.redundant_run_skip_handler = redundant_run_skip_handler
+
+        self.start_time, self.end_time = self._get_time_window()
+
+        self.aggregator = SqlParsingAggregator(
+            platform=self.identifiers.platform,
+            platform_instance=self.identifiers.identifier_config.platform_instance,
+            env=self.identifiers.identifier_config.env,
+            schema_resolver=schema_resolver,
+            graph=graph,
+            eager_graph_load=False,
+            generate_lineage=self.config.include_lineage,
+            generate_queries=self.config.include_queries,
+            generate_usage_statistics=self.config.include_usage_statistics,
+            generate_query_usage_statistics=self.config.include_query_usage_statistics,
+            usage_config=BaseUsageConfig(
+                bucket_duration=self.config.window.bucket_duration,
+                start_time=self.start_time,
+                end_time=self.end_time,
+                user_email_pattern=self.config.user_email_pattern,
+                top_n_queries=self.config.top_n_queries,
+                format_sql_queries=self.config.format_sql_queries,
+                include_top_n_queries=self.config.include_top_n_queries,
+                queries_character_limit=self.config.queries_character_limit,
+            ),
+            generate_operations=self.config.include_operations,
+            is_temp_table=self.is_temp_table,
+            is_allowed_table=self.is_allowed_table,
+            format_queries=self.config.format_sql_queries,
+        )
+
+        self.report.sql_aggregator = self.aggregator.report
+        self.report.num_discovered_tables = (
+            len(self.discovered_tables) if self.discovered_tables else None
+        )
+
+    @functools.cached_property
+    def local_temp_path(self) -> pathlib.Path:
+        if self.config.local_temp_path:
+            assert self.config.local_temp_path.is_dir()
+            return self.config.local_temp_path
+
+        path = pathlib.Path(tempfile.mkdtemp())
+        path.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Using local temp path: {path}")
+        return path
+
+    def _get_time_window(self) -> tuple[datetime, datetime]:
+        if self.redundant_run_skip_handler:
+            start_time, end_time = (
+                self.redundant_run_skip_handler.suggest_run_time_window(
+                    self.config.window.start_time,
+                    self.config.window.end_time,
+                )
+            )
+        else:
+            start_time = self.config.window.start_time
+            end_time = self.config.window.end_time
+
+        # Usage statistics are aggregated per bucket (typically per day).
+        # To ensure accurate aggregated metrics, we need to align the start_time
+        # to the beginning of a bucket so that we include complete bucket periods.
+        if self.config.include_usage_statistics:
+            start_time = get_time_bucket(start_time, self.config.window.bucket_duration)
+
+        return start_time, end_time
+
+    def _update_state(self) -> None:
+        if self.redundant_run_skip_handler:
+            self.redundant_run_skip_handler.update_state(
+                self.config.window.start_time,
+                self.config.window.end_time,
+                self.config.window.bucket_duration,
+            )
+
+    def is_temp_table(self, name: str) -> bool:
+        try:
+            table = BigqueryTableIdentifier.from_string_name(name)
+
+            if table.dataset.startswith(self.config.temp_table_dataset_prefix):
+                return True
+
+            # This is also a temp table if
+            #   1. this name would be allowed by the dataset patterns, and
+            #   2. we have a list of discovered tables, and
+            #   3. it's not in the discovered tables list
+
+            if (
+                self.filters.is_allowed(table)
+                and self.discovered_tables
+                and self.identifiers.standardize_identifier_case(
+                    str(BigQueryTableRef(table))
+                )
+                not in self.discovered_tables
+            ):
+                logger.debug(
+                    f"Inferred as temp table {name} (is_allowed?{self.filters.is_allowed(table)})"
+                )
+                self.report.inferred_temp_tables.add(name)
+                return True
+
+        except Exception:
+            logger.warning(f"Error parsing table name {name} ")
+        return False
+
+    def is_allowed_table(self, name: str) -> bool:
+        try:
+            table = BigqueryTableIdentifier.from_string_name(name)
+            if (
+                self.discovered_tables
+                and self.identifiers.standardize_identifier_case(
+                    str(BigQueryTableRef(table))
+                )
+                not in self.discovered_tables
+            ):
+                logger.debug(f"not allowed table {name}")
+                return False
+            return self.filters.is_allowed(table)
+        except Exception:
+            logger.warning(f"Error parsing table name {name} ")
+            return False
+
+    def get_workunits_internal(
+        self,
+    ) -> Iterable[MetadataWorkUnit]:
+        # TODO: Add some logic to check if the cached audit log is stale or not.
+        # The cache key should then also cover capture_job_labels_as_query_properties,
+        # since a cache written with the flag off has no labels to replay.
+        audit_log_file = self.local_temp_path / "audit_log.sqlite"
+        use_cached_audit_log = audit_log_file.exists()
+
+        queries: FileBackedList[ObservedQuery]
+        if use_cached_audit_log:
+            logger.info("Using cached audit log")
+            shared_connection = ConnectionWrapper(audit_log_file)
+            queries = FileBackedList(shared_connection)
+        else:
+            audit_log_file.unlink(missing_ok=True)
+
+            shared_connection = ConnectionWrapper(audit_log_file)
+            queries = FileBackedList(shared_connection)
+            entry: ObservedQuery
+
+            with self.report.query_log_fetch_timer:
+                for project in get_projects(
+                    self.schema_api, self.structured_report, self.filters
+                ):
+                    for entry in self.fetch_query_log(project):
+                        self.report.num_queries_by_project[project.id] += 1
+                        queries.append(entry)
+        self.report.num_total_queries = len(queries)
+        logger.info(f"Found {self.report.num_total_queries} total queries")
+
+        with self.report.audit_log_preprocessing_timer:
+            # Preprocessing stage that deduplicates the queries using query hash per usage bucket
+            # Note: FileBackedDict is an ordered dictionary, so the order of execution of
+            # queries is inherently maintained
+            queries_deduped: FileBackedDict[Dict[int, ObservedQuery]] = (
+                self.deduplicate_queries(queries)
+            )
+            self.report.num_unique_queries = len(queries_deduped)
+            logger.info(f"Found {self.report.num_unique_queries} unique queries")
+
+        with self.report.audit_log_load_timer, queries_deduped:
+            log_timer = ProgressTimer(timedelta(minutes=1))
+            report_timer = ProgressTimer(timedelta(minutes=5))
+
+            for i, (_, query_instances) in enumerate(queries_deduped.items()):
+                # The aggregator expects each query's observations in time order.
+                for _, query in sorted(query_instances.items()):
+                    if log_timer.should_report():
+                        logger.info(
+                            f"Added {i} deduplicated query log entries to SQL aggregator"
+                        )
+
+                    if report_timer.should_report() and self.report.sql_aggregator:
+                        logger.info(self.report.sql_aggregator.as_string())
+
+                    self.aggregator.add(query)
+
+        yield from auto_workunit(self.aggregator.gen_metadata())
+
+        if not use_cached_audit_log:
+            queries.close()
+            shared_connection.close()
+            audit_log_file.unlink(missing_ok=True)
+
+        self._update_state()
+
+    def deduplicate_queries(
+        self, queries: FileBackedList[ObservedQuery]
+    ) -> FileBackedDict[Dict[int, ObservedQuery]]:
+        # This fingerprint based deduplication is done here to reduce performance hit due to
+        # repetitive sql parsing while adding observed query to aggregator that would otherwise
+        # parse same query multiple times. In future, aggregator may absorb this deduplication.
+        # With current implementation, it is possible that "Operation"(e.g. INSERT) is reported
+        # only once per day, although it may have happened multiple times throughout the day.
+
+        queries_deduped: FileBackedDict[Dict[int, ObservedQuery]] = FileBackedDict()
+
+        for i, query in enumerate(queries):
+            if i > 0 and i % 10000 == 0:
+                logger.info(f"Preprocessing completed for {i} query log entries")
+
+            # query = ObservedQuery(**asdict(query))
+
+            time_bucket = 0
+            if query.timestamp:
+                time_bucket = datetime_to_ts_millis(
+                    get_time_bucket(query.timestamp, self.config.window.bucket_duration)
+                )
+
+            # Not using original BQ query hash as it's not always present
+            query.query_hash = get_query_fingerprint(
+                query.query, self.identifiers.platform, fast=True
+            )
+
+            query_instances = queries_deduped.setdefault(query.query_hash, {})
+
+            observed_query = query_instances.setdefault(time_bucket, query)
+
+            # If the query already exists for this time bucket, update its attributes
+            if observed_query is not query:
+                observed_query.usage_multiplier += 1
+                # Entries are time-ordered only within one project and region, so keep
+                # the newest job's timestamp, labels and extra_info (job_id etc.) rather
+                # than the last one read. user and session_id stay first-seen.
+                if observed_query.timestamp is None or (
+                    query.timestamp is not None
+                    and query.timestamp >= observed_query.timestamp
+                ):
+                    observed_query.timestamp = query.timestamp
+                    observed_query.custom_properties = query.custom_properties
+                    observed_query.extra_info = query.extra_info
+
+        return queries_deduped
+
+    def fetch_query_log(self, project: BigqueryProject) -> Iterable[ObservedQuery]:
+        # See https://cloud.google.com/bigquery/docs/locations#supported_locations
+        regions = self.effective_region_qualifiers
+
+        rows_per_region: Dict[str, int] = {region: 0 for region in regions}
+        errored_regions: Set[str] = set()
+        for region in regions:
+            try:
+                for entry in self.fetch_region_query_log(project, region):
+                    rows_per_region[region] += 1
+                    yield entry
+            except Exception as exc:
+                errored_regions.add(region)
+                self.structured_report.failure(
+                    title="BigQuery query log fetch failed",
+                    message="Error fetching query log from BQ project for region",
+                    context=f"project={project.id} region={region}",
+                    exc=exc,
+                )
+
+        for region, count in rows_per_region.items():
+            self.report.num_queries_by_region[region] += count
+
+        if _all_scanned_regions_empty(rows_per_region, errored_regions):
+            self.structured_report.warning(
+                title="BigQuery query log empty for all scanned regions",
+                message=(
+                    "No rows returned from INFORMATION_SCHEMA.JOBS in any of the "
+                    "scanned regions. If the project's datasets live in a region "
+                    "outside this list, usage/lineage/queries extraction will be "
+                    "silently empty. Either set `region_qualifiers` explicitly to "
+                    "the regions where this project's data resides, or set "
+                    "`region_qualifiers_auto_discovery: true` to detect regions "
+                    "automatically from dataset locations."
+                ),
+                context=f"project={project.id} regions_scanned={regions}",
+            )
+
+    def fetch_region_query_log(
+        self, project: BigqueryProject, region: str
+    ) -> Iterable[ObservedQuery]:
+        # Build user filter for pushdown if patterns are configured
+        if self.config.pushdown_deny_usernames or self.config.pushdown_allow_usernames:
+            user_filter = _build_user_filter(
+                allow_usernames=self.config.pushdown_allow_usernames,
+                deny_usernames=self.config.pushdown_deny_usernames,
+            )
+            logger.debug(f"Using pushdown user filter: {user_filter}")
+        else:
+            # No pushdown - filter client-side (existing behavior via SqlParsingAggregator)
+            user_filter = "TRUE"
+
+        # Each region needs to be a different query
+        query_log_query = _build_enriched_query_log_query(
+            project_id=project.id,
+            region=region,
+            start_time=self.start_time,
+            end_time=self.end_time,
+            user_filter=user_filter,
+            include_labels=self.config.capture_job_labels_as_query_properties,
+        )
+
+        logger.info(f"Fetching query log from BQ Project {project.id} for {region}")
+        resp = self.connection.query(query_log_query)
+
+        for i, row in enumerate(resp):
+            if i > 0 and i % 1000 == 0:
+                logger.info(f"Processed {i} query log rows so far")
+            try:
+                entry = self._parse_audit_log_row(row)
+            except Exception as e:
+                self.structured_report.warning(
+                    "Error parsing query log row",
+                    context=f"{row}",
+                    exc=e,
+                )
+            else:
+                yield entry
+
+    def _parse_audit_log_row(self, row: BigQueryJob) -> ObservedQuery:
+        timestamp: datetime = row["creation_time"]
+        timestamp = timestamp.astimezone(timezone.utc)
+
+        # Usually bigquery identifiers are always referred as <dataset>.<table> and only
+        # temporary tables are referred as <table> alone without project or dataset name.
+        # Note that temporary tables can also be referenced using _SESSION.<table>
+        # More details here - https://cloud.google.com/bigquery/docs/multi-statement-queries
+        # Also _ at start considers this as temp dataset as per `temp_table_dataset_prefix` config
+        TEMP_TABLE_QUALIFIER = "_SESSION"
+
+        query = _extract_query_text(row)
+
+        entry = ObservedQuery(
+            query=query,
+            session_id=row["session_id"],
+            timestamp=row["creation_time"],
+            user=(
+                CorpUserUrn.from_string(
+                    self.identifiers.gen_user_urn(row["user_email"])
+                )
+                if row["user_email"]
+                else None
+            ),
+            default_db=row["project_id"],
+            default_schema=TEMP_TABLE_QUALIFIER,
+            query_hash=row["query_hash"],
+            extra_info={
+                "job_id": row["job_id"],
+                "statement_type": row["statement_type"],
+                "destination_table": row["destination_table"],
+                "referenced_tables": row["referenced_tables"],
+            },
+            custom_properties=(
+                _job_labels_to_custom_properties(row.get("labels"))
+                if self.config.capture_job_labels_as_query_properties
+                else None
+            ),
+        )
+
+        return entry
+
+    def close(self) -> None:
+        self.aggregator.close()
+
+
+_REGION_BODY_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
+# Cross-cloud BigLake locations are not valid INFORMATION_SCHEMA qualifiers: https://cloud.google.com/bigquery/docs/locations#cross-cloud-locations
+_BIGLAKE_LOCATION_PREFIXES = ("aws-", "azure-")
+
+
+def _normalize_location_to_region_qualifier(location: str) -> Optional[str]:
+    """
+    Map a BigQuery dataset location to its INFORMATION_SCHEMA region qualifier,
+    returning None for anything that isn't a valid qualifier body.
+
+    Examples:
+        "US"            -> "region-us"
+        "EU"            -> "region-eu"
+        "europe-west1"  -> "region-europe-west1"
+        "region-us"     -> "region-us"   (already a qualifier — idempotent)
+        ""              -> None
+        "US/foo"        -> None          (rejected — would build a bad SQL identifier)
+    """
+    if not location:
+        return None
+    normalized = location.strip().lower()
+    if not normalized:
+        return None
+    body = (
+        normalized[len("region-") :] if normalized.startswith("region-") else normalized
+    )
+    if body.startswith(_BIGLAKE_LOCATION_PREFIXES):
+        return None
+    if not _REGION_BODY_RE.match(body):
+        return None
+    return normalized if normalized.startswith("region-") else f"region-{body}"
+
+
+def _resolve_region_qualifiers(
+    configured: List[str],
+    region_qualifiers_auto_discovery: bool,
+    discovered_locations: Optional[Collection[str]],
+    report: BigQueryQueriesExtractorReport,
+    structured_report: SourceReport,
+) -> List[str]:
+    """
+    Build the effective list of INFORMATION_SCHEMA region qualifiers.
+
+    When region_qualifiers_auto_discovery=True (opt-in; defaults to False), any
+    regions found in dataset locations are merged into the effective list.
+    When False, the configured list is used as-is (after normalization).
+
+    Side effects:
+      - Records the configured/auto-discovered/used breakdown on the report.
+      - Emits structured failure if any configured value is unparseable.
+      - Emits structured failure if the effective list ends up empty.
+      - Emits structured info when discovery was enabled but found no new regions.
+      - Emits structured info when discovery is disabled and uncovered regions exist.
+    """
+    seen: Set[str] = set()
+    ordered: List[str] = []
+    configured_normalized: List[str] = []
+    rejected_configured: List[str] = []
+    for region in configured:
+        normalized = _normalize_location_to_region_qualifier(region)
+        if normalized is None:
+            rejected_configured.append(region)
+            continue
+        if normalized not in seen:
+            seen.add(normalized)
+            ordered.append(normalized)
+            configured_normalized.append(normalized)
+
+    if rejected_configured:
+        structured_report.failure(
+            title="Invalid BigQuery region_qualifiers entry",
+            message=(
+                "One or more `region_qualifiers` values could not be parsed "
+                "as INFORMATION_SCHEMA region qualifiers and were skipped. "
+                "Expected forms like `region-us`, `region-europe-west1`, or "
+                "raw locations like `US` / `europe-west1`."
+            ),
+            context=f"rejected={rejected_configured}",
+        )
+
+    discovered_normalized: List[str] = []
+    for location in discovered_locations or []:
+        normalized = _normalize_location_to_region_qualifier(location)
+        if normalized:
+            discovered_normalized.append(normalized)
+        elif location and location.strip():
+            # dataset.location is well-defined; track unexpected values rather
+            # than silently dropping them and re-introducing a silent failure.
+            report.discovered_locations_unparseable.append(location)
+    discovered_normalized.sort()
+
+    auto_added: List[str] = []
+    if region_qualifiers_auto_discovery:
+        for normalized in discovered_normalized:
+            if normalized not in seen:
+                seen.add(normalized)
+                ordered.append(normalized)
+                auto_added.append(normalized)
+        if auto_added:
+            logger.info(
+                "Auto-extended region_qualifiers with %s based on discovered "
+                "dataset locations (configured: %s)",
+                auto_added,
+                configured_normalized,
+            )
+        elif discovered_locations is not None and not discovered_normalized:
+            # `None` means discovery wasn't attempted (e.g. standalone
+            # BigQueryQueriesSource); `[]` or all-unparseable means it ran
+            # but yielded nothing actionable — only that case warrants the
+            # breadcrumb.
+            structured_report.info(
+                title="BigQuery region auto-detection skipped",
+                message=(
+                    "No usable dataset locations were available from schema "
+                    "discovery, so region_qualifiers was not extended. "
+                    "If your project's data lives outside the configured "
+                    "regions, set `region_qualifiers` explicitly to avoid "
+                    "missing usage/lineage."
+                ),
+            )
+    else:
+        # Discovery disabled: surface uncovered regions so the operator can
+        # decide whether to add them to region_qualifiers.
+        uncovered = sorted({r for r in discovered_normalized if r not in seen})
+        if uncovered:
+            structured_report.info(
+                title="BigQuery regions discovered outside region_qualifiers",
+                message=(
+                    "Schema discovery found datasets in BigQuery regions that "
+                    "are not in your configured `region_qualifiers`. These "
+                    "regions are NOT being scanned. Add them to "
+                    "`region_qualifiers` if you want their usage/lineage "
+                    "extracted."
+                ),
+                context=f"uncovered_regions={uncovered}",
+            )
+
+    if not ordered:
+        if rejected_configured:
+            empty_cause = "all configured `region_qualifiers` entries were unparseable"
+        elif not configured:
+            empty_cause = "`region_qualifiers` is empty"
+        else:
+            empty_cause = "no valid qualifiers remain after parsing"
+        structured_report.failure(
+            title="BigQuery region_qualifiers resolved to empty list",
+            message=(
+                f"INFORMATION_SCHEMA.JOBS will not be scanned at all and "
+                f"usage/lineage/queries extraction will produce no rows: "
+                f"{empty_cause}. Set `region_qualifiers` to at least one "
+                f"valid qualifier (e.g. `region-us`, `region-europe-west1`)."
+            ),
+            context=f"configured={list(configured)} rejected={rejected_configured}",
+        )
+
+    report.region_qualifiers_configured = configured_normalized
+    report.region_qualifiers_auto_discovered = auto_added
+    report.region_qualifiers_used = ordered
+    return ordered
+
+
+def _all_scanned_regions_empty(
+    rows_per_region: Dict[str, int],
+    errored_regions: Set[str],
+) -> bool:
+    """
+    Return True if at least one region completed without error AND every
+    such successfully-scanned region returned zero rows. Regions that errored
+    are excluded from the gate so the "empty regions" warning isn't fired
+    misleadingly when the real failure is captured elsewhere in the report.
+    """
+    successful_counts = [
+        count
+        for region, count in rows_per_region.items()
+        if region not in errored_regions
+    ]
+    return bool(successful_counts) and sum(successful_counts) == 0
+
+
+def _is_allow_all_pattern(allow_usernames: List[str]) -> bool:
+    """
+    Check if allow patterns effectively match everything.
+
+    When detected, we skip adding the allow filter since it has no effect.
+
+    Design Choice - all() vs any():
+        Uses all() to be conservative: only treat as allow-all if ALL patterns
+        are allow-all. This preserves user intent for auditability, even if
+        logically redundant (e.g., ["%", "specific"] still generates SQL).
+
+    Recognized patterns: "%" (matches any string in SQL LIKE)
+    """
+    if not allow_usernames:
+        return True
+    allow_all_patterns = {"%"}
+    return all(pattern in allow_all_patterns for pattern in allow_usernames)
+
+
+def _escape_for_sql_like(pattern: str) -> str:
+    """
+    Escape a LIKE pattern for safe use in a BigQuery SQL string literal.
+
+    Security Note:
+        Escapes single quotes by doubling them (' → ''), which is the SQL
+        standard for escaping quotes in string literals. This prevents SQL
+        injection attacks.
+
+    Args:
+        pattern: The LIKE pattern to escape
+
+    Returns:
+        The escaped pattern safe for use in SQL LIKE clause
+    """
+    return pattern.replace("'", "''")
+
+
+def _build_user_filter(
+    allow_usernames: List[str],
+    deny_usernames: List[str],
+) -> str:
+    """
+    Convert allow/deny patterns to BigQuery SQL WHERE clause using LIKE.
+
+    Uses LOWER() for case-insensitive matching.
+    This allows pushing down user filtering to BigQuery for improved performance.
+
+    Security: Escapes single quotes by doubling them (' → '') to prevent SQL injection.
+
+    Args:
+        allow_usernames: List of LIKE patterns for users to include (% = any chars, _ = single char)
+        deny_usernames: List of LIKE patterns for users to exclude
+
+    Returns:
+        A SQL WHERE condition string, or "TRUE" if no filtering should be applied
+    """
+    conditions = []
+
+    logger.debug(
+        f"Building user filter: allow={allow_usernames}, deny={deny_usernames}"
+    )
+
+    # Handle ALLOW patterns (inclusions)
+    # Skip if it's the default "allow all" pattern
+    if allow_usernames and not _is_allow_all_pattern(allow_usernames):
+        allow_conditions = []
+        for pattern in allow_usernames:
+            # Lowercase in Python, escape for SQL safety (prevents SQL injection)
+            escaped = _escape_for_sql_like(pattern.lower())
+            logger.debug(f"Allow pattern '{pattern}' escaped to '{escaped}'")
+            # Use LOWER() on column for case-insensitive matching
+            allow_conditions.append(f"LOWER(user_email) LIKE '{escaped}'")
+        if allow_conditions:
+            conditions.append(f"({' OR '.join(allow_conditions)})")
+    elif allow_usernames:
+        logger.debug(
+            f"Skipping allow patterns {allow_usernames} - detected as 'allow all' pattern"
+        )
+
+    # Handle DENY patterns (exclusions)
+    for pattern in deny_usernames:
+        # Lowercase in Python, escape for SQL safety (prevents SQL injection)
+        escaped = _escape_for_sql_like(pattern.lower())
+        logger.debug(f"Deny pattern '{pattern}' escaped to '{escaped}'")
+        # Use LOWER() on column for case-insensitive matching
+        conditions.append(f"LOWER(user_email) NOT LIKE '{escaped}'")
+
+    result = " AND ".join(conditions) if conditions else "TRUE"
+    logger.debug(f"Generated SQL user filter: {result}")
+    return result
+
+
+# `TEMP` and `TEMPORARY` both tokenize as `TokenType.TEMPORARY`; AGGREGATE is
+# not a keyword token, so it is matched by text.
+_AGGREGATE = "AGGREGATE"
+_TEMP_FUNCTION_HEADS: List[List[Union[TokenType, str]]] = [
+    [TokenType.CREATE, TokenType.TEMPORARY, TokenType.FUNCTION],
+    [TokenType.CREATE, TokenType.TEMPORARY, _AGGREGATE, TokenType.FUNCTION],
+    [
+        TokenType.CREATE,
+        TokenType.OR,
+        TokenType.REPLACE,
+        TokenType.TEMPORARY,
+        TokenType.FUNCTION,
+    ],
+    [
+        TokenType.CREATE,
+        TokenType.OR,
+        TokenType.REPLACE,
+        TokenType.TEMPORARY,
+        _AGGREGATE,
+        TokenType.FUNCTION,
+    ],
+]
+_FUNCTION_WORD_RE = re.compile(r"\bFUNCTION\b", re.IGNORECASE)
+_STATEMENT_SEPARATOR = ";"
+
+
+def _extract_query_text(row: BigQueryJob) -> str:
+    # We wrap select statements in a CTE to make them parseable as DML statement.
+    # This is a workaround to support the case where the user runs a query and inserts the result into a table.
+    # NOTE This and the temp-function removal below result in showing modified query instead of original query in DataHub UI
+    # Alternatively, this support needs to be added more natively in aggregator.add_observed_query
+    destination = row["destination_table"]
+    if (
+        row["statement_type"] != "SELECT"
+        or not destination
+        or destination["table_id"].startswith("anon")
+    ):
+        return _strip_temp_functions(row["query"], strip_semicolons=False)
+    table_name = BigqueryTableIdentifier(
+        destination["project_id"],
+        destination["dataset_id"],
+        destination["table_id"],
+    ).raw_table_name()
+    query = _strip_temp_functions(row["query"], strip_semicolons=True)
+    return f"""CREATE TABLE `{table_name}` AS
+                (
+                    {query}
+                )"""
+
+
+def _strip_temp_functions(query: str, *, strip_semicolons: bool) -> str:
+    """Remove temp-function statements, and top-level semicolons if asked; keep all other text.
+
+    Returns the text unchanged unless it is one statement plus optional temp functions.
+    """
+    if _STATEMENT_SEPARATOR not in query:
+        return query
+    # Unwrapped text changes only if it defines a temp function.
+    if not strip_semicolons and not _FUNCTION_WORD_RE.search(query):
+        return query
+    # split_statements would cut `UNNEST(x) AS e WITH OFFSET` into two statements.
+    try:
+        tokens = get_dialect(BigQueryIdentifierBuilder.platform).tokenize(query)
+    except (ValueError, TypeError, sqlglot.errors.SqlglotError):
+        return query
+
+    statements: List[List[Token]] = [[]]
+    for token in tokens:
+        statements[-1].append(token)
+        if token.token_type == TokenType.SEMICOLON:
+            statements.append([])
+
+    removed: List[Tuple[int, int]] = []
+    main_statements = 0
+    for statement in statements:
+        if _is_temp_function(statement):
+            removed.append((statement[0].start, statement[-1].end))
+            continue
+        if any(token.token_type != TokenType.SEMICOLON for token in statement):
+            main_statements += 1
+        if strip_semicolons:
+            removed += [
+                (token.start, token.end)
+                for token in statement
+                if token.token_type == TokenType.SEMICOLON
+            ]
+    if main_statements != 1:
+        return query
+
+    kept: List[str] = []
+    position = 0
+    for start, end in removed:
+        kept.append(query[position:start])
+        position = end + 1
+    kept.append(query[position:])
+    return "".join(kept)
+
+
+def _is_temp_function(statement: List[Token]) -> bool:
+    head = [
+        _AGGREGATE if token.text.upper() == _AGGREGATE else token.token_type
+        for token in statement[:6]
+    ]
+    return any(head[: len(form)] == form for form in _TEMP_FUNCTION_HEADS)
+
+
+def _job_labels_to_custom_properties(
+    labels: Optional[List[BigQueryJobLabel]],
+) -> Optional[Dict[str, str]]:
+    if not labels:
+        return None
+    # The STRUCT field is nullable in INFORMATION_SCHEMA.JOBS, and a None value would
+    # fail MCP serialization of the whole Query aspect.
+    return {label["key"]: label["value"] or "" for label in labels}
+
+
+def _build_enriched_query_log_query(
+    project_id: str,
+    region: str,
+    start_time: datetime,
+    end_time: datetime,
+    user_filter: str = "TRUE",
+    include_labels: bool = False,
+) -> str:
+    """
+    Build the SQL query to fetch enriched query log from BigQuery INFORMATION_SCHEMA.JOBS.
+
+    Args:
+        project_id: The GCP project ID
+        region: The BigQuery region qualifier (e.g., "region-us", "region-eu")
+        start_time: Start of the time window for query log
+        end_time: End of the time window for query log
+        user_filter: SQL WHERE clause condition for filtering by user_email.
+                     Defaults to "TRUE" (no filtering). Use _build_user_filter()
+                     to generate this from allow/deny pattern lists.
+        include_labels: Also select the job's `labels` column.
+
+    Returns:
+        SQL query string to fetch query log
+    """
+    audit_start_time = start_time.strftime(BQ_DATETIME_FORMAT)
+    audit_end_time = end_time.strftime(BQ_DATETIME_FORMAT)
+
+    # List of all statement types
+    # https://cloud.google.com/bigquery/docs/reference/auditlogs/rest/Shared.Types/BigQueryAuditMetadata.QueryStatementType
+    UNSUPPORTED_STATEMENT_TYPES = [
+        # procedure
+        "CREATE_PROCEDURE",
+        "DROP_PROCEDURE",
+        "CALL",
+        "SCRIPT",  # individual statements in executed procedure are present as separate jobs
+        # schema
+        "CREATE_SCHEMA",
+        "DROP_SCHEMA",
+        # function
+        "CREATE_FUNCTION",
+        "CREATE_TABLE_FUNCTION",
+        "DROP_FUNCTION",
+        # policies
+        "CREATE_ROW_ACCESS_POLICY",
+        "DROP_ROW_ACCESS_POLICY",
+    ]
+
+    unsupported_statement_types = ",".join(
+        [f"'{statement_type}'" for statement_type in UNSUPPORTED_STATEMENT_TYPES]
+    )
+
+    # NOTE the use of partition column creation_time as timestamp here.
+    # Currently, only required columns are fetched. There are more columns such as
+    # total_slot_ms, job_type, total_bytes_billed, dml_statistics(inserted_row_count, etc)
+    # that may be fetched as required in future. Refer below link for list of all columns
+    # https://cloud.google.com/bigquery/docs/information-schema-jobs#schema
+    labels_column = ",\n            labels" if include_labels else ""
+
+    return f"""\
+        SELECT
+            job_id,
+            project_id,
+            creation_time,
+            user_email,
+            query,
+            session_info.session_id as session_id,
+            query_info.query_hashes.normalized_literals as query_hash,
+            statement_type,
+            destination_table,
+            referenced_tables{labels_column}
+        FROM
+            `{project_id}`.`{region}`.INFORMATION_SCHEMA.JOBS
+        WHERE
+            creation_time >= '{audit_start_time}' AND
+            creation_time <= '{audit_end_time}' AND
+            error_result is null AND
+            not CONTAINS_SUBSTR(query, '.INFORMATION_SCHEMA.') AND
+            statement_type not in ({unsupported_statement_types}) AND
+            {user_filter}
+        ORDER BY creation_time
+    """

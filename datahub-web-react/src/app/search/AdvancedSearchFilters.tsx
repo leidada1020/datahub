@@ -1,0 +1,124 @@
+import * as React from 'react';
+import { Trans, useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { AdvancedFilterSelectValueModal } from '@app/search/AdvancedFilterSelectValueModal';
+import { AdvancedSearchAddFilterSelect } from '@app/search/AdvancedSearchAddFilterSelect';
+import { AdvancedSearchFilter } from '@app/search/AdvancedSearchFilter';
+import { AdvancedSearchFilterOverallUnionTypeSelect } from '@app/search/AdvancedSearchFilterOverallUnionTypeSelect';
+import useAdvancedSearchSelectFilters from '@app/search/useAdvancedSearchSelectFilters';
+import { UnionType } from '@app/search/utils/constants';
+
+import { FacetFilterInput, FacetMetadata } from '@types';
+
+const AnyAllSection = styled.div`
+    padding: 6px;
+    color: ${(props) => props.theme.colors.textSecondary};
+`;
+
+const EmptyStateSection = styled.div`
+    border-radius: 5px;
+    background-color: ${(props) => props.theme.colors.bgSurface};
+    padding: 22px;
+    margin-top: 10px;
+`;
+
+const AdvancedSearchFiltersGroup = styled.div`
+    display: flex;
+    flex-wrap: wrap;
+`;
+
+export enum LayoutDirection {
+    Horizontal = 'horizontal',
+    Vertical = 'vertical',
+}
+
+interface Props {
+    selectedFilters: Array<FacetFilterInput>;
+    facets: Array<FacetMetadata>;
+    onFilterSelect: (newFilters: Array<FacetFilterInput>) => void;
+    onChangeUnionType: (unionType: UnionType) => void;
+    unionType?: UnionType;
+    loading: boolean;
+    direction?: LayoutDirection;
+    disabled?: boolean;
+}
+
+export const AdvancedSearchFilters = ({
+    unionType = UnionType.AND,
+    facets,
+    selectedFilters,
+    onFilterSelect,
+    onChangeUnionType,
+    loading,
+    direction = LayoutDirection.Vertical,
+    disabled = false,
+}: Props) => {
+    const { t } = useTranslation('search');
+    const { filterField, setFilterField, onFilterFieldSelect, onSelectValueFromModal } = useAdvancedSearchSelectFilters(
+        { selectedFilters, onFilterSelect },
+    );
+
+    return (
+        <>
+            {!disabled && (
+                <AdvancedSearchAddFilterSelect
+                    selectedFilters={selectedFilters}
+                    onFilterFieldSelect={onFilterFieldSelect}
+                />
+            )}
+            <AdvancedSearchFiltersGroup>
+                {selectedFilters.map((filter) => (
+                    <AdvancedSearchFilter
+                        key={`${filter.field}-${filter.condition}-${filter.negated}-${filter.values?.join(',') ?? ''}`}
+                        facet={facets.find((facet) => facet.field === filter.field) || facets[0]}
+                        loading={loading}
+                        filter={filter}
+                        onClose={() => {
+                            onFilterSelect(selectedFilters.filter((f) => f !== filter));
+                        }}
+                        onUpdate={(newValue) => {
+                            onFilterSelect(
+                                selectedFilters.map((f) => {
+                                    if (f === filter) {
+                                        return newValue;
+                                    }
+                                    return f;
+                                }),
+                            );
+                        }}
+                        disabled={disabled}
+                    />
+                ))}
+            </AdvancedSearchFiltersGroup>
+            {filterField && (
+                <AdvancedFilterSelectValueModal
+                    facet={facets.find((facet) => facet.field === filterField) || null}
+                    onCloseModal={() => setFilterField(null)}
+                    filterField={filterField}
+                    onSelect={onSelectValueFromModal}
+                />
+            )}
+            {selectedFilters?.length >= 2 && (
+                <AnyAllSection>
+                    <Trans
+                        t={t}
+                        i18nKey="advancedSearch.showResultsThatMatch"
+                        components={{
+                            select: (
+                                <AdvancedSearchFilterOverallUnionTypeSelect
+                                    unionType={unionType}
+                                    onUpdate={(newValue) => onChangeUnionType(newValue)}
+                                    disabled={disabled}
+                                />
+                            ),
+                        }}
+                    />
+                </AnyAllSection>
+            )}
+            {selectedFilters?.length === 0 && direction === LayoutDirection.Vertical && (
+                <EmptyStateSection>{t('advancedSearch.noFiltersApplied')}</EmptyStateSection>
+            )}
+        </>
+    );
+};

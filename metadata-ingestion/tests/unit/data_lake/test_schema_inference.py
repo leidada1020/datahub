@@ -1,0 +1,251 @@
+import tempfile
+from typing import Dict, List, Type
+
+import pandas as pd
+import ujson
+from avro import schema as avro_schema
+from avro.datafile import DataFileWriter
+from avro.io import DatumWriter
+
+from datahub.ingestion.source.schema_inference import csv_tsv, json, parquet
+from datahub.ingestion.source.schema_inference.avro import AvroInferrer
+from datahub.metadata.com.linkedin.pegasus2avro.schema import (
+    BooleanTypeClass,
+    NumberTypeClass,
+    SchemaField,
+    StringTypeClass,
+)
+from tests.unit.test_schema_util import assert_field_paths_match
+
+expected_field_paths = [
+    "integer_field",
+    "boolean_field",
+    "string_field",
+]
+
+expected_field_paths_avro = [
+    "[version=2.0].[type=test].[type=int].integer_field",
+    "[version=2.0].[type=test].[type=boolean].boolean_field",
+    "[version=2.0].[type=test].[type=string].string_field",
+]
+
+expected_field_types = [NumberTypeClass, BooleanTypeClass, StringTypeClass]
+
+test_table = pd.DataFrame(
+    {
+        "integer_field": [1, 2, 3],
+        "boolean_field": [True, False, True],
+        "string_field": ["a", "b", "c"],
+    }
+)
+
+
+def assert_field_types_match(
+    fields: List[SchemaField], expected_field_types: List[Type]
+) -> None:
+    assert len(fields) == len(expected_field_types)
+    for field, expected_type in zip(fields, expected_field_types, strict=False):
+        assert isinstance(field.type.type, expected_type)
+
+
+def test_infer_schema_csv():
+    with tempfile.TemporaryFile(mode="w+b") as file:
+        file.write(bytes(test_table.to_csv(index=False, header=True), encoding="utf-8"))
+        file.seek(0)
+
+        fields = csv_tsv.CsvInferrer(max_rows=100).infer_schema(file)
+
+        assert_field_paths_match(fields, expected_field_paths)
+        assert_field_types_match(fields, expected_field_types)
+
+
+def test_infer_schema_tsv():
+    with tempfile.TemporaryFile(mode="w+b") as file:
+        file.write(
+            bytes(
+                test_table.to_csv(index=False, header=True, sep="\t"), encoding="utf-8"
+            )
+        )
+        file.seek(0)
+
+        fields = csv_tsv.TsvInferrer(max_rows=100).infer_schema(file)
+
+        assert_field_paths_match(fields, expected_field_paths)
+        assert_field_types_match(fields, expected_field_types)
+
+
+def test_infer_schema_jsonl():
+    with tempfile.TemporaryFile(mode="w+b") as file:
+        file.write(
+            bytes(test_table.to_json(orient="records", lines=True), encoding="utf-8")
+        )
+        file.seek(0)
+
+        fields = json.JsonInferrer(max_rows=100, format="jsonl").infer_schema(file)
+
+        assert_field_paths_match(fields, expected_field_paths)
+        assert_field_types_match(fields, expected_field_types)
+
+
+def test_infer_schema_json():
+    with tempfile.TemporaryFile(mode="w+b") as file:
+        file.write(bytes(test_table.to_json(orient="records"), encoding="utf-8"))
+        file.seek(0)
+
+        fields = json.JsonInferrer().infer_schema(file)
+
+        assert_field_paths_match(fields, expected_field_paths)
+        assert_field_types_match(fields, expected_field_types)
+
+
+def test_infer_schema_json_large_array_capped():
+    """Verify that JsonInferrer only reads max_rows records from a large JSON array."""
+    records = [
+        {"integer_field": i, "boolean_field": i % 2 == 0, "string_field": f"val_{i}"}
+        for i in range(1000)
+    ]
+    with tempfile.TemporaryFile(mode="w+b") as file:
+        file.write(ujson.dumps(records).encode("utf-8"))
+        file.seek(0)
+
+        fields = json.JsonInferrer(max_rows=10).infer_schema(file)
+
+        assert_field_paths_match(fields, expected_field_paths)
+        assert_field_types_match(fields, expected_field_types)
+
+
+def test_infer_schema_json_single_object():
+    """Verify that a single JSON object (not array) is handled correctly."""
+    with tempfile.TemporaryFile(mode="w+b") as file:
+        file.write(
+            ujson.dumps(
+                {"integer_field": 1, "boolean_field": True, "string_field": "a"}
+            ).encode("utf-8")
+        )
+        file.seek(0)
+
+        fields = json.JsonInferrer().infer_schema(file)
+
+        assert_field_paths_match(fields, expected_field_paths)
+        assert_field_types_match(fields, expected_field_types)
+
+
+def test_bounded_json_value_truncates_arrays():
+    """A single JSON object with a huge array must not be fully materialized:
+    arrays are truncated to max_rows while structure and native types survive."""
+    with tempfile.TemporaryFile(mode="w+b") as file:
+        file.write(
+            ujson.dumps(
+                {"big": list(range(1000)), "meta": {"n": 3}, "flag": True}
+            ).encode("utf-8")
+        )
+        file.seek(0)
+
+        result = json._bounded_json_value(file, max_rows=10)
+
+    assert isinstance(result, dict)
+    assert result["big"] == list(range(10))
+    assert isinstance(result["big"][0], int)  # native int, not ijson's Decimal
+    assert result["meta"] == {"n": 3}
+    assert result["flag"] is True
+
+
+def test_bounded_json_value_truncates_array_of_objects():
+    """Array elements beyond max_rows that are themselves objects are skipped
+    without being materialized (exercises the nested-container skip path)."""
+    with tempfile.TemporaryFile(mode="w+b") as file:
+        file.write(ujson.dumps({"rows": [{"a": i} for i in range(50)]}).encode("utf-8"))
+        file.seek(0)
+
+        result = json._bounded_json_value(file, max_rows=3)
+
+    assert result == {"rows": [{"a": 0}, {"a": 1}, {"a": 2}]}
+
+
+def test_bounded_json_value_skips_nested_containers_past_limit():
+    """Skipped array items may themselves contain nested containers, so the skip
+    bookkeeping has to unwind to exactly the right depth. The trailing key proves
+    parsing resumed at the top level."""
+    rows = [{"a": {"b": [i, i + 1]}} for i in range(10)]
+    with tempfile.TemporaryFile(mode="w+b") as file:
+        file.write(ujson.dumps({"rows": rows, "tail": "sentinel"}).encode("utf-8"))
+        file.seek(0)
+
+        result = json._bounded_json_value(file, max_rows=2)
+
+    assert result == {
+        "rows": [{"a": {"b": [0, 1]}}, {"a": {"b": [1, 2]}}],
+        "tail": "sentinel",
+    }
+
+
+def test_infer_schema_json_single_object_is_sampled():
+    """A single JSON object is sampled rather than read whole, so a field that
+    first appears past max_rows is not reported. This fails against the old
+    ujson.load fallback, which saw every record."""
+    records: List[Dict[str, int]] = [{"integer_field": i} for i in range(200)]
+    records[150]["late_field"] = 1
+
+    with tempfile.TemporaryFile(mode="w+b") as file:
+        file.write(ujson.dumps({"rows": records}).encode("utf-8"))
+        file.seek(0)
+
+        fields = json.JsonInferrer(max_rows=100).infer_schema(file)
+
+    field_paths = [f.fieldPath for f in fields]
+    assert "rows.integer_field" in field_paths
+    assert "rows.late_field" not in field_paths
+
+
+def test_infer_schema_json_fallback_to_jsonlines():
+    """Verify that JSONL content with .json extension falls back correctly."""
+    with tempfile.TemporaryFile(mode="w+b") as file:
+        file.write(
+            bytes(test_table.to_json(orient="records", lines=True), encoding="utf-8")
+        )
+        file.seek(0)
+
+        # format="json" (not "jsonl") but content is actually JSONL
+        fields = json.JsonInferrer(max_rows=100, format="json").infer_schema(file)
+
+        assert_field_paths_match(fields, expected_field_paths)
+        assert_field_types_match(fields, expected_field_types)
+
+
+def test_infer_schema_parquet():
+    with tempfile.TemporaryFile(mode="w+b") as file:
+        test_table.to_parquet(file)
+        file.seek(0)
+        fields = parquet.ParquetInferrer().infer_schema(file)
+
+        assert_field_paths_match(fields, expected_field_paths)
+        assert_field_types_match(fields, expected_field_types)
+
+
+def test_infer_schema_avro():
+    with tempfile.TemporaryFile(mode="w+b") as file:
+        schema = avro_schema.parse(
+            ujson.dumps(
+                {
+                    "type": "record",
+                    "name": "test",
+                    "fields": [
+                        {"name": "integer_field", "type": "int"},
+                        {"name": "boolean_field", "type": "boolean"},
+                        {"name": "string_field", "type": "string"},
+                    ],
+                }
+            )
+        )
+        writer = DataFileWriter(file, DatumWriter(), schema)
+        records = test_table.to_dict(orient="records")
+        for record in records:
+            writer.append(record)
+        writer.sync()
+
+        file.seek(0)
+
+        fields = AvroInferrer().infer_schema(file)
+
+        assert_field_paths_match(fields, expected_field_paths_avro)
+        assert_field_types_match(fields, expected_field_types)

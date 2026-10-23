@@ -1,0 +1,262 @@
+import { Key } from '@phosphor-icons/react/dist/csr/Key';
+import { ListBullets } from '@phosphor-icons/react/dist/csr/ListBullets';
+import { TreeStructure } from '@phosphor-icons/react/dist/csr/TreeStructure';
+import i18next from 'i18next';
+import * as React from 'react';
+
+import { GenericEntityProperties } from '@app/entity/shared/types';
+import { Entity, EntityCapabilityType, IconStyleType, PreviewType } from '@app/entityV2/Entity';
+import { Preview } from '@app/entityV2/mlPrimaryKey/preview/Preview';
+import { EntityMenuItems } from '@app/entityV2/shared/EntityDropdown/EntityMenuActions';
+import { TYPE_ICON_CLASS_NAME } from '@app/entityV2/shared/components/subtypes';
+import { EntityTabPath } from '@app/entityV2/shared/constants';
+import { getDataForEntityType } from '@app/entityV2/shared/containers/profile/entityData';
+import { lazyProfileComponent } from '@app/entityV2/shared/lazyEntityProfile';
+import {
+    DataProductSection,
+    DocumentationTab,
+    EntityProfile,
+    LineageTab,
+    PropertiesTab,
+    SidebarAboutSection,
+    SidebarDomainSection,
+    SidebarEntityHeader,
+    SidebarGlossaryTermsSection,
+    SidebarOwnerSection,
+    SidebarStructuredProperties,
+    SidebarTagsSection,
+    StatusSection,
+} from '@app/entityV2/shared/profileChunks';
+import { SidebarTitleActionType, getDataProduct, isOutputPort } from '@app/entityV2/shared/utils';
+
+import { useGetMlPrimaryKeyQuery } from '@graphql/mlPrimaryKey.generated';
+import { EntityType, MlPrimaryKey, SearchResult } from '@types';
+
+const FeatureTableTab = lazyProfileComponent('FeatureTableTab', () =>
+    import('@app/entityV2/shared/tabs/ML/MlPrimaryKeyFeatureTableTab').then((module) => ({
+        default: module.FeatureTableTab,
+    })),
+);
+
+const headerDropdownItems = new Set([
+    EntityMenuItems.UPDATE_DEPRECATION,
+    EntityMenuItems.SHARE,
+    EntityMenuItems.ANNOUNCE,
+]);
+
+/**
+ * Definition of the DataHub MLPrimaryKey entity.
+ */
+export class MLPrimaryKeyEntity implements Entity<MlPrimaryKey> {
+    type: EntityType = EntityType.MlprimaryKey;
+
+    icon = (fontSize?: number, styleType?: IconStyleType, color?: string) => {
+        return (
+            <Key
+                className={TYPE_ICON_CLASS_NAME}
+                size={fontSize || 14}
+                color={color || 'currentColor'}
+                weight={styleType === IconStyleType.HIGHLIGHT ? 'fill' : 'regular'}
+            />
+        );
+    };
+
+    isSearchEnabled = () => true;
+
+    isBrowseEnabled = () => false;
+
+    isLineageEnabled = () => true;
+
+    getAutoCompleteFieldName = () => 'name';
+
+    getGraphName = () => 'mlPrimaryKey';
+
+    getPathName = () => 'mlPrimaryKeys';
+
+    getEntityName = () => i18next.t('entity.types:mlPrimaryKey.name');
+
+    getCollectionName = () => i18next.t('entity.types:mlPrimaryKey.namePlural');
+
+    getOverridePropertiesFromEntity = (key?: MlPrimaryKey | null): GenericEntityProperties => {
+        return {
+            // eslint-disable-next-line
+            platform: key?.['featureTables']?.relationships?.[0]?.entity?.platform,
+        };
+    };
+
+    useEntityQuery = useGetMlPrimaryKeyQuery;
+
+    renderProfile = (urn: string) => (
+        <EntityProfile
+            urn={urn}
+            key={urn}
+            entityType={EntityType.MlprimaryKey}
+            useEntityQuery={useGetMlPrimaryKeyQuery}
+            getOverrideProperties={this.getOverridePropertiesFromEntity}
+            headerDropdownItems={headerDropdownItems}
+            tabs={[
+                {
+                    name: i18next.t('entity.types:tab.featureTables'),
+                    path: EntityTabPath.FEATURE_TABLES,
+                    component: FeatureTableTab,
+                },
+                {
+                    name: i18next.t('entity.types:tab.documentation'),
+                    path: EntityTabPath.DOCUMENTATION,
+                    component: DocumentationTab,
+                },
+                {
+                    name: i18next.t('entity.types:tab.lineage'),
+                    path: EntityTabPath.LINEAGE,
+                    component: LineageTab,
+                    supportsFullsize: true,
+                },
+                {
+                    name: i18next.t('entity.types:tab.properties'),
+                    path: EntityTabPath.PROPERTIES,
+                    component: PropertiesTab,
+                },
+            ]}
+            sidebarSections={this.getSidebarSections()}
+            sidebarTabs={this.getSidebarTabs()}
+        />
+    );
+
+    getSidebarSections = () => [
+        {
+            component: SidebarEntityHeader,
+        },
+        {
+            component: SidebarAboutSection,
+        },
+        {
+            component: SidebarOwnerSection,
+        },
+        {
+            component: SidebarDomainSection,
+        },
+        {
+            component: DataProductSection,
+        },
+        {
+            component: SidebarTagsSection,
+        },
+        {
+            component: SidebarGlossaryTermsSection,
+        },
+        {
+            component: SidebarStructuredProperties,
+        },
+        {
+            component: StatusSection,
+        },
+    ];
+
+    getSidebarTabs = () => [
+        {
+            name: i18next.t('entity.types:tab.lineage'),
+            component: LineageTab,
+            description: i18next.t('entity.types:sidebar.lineageDescription'),
+            icon: TreeStructure,
+            properties: {
+                actionType: SidebarTitleActionType.LineageExplore,
+            },
+        },
+        {
+            name: i18next.t('entity.types:tab.properties'),
+            component: PropertiesTab,
+            description: i18next.t('entity.types:sidebar.propertiesDescription'),
+            icon: ListBullets,
+        },
+    ];
+
+    renderPreview = (previewType: PreviewType, data: MlPrimaryKey) => {
+        const genericProperties = this.getGenericEntityProperties(data);
+        // eslint-disable-next-line
+        const platform = data?.['featureTables']?.relationships?.[0]?.entity?.platform;
+        return (
+            <Preview
+                urn={data.urn}
+                data={genericProperties}
+                name={data.name || ''}
+                featureNamespace={data.featureNamespace || ''}
+                description={data.description}
+                owners={data.ownership?.owners}
+                platform={platform}
+                dataProduct={getDataProduct(genericProperties?.dataProduct)}
+                deprecation={data.deprecation}
+                headerDropdownItems={headerDropdownItems}
+                previewType={previewType}
+            />
+        );
+    };
+
+    renderSearch = (result: SearchResult) => {
+        const data = result.entity as MlPrimaryKey;
+        const genericProperties = this.getGenericEntityProperties(data);
+        // eslint-disable-next-line
+        const platform = data?.['featureTables']?.relationships?.[0]?.entity?.platform;
+        return (
+            <Preview
+                urn={data.urn}
+                data={genericProperties}
+                name={data.name || ''}
+                featureNamespace={data.featureNamespace || ''}
+                description={data.description || ''}
+                owners={data.ownership?.owners}
+                platform={platform}
+                platformInstanceId={data.dataPlatformInstance?.instanceId}
+                dataProduct={getDataProduct(genericProperties?.dataProduct)}
+                deprecation={data.deprecation}
+                degree={(result as any).degree}
+                paths={(result as any).paths}
+                isOutputPort={isOutputPort(result)}
+                headerDropdownItems={headerDropdownItems}
+                previewType={PreviewType.SEARCH}
+            />
+        );
+    };
+
+    displayName = (data: MlPrimaryKey) => {
+        return data.name || data.urn;
+    };
+
+    getGenericEntityProperties = (mlPrimaryKey: MlPrimaryKey) => {
+        return getDataForEntityType({
+            data: mlPrimaryKey,
+            entityType: this.type,
+            getOverrideProperties: this.getOverridePropertiesFromEntity,
+        });
+    };
+
+    getLineageVizConfig = (entity: MlPrimaryKey) => {
+        return {
+            urn: entity.urn,
+            name: entity.name,
+            type: EntityType.MlprimaryKey,
+            // eslint-disable-next-line
+            icon: entity?.['featureTables']?.relationships?.[0]?.entity?.platform?.properties?.logoUrl || undefined,
+            // eslint-disable-next-line
+            platform: entity?.['featureTables']?.relationships?.[0]?.entity?.platform?.name,
+        };
+    };
+
+    supportedCapabilities = () => {
+        return new Set([
+            EntityCapabilityType.OWNERS,
+            EntityCapabilityType.GLOSSARY_TERMS,
+            EntityCapabilityType.TAGS,
+            EntityCapabilityType.DOMAINS,
+            EntityCapabilityType.DEPRECATION,
+            EntityCapabilityType.SOFT_DELETE,
+            EntityCapabilityType.DATA_PRODUCTS,
+            EntityCapabilityType.LINEAGE,
+            EntityCapabilityType.RELATED_DOCUMENTS,
+            EntityCapabilityType.FORMS,
+        ]);
+    };
+
+    getPlatformProperties = (data: MlPrimaryKey) => {
+        return data?.properties?.sources?.[0]?.platform;
+    };
+}

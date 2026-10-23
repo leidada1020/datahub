@@ -1,0 +1,121 @@
+from typing import List, Optional, Union
+
+from pydantic import Field, RootModel
+from typing_extensions import Literal
+
+import datahub.emitter.mce_builder as builder
+from datahub.api.entities.datacontract.assertion import BaseAssertion
+from datahub.api.entities.datacontract.assertion_operator import Operators
+from datahub.emitter.mcp import MetadataChangeProposalWrapper
+from datahub.metadata.schema_classes import (
+    AssertionInfoClass,
+    AssertionStdAggregationClass,
+    AssertionStdOperatorClass,
+    AssertionStdParameterClass,
+    AssertionStdParametersClass,
+    AssertionStdParameterTypeClass,
+    AssertionTypeClass,
+    AssertionValueChangeTypeClass,
+    CustomAssertionInfoClass,
+    DatasetAssertionScopeClass,
+    SqlAssertionInfoClass,
+    SqlAssertionTypeClass,
+)
+
+
+class IdConfigMixin(BaseAssertion):
+    id_raw: Optional[str] = Field(
+        default=None,
+        alias="id",
+        description="The id of the assertion. If not provided, one will be generated using the type.",
+    )
+
+    def generate_default_id(self) -> str:
+        raise NotImplementedError
+
+
+class CustomSQLAssertion(IdConfigMixin, BaseAssertion):
+    type: Literal["custom_sql"]
+    sql: str
+    operator: Operators = Field(discriminator="type")
+
+    def generate_default_id(self) -> str:
+        return f"{self.type}-{self.sql}-{self.operator.id()}"
+
+    def generate_assertion_info(self, entity_urn: str) -> AssertionInfoClass:
+        sql_assertion_info = SqlAssertionInfoClass(
+            entity=entity_urn,
+            statement=self.sql,
+            operator=self.operator.operator,
+            parameters=self.operator.generate_parameters(),
+            # TODO: Support other types of assertions
+            type=SqlAssertionTypeClass.METRIC,
+            changeType=AssertionValueChangeTypeClass.ABSOLUTE,
+        )
+        return AssertionInfoClass(
+            type=AssertionTypeClass.SQL,
+            sqlAssertion=sql_assertion_info,
+            source=builder.make_assertion_source(),
+            description=self.description,
+        )
+
+
+class ColumnUniqueAssertion(IdConfigMixin, BaseAssertion):
+    type: Literal["unique"]
+
+    # TODO: support multiple columns?
+    column: str
+
+    def generate_default_id(self) -> str:
+        return f"{self.type}-{self.column}"
+
+    def generate_assertion_info(self, entity_urn: str) -> AssertionInfoClass:
+        field_urn = builder.make_schema_field_urn(entity_urn, self.column)
+        custom_assertion_info = CustomAssertionInfoClass(
+            type="dataContract",
+            entity=entity_urn,
+            field=field_urn,
+            fields=[field_urn],
+            scope=DatasetAssertionScopeClass.DATASET_COLUMN,
+            operator=AssertionStdOperatorClass.EQUAL_TO,
+            # purposely using the misspelled version to work with gql
+            aggregation=AssertionStdAggregationClass.UNIQUE_PROPOTION,
+            parameters=AssertionStdParametersClass(
+                value=AssertionStdParameterClass(
+                    value="1", type=AssertionStdParameterTypeClass.NUMBER
+                )
+            ),
+            nativeType="unique",
+        )
+        return AssertionInfoClass(
+            type=AssertionTypeClass.CUSTOM,
+            customAssertion=custom_assertion_info,
+            source=builder.make_assertion_source(),
+            description=self.description,
+        )
+
+
+class DataQualityAssertion(RootModel[Union[CustomSQLAssertion, ColumnUniqueAssertion]]):
+    root: Union[
+        CustomSQLAssertion,
+        ColumnUniqueAssertion,
+    ] = Field(discriminator="type")
+
+    @property
+    def id(self) -> str:
+        if self.root.id_raw:
+            return self.root.id_raw
+        try:
+            return self.root.generate_default_id()
+        except NotImplementedError:
+            return self.root.type
+
+    def generate_mcp(
+        self, assertion_urn: str, entity_urn: str
+    ) -> List[MetadataChangeProposalWrapper]:
+        return [
+            MetadataChangeProposalWrapper(
+                entityUrn=assertion_urn,
+                aspect=self.root.generate_assertion_info(entity_urn),
+            )
+        ]

@@ -1,0 +1,103 @@
+import { Tooltip } from '@components';
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import { useHistory } from 'react-router';
+import styled from 'styled-components/macro';
+
+import { PLATFORM_FILTER_NAME } from '@app/searchV2/utils/constants';
+import { navigateToSearchUrl } from '@app/searchV2/utils/navigateToSearchUrl';
+import { formatNumber, formatNumberWithoutAbbreviation } from '@app/sharedV2/formatNumber';
+import PlatformIcon from '@app/sharedV2/icons/PlatformIcon';
+import { useEntityRegistry } from '@app/useEntityRegistry';
+import { useShowNavBarRedesign } from '@src/app/useShowNavBarRedesign';
+
+import { DataPlatform, EntityType } from '@types';
+
+const Card = styled.div<{ $isShowNavBarRedesign?: boolean }>`
+    border-radius: 10px;
+    background-color: ${(props) => props.theme.colors.bg};
+    padding: 16px;
+    min-width: 180px;
+    border: ${(props) =>
+        props.$isShowNavBarRedesign ? `1px solid ${props.theme.colors.border}` : '2px solid transparent'};
+    ${(props) => props.$isShowNavBarRedesign && 'border-radius: 8px;'}
+    :hover {
+        border: ${(props) => (props.$isShowNavBarRedesign ? '1px' : '2px')} solid
+            ${(props) => props.theme.colors.borderHover};
+        cursor: pointer;
+    }
+    display: flex;
+    justify-content: start;
+    align-items: center;
+    gap: 14px;
+`;
+
+const Text = styled.div``;
+
+const Name = styled.div`
+    font-size: 16px;
+    color: ${(props) => props.theme.colors.textTertiary};
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 160px;
+    white-space: nowrap;
+`;
+
+const Count = styled.div`
+    font-size: 16px;
+    color: ${(props) => props.theme.colors.textSecondary};
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+`;
+
+type Props = {
+    platform: DataPlatform;
+    count?: number;
+};
+
+export const PlatformCard = ({ platform, count }: Props) => {
+    const { t } = useTranslation('home.v2');
+    const isShowNavBarRedesign = useShowNavBarRedesign();
+    const history = useHistory();
+    const entityRegistry = useEntityRegistry();
+    const name = entityRegistry.getDisplayName(EntityType.DataPlatform, platform);
+
+    const navigateToPlatformSearch = () => {
+        navigateToSearchUrl({
+            history,
+            filters: [
+                {
+                    field: PLATFORM_FILTER_NAME,
+                    values: [platform.urn],
+                },
+            ],
+        });
+    };
+
+    return (
+        <Tooltip
+            title={t('platforms.viewAssetsTooltip', {
+                count,
+                formattedCount: formatNumberWithoutAbbreviation(count),
+                name,
+            })}
+            showArrow={false}
+            placement="bottom"
+        >
+            <Card key={platform.urn} onClick={navigateToPlatformSearch} $isShowNavBarRedesign={isShowNavBarRedesign}>
+                <PlatformIcon
+                    platform={platform}
+                    size={30}
+                    styles={{
+                        padding: '10px',
+                    }}
+                />
+                <Text>
+                    <Name>{name}</Name>
+                    {(count !== undefined && <Count>{formatNumber(count)}</Count>) || null}
+                </Text>
+            </Card>
+        </Tooltip>
+    );
+};

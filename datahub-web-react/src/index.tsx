@@ -1,0 +1,22 @@
+import React from 'react';
+import ReactDOM from 'react-dom';
+
+import { installChunkReloadHandler } from '@app/sharedV2/chunkReload';
+import { App } from '@src/App';
+import '@src/i18n/i18n';
+import reportWebVitals from '@src/reportWebVitals';
+import '@utils/dayjs';
+
+installChunkReloadHandler();
+
+ReactDOM.render(
+    <React.StrictMode>
+        <App />
+    </React.StrictMode>,
+    document.getElementById('root'),
+);
+
+// If you want to start measuring performance in your app, pass a function
+// to log results (for example: reportWebVitals(console.log))
+// or send to an analytics endpoint. Learn more: https://bit.ly/CRA-vitals
+reportWebVitals();

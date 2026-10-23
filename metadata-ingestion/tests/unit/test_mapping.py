@@ -1,0 +1,921 @@
+from typing import Any, Dict
+
+import pytest
+
+from datahub.emitter.mce_builder import validate_ownership_type
+from datahub.metadata.com.linkedin.pegasus2avro.common import GlobalTags
+from datahub.metadata.schema_classes import (
+    DomainsClass,
+    GlobalTagsClass,
+    GlossaryTermsClass,
+    InstitutionalMemoryClass,
+    OwnerClass,
+    OwnershipClass,
+    OwnershipSourceTypeClass,
+    OwnershipTypeClass,
+    StructuredPropertiesClass,
+)
+from datahub.utilities.mapping import OperationProcessor
+from datahub.utilities.urns.error import InvalidUrnError
+
+
+def get_operation_defs() -> Dict[str, Any]:
+    return {
+        "user_owner": {
+            "match": ".*",
+            "operation": "add_owner",
+            "config": {"owner_type": "user"},
+        },
+        "user_owner_2": {
+            "match": ".*",
+            "operation": "add_owner",
+            "config": {"owner_type": "user"},
+        },
+        "multi_user": {
+            "match": ".*",
+            "operation": "add_owner",
+            "config": {"owner_type": "user"},
+        },
+        "group.owner": {
+            "match": ".*",
+            "operation": "add_owner",
+            "config": {"owner_type": "group"},
+        },
+        "pii": {
+            "match": True,
+            "operation": "add_tag",
+            "config": {"tag": "has_pii_test"},
+        },
+        "int_property": {
+            "match": 1,
+            "operation": "add_tag",
+            "config": {"tag": "int_property"},
+        },
+        "double_property": {
+            "match": 2.5,
+            "operation": "add_term",
+            "config": {"term": "double_property"},
+        },
+        "governance.team_owner": {
+            "match": "Finan.*",
+            "operation": "add_term",
+            "config": {"term": "Finance.test"},
+        },
+        "tag": {
+            "match": ".*",
+            "operation": "add_tag",
+            "config": {"tag": "{{ $match }}"},
+        },
+    }
+
+
+def test_operation_processor_not_matching():
+    # no property matches to the rules
+    raw_props = {
+        "user_owner_test": "test_user@abc.com",
+        "group.owner_test": "test.group@abc.co.in",
+        "governance.team_owner": "Binance",
+        "pii": False,
+        "int_property": 3,
+        "double_property": 25,
+    }
+    processor = OperationProcessor(get_operation_defs())
+    aspect_map = processor.process(raw_props)
+    assert "add_tag" not in aspect_map
+    assert "add_term" not in aspect_map
+    assert "add_owner" not in aspect_map
+
+
+def test_operation_processor_matching():
+    raw_props = {
+        "user_owner": "test_user@abc.com",
+        "multi_user": "sales_member1@abc.com, sales_member2@abc.com",
+        "user_owner_2": "test_user_2",
+        "group.owner": "test.group@abc.co.in",
+        "governance.team_owner": "Finance",
+        "pii": True,
+        "int_property": 1,
+        "double_property": 2.5,
+        "tag": "Finance",
+    }
+
+    processor = OperationProcessor(
+        operation_defs=get_operation_defs(),
+        owner_source_type="SOURCE_CONTROL",
+        strip_owner_email_id=True,
+    )
+    aspect_map = processor.process(raw_props)
+    assert "add_tag" in aspect_map
+    assert "add_term" in aspect_map
+    assert "add_owner" in aspect_map
+    tag_aspect: GlobalTags = aspect_map["add_tag"]
+    tags_added = [
+        tag_association_class.tag for tag_association_class in tag_aspect.tags
+    ]
+    term_aspect: GlossaryTermsClass = aspect_map["add_term"]
+    terms_added = [
+        term_association_class.urn for term_association_class in term_aspect.terms
+    ]
+    assert (
+        len(tags_added) == 3
+        and "urn:li:tag:has_pii_test" in tags_added
+        and "urn:li:tag:int_property" in tags_added
+        and "urn:li:tag:Finance" in tags_added
+    )
+    assert (
+        len(terms_added) == 2
+        and "urn:li:glossaryTerm:Finance.test" in terms_added
+        and "urn:li:glossaryTerm:double_property" in terms_added
+    )
+
+    ownership_aspect: OwnershipClass = aspect_map["add_owner"]
+    assert len(ownership_aspect.owners) == 5
+    owner_set = {
+        "urn:li:corpuser:test_user",
+        "urn:li:corpuser:test_user_2",
+        "urn:li:corpGroup:test.group",
+        "urn:li:corpuser:sales_member1",
+        "urn:li:corpuser:sales_member2",
+    }
+    for single_owner in ownership_aspect.owners:
+        assert single_owner.owner in owner_set
+        assert (
+            single_owner.source
+            and single_owner.source.type == OwnershipSourceTypeClass.SOURCE_CONTROL
+        )
+
+
+def test_operation_processor_no_email_strip_source_type_not_null():
+    raw_props = {
+        "user_owner": "test_user@abc.com",
+    }
+    processor = OperationProcessor(
+        operation_defs=get_operation_defs(),
+        owner_source_type="SERVICE",
+        strip_owner_email_id=False,
+    )
+    aspect_map = processor.process(raw_props)
+    assert "add_owner" in aspect_map
+
+    ownership_aspect: OwnershipClass = aspect_map["add_owner"]
+    assert len(ownership_aspect.owners) == 1
+    new_owner: OwnerClass = ownership_aspect.owners[0]
+    assert new_owner.owner == "urn:li:corpuser:test_user@abc.com"
+    assert new_owner.source and new_owner.source.type == "SERVICE"
+
+
+def test_operation_processor_advanced_matching_owners():
+    raw_props = {
+        "user_owner": "@test_user@abc.com",
+    }
+    processor = OperationProcessor(
+        operation_defs={
+            "user_owner": {
+                "match": "^@(.*)",
+                "operation": "add_owner",
+                "config": {"owner_type": "group"},
+            },
+        },
+        owner_source_type="SOURCE_CONTROL",
+    )
+    aspect_map = processor.process(raw_props)
+    assert "add_owner" in aspect_map
+
+    ownership_aspect: OwnershipClass = aspect_map["add_owner"]
+    assert len(ownership_aspect.owners) == 1
+    new_owner: OwnerClass = ownership_aspect.owners[0]
+    assert new_owner.owner == "urn:li:corpGroup:test_user@abc.com"
+    assert new_owner.source and new_owner.source.type == "SOURCE_CONTROL"
+
+
+def test_operation_processor_ownership_category():
+    raw_props = {
+        "user_owner": "@test_user",
+        "business_owner": "alice,urn:li:corpGroup:biz-data-team",
+        "architect": "bob",
+        "producer": "urn:li:corpGroup:producer-group",
+    }
+    processor = OperationProcessor(
+        operation_defs={
+            "user_owner": {
+                "match": "^@(.*)",
+                "operation": "add_owner",
+                "config": {
+                    "owner_type": "group",
+                    "owner_category": OwnershipTypeClass.DATA_STEWARD,
+                },
+            },
+            "business_owner": {
+                "match": ".*",
+                "operation": "add_owner",
+                "config": {
+                    "owner_type": "user",
+                    "owner_category": OwnershipTypeClass.BUSINESS_OWNER,
+                },
+            },
+            "architect": {
+                "match": ".*",
+                "operation": "add_owner",
+                "config": {
+                    "owner_type": "user",
+                    "owner_category": "urn:li:ownershipType:architect",
+                },
+            },
+            "producer": {
+                "match": ".*",
+                "operation": "add_owner",
+                "config": {
+                    # Testing using full urns without any owner_type set.
+                    "owner_category": OwnershipTypeClass.PRODUCER,
+                },
+            },
+        },
+        owner_source_type="SOURCE_CONTROL",
+    )
+    aspect_map = processor.process(raw_props)
+    assert "add_owner" in aspect_map
+
+    ownership_aspect: OwnershipClass = aspect_map["add_owner"]
+    assert len(ownership_aspect.owners) == 5
+    assert all(
+        new_owner.source and new_owner.source.type == "SOURCE_CONTROL"
+        for new_owner in ownership_aspect.owners
+    )
+
+    new_owner: OwnerClass = ownership_aspect.owners[0]
+    assert new_owner.owner == "urn:li:corpGroup:biz-data-team"
+    assert new_owner.type and new_owner.type == OwnershipTypeClass.BUSINESS_OWNER
+
+    new_owner = ownership_aspect.owners[1]
+    assert new_owner.owner == "urn:li:corpGroup:producer-group"
+    assert new_owner.type and new_owner.type == OwnershipTypeClass.PRODUCER
+
+    new_owner = ownership_aspect.owners[2]
+    assert new_owner.owner == "urn:li:corpGroup:test_user"
+    assert new_owner.type and new_owner.type == OwnershipTypeClass.DATA_STEWARD
+
+    new_owner = ownership_aspect.owners[3]
+    assert new_owner.owner == "urn:li:corpuser:alice"
+    assert new_owner.type and new_owner.type == OwnershipTypeClass.BUSINESS_OWNER
+
+    new_owner = ownership_aspect.owners[4]
+    assert new_owner.owner == "urn:li:corpuser:bob"
+    assert new_owner.type == OwnershipTypeClass.CUSTOM
+    assert new_owner.typeUrn == "urn:li:ownershipType:architect"
+
+
+def test_operation_processor_advanced_matching_tags():
+    raw_props = {
+        "case": "PLT-4567",
+    }
+    processor = OperationProcessor(
+        operation_defs={
+            "case": {
+                "match": "^PLT-(.*)",
+                "operation": "add_tag",
+                "config": {"tag": "case_{{ $match }}"},
+            },
+        },
+        owner_source_type="SOURCE_CONTROL",
+    )
+    aspect_map = processor.process(raw_props)
+    assert "add_tag" in aspect_map
+
+    tag_aspect: GlobalTagsClass = aspect_map["add_tag"]
+    assert len(tag_aspect.tags) == 1
+    assert tag_aspect.tags[0].tag == "urn:li:tag:case_4567"
+
+
+def test_operation_processor_add_domain():
+    raw_props = {
+        "domain": "Marketing",
+    }
+    processor = OperationProcessor(
+        operation_defs={
+            "domain": {
+                "match": ".*",
+                "operation": "add_domain",
+                "config": {"domain": "{{ $match }}"},
+            },
+        },
+    )
+    aspect_map = processor.process(raw_props)
+    assert "add_domain" in aspect_map
+
+    domain_aspect: DomainsClass = aspect_map["add_domain"]
+    assert domain_aspect.domains == ["urn:li:domain:Marketing"]
+
+
+def test_operation_processor_add_domain_with_urn():
+    raw_props = {
+        "domain": "urn:li:domain:Finance",
+    }
+    processor = OperationProcessor(
+        operation_defs={
+            "domain": {
+                "match": ".*",
+                "operation": "add_domain",
+                "config": {"domain": "{{ $match }}"},
+            },
+        },
+    )
+    aspect_map = processor.process(raw_props)
+    assert "add_domain" in aspect_map
+
+    domain_aspect: DomainsClass = aspect_map["add_domain"]
+    # make_domain_urn is idempotent — full URNs are not double-wrapped
+    assert domain_aspect.domains == ["urn:li:domain:Finance"]
+
+
+def test_operation_processor_add_domain_static_value():
+    raw_props = {
+        "has_pii": True,
+    }
+    processor = OperationProcessor(
+        operation_defs={
+            "has_pii": {
+                "match": True,
+                "operation": "add_domain",
+                "config": {"domain": "DataGovernance"},
+            },
+        },
+    )
+    aspect_map = processor.process(raw_props)
+    assert "add_domain" in aspect_map
+
+    domain_aspect: DomainsClass = aspect_map["add_domain"]
+    assert domain_aspect.domains == ["urn:li:domain:DataGovernance"]
+
+
+def test_operation_processor_institutional_memory():
+    raw_props = {
+        "documentation_link": "https://test.com/documentation#ignore-this",
+    }
+    processor = OperationProcessor(
+        operation_defs={
+            "documentation_link": {
+                "match": r"(?:https?)?\:\/\/\w*[^#]*",
+                "operation": "add_doc_link",
+                "config": {"link": "{{ $match }}", "description": "test"},
+            },
+        },
+    )
+    aspect_map = processor.process(raw_props)
+    assert "add_doc_link" in aspect_map
+
+    doc_link_aspect: InstitutionalMemoryClass = aspect_map["add_doc_link"]
+
+    assert doc_link_aspect.elements[0].url == "https://test.com/documentation"
+    assert doc_link_aspect.elements[0].description == "test"
+
+
+def test_operation_processor_institutional_memory_no_description():
+    raw_props = {
+        "documentation_link": "test.com/documentation#ignore-this",
+    }
+    processor = OperationProcessor(
+        operation_defs={
+            "documentation_link": {
+                "match": r"(?:https?)?\:\/\/\w*[^#]*",
+                "operation": "add_doc_link",
+                "config": {"link": "{{ $match }}"},
+            },
+        },
+    )
+    # we require a description, so this should stay empty
+    aspect_map = processor.process(raw_props)
+    assert aspect_map == {}
+
+
+def test_operation_processor_matching_nested_props():
+    raw_props = {
+        "gdpr": {
+            "pii": True,
+        },
+    }
+    processor = OperationProcessor(
+        operation_defs={
+            "gdpr.pii": {
+                "match": True,
+                "operation": "add_tag",
+                "config": {"tag": "pii"},
+            },
+        },
+        owner_source_type="SOURCE_CONTROL",
+        match_nested_props=True,
+    )
+    aspect_map = processor.process(raw_props)
+    assert "add_tag" in aspect_map
+
+    tag_aspect: GlobalTagsClass = aspect_map["add_tag"]
+    assert len(tag_aspect.tags) == 1
+    assert tag_aspect.tags[0].tag == "urn:li:tag:pii"
+
+
+def test_operation_processor_matching_dot_props():
+    raw_props = {
+        "gdpr.pii": True,
+    }
+    processor = OperationProcessor(
+        operation_defs={
+            "gdpr.pii": {
+                "match": True,
+                "operation": "add_tag",
+                "config": {"tag": "pii"},
+            },
+        },
+        owner_source_type="SOURCE_CONTROL",
+        match_nested_props=True,
+    )
+    aspect_map = processor.process(raw_props)
+    assert "add_tag" in aspect_map
+
+    tag_aspect: GlobalTagsClass = aspect_map["add_tag"]
+    assert len(tag_aspect.tags) == 1
+    assert tag_aspect.tags[0].tag == "urn:li:tag:pii"
+
+
+def test_operation_processor_datahub_props():
+    raw_props = {
+        "datahub": {
+            "tags": ["tag1", "tag2"],
+            "terms": ["term1", "term2"],
+            "owners": [
+                "owner1",
+                "urn:li:corpGroup:group1",
+                {
+                    "owner": "owner2",
+                    "owner_type": "urn:li:ownershipType:steward",
+                },
+                {
+                    "owner": "urn:li:corpGroup:group2",
+                    "owner_type": "urn:li:ownershipType:steward",
+                },
+            ],
+            "domain": "domain1",
+        }
+    }
+
+    processor = OperationProcessor(
+        operation_defs={},
+        owner_source_type="SOURCE_CONTROL",
+    )
+    aspect_map = processor.process(raw_props)
+
+    assert isinstance(aspect_map["add_owner"], OwnershipClass)
+    assert [
+        (owner.owner, owner.type, owner.typeUrn)
+        for owner in aspect_map["add_owner"].owners
+    ] == [
+        ("urn:li:corpGroup:group1", "DATAOWNER", None),
+        ("urn:li:corpGroup:group2", "CUSTOM", "urn:li:ownershipType:steward"),
+        ("urn:li:corpuser:owner1", "DATAOWNER", None),
+        ("urn:li:corpuser:owner2", "CUSTOM", "urn:li:ownershipType:steward"),
+    ]
+
+    assert isinstance(aspect_map["add_tag"], GlobalTagsClass)
+    assert [tag_association.tag for tag_association in aspect_map["add_tag"].tags] == [
+        "urn:li:tag:tag1",
+        "urn:li:tag:tag2",
+    ]
+
+    assert isinstance(aspect_map["add_term"], GlossaryTermsClass)
+    assert [
+        term_association.urn for term_association in aspect_map["add_term"].terms
+    ] == ["urn:li:glossaryTerm:term1", "urn:li:glossaryTerm:term2"]
+
+    assert isinstance(aspect_map["add_domain"], DomainsClass)
+    assert aspect_map["add_domain"].domains == ["urn:li:domain:domain1"]
+
+
+def test_validate_ownership_type_with_urn_valid():
+    # Valid urn starting with "urn:li:ownershipType:" (and not __system__)
+    input_urn = "urn:li:ownershipType:TEST"
+    result = validate_ownership_type(input_urn)
+    assert result == (OwnershipTypeClass.CUSTOM, input_urn)
+
+
+def test_validate_ownership_type_with_wrong_prefix():
+    # Invalid if urn does not have the correct prefix
+    wrong_urn = "urn:li:notOwnership:INVALID"
+    with pytest.raises(InvalidUrnError):
+        validate_ownership_type(wrong_urn)
+
+
+def test_validate_ownership_type_non_urn_valid():
+    # Non-urn input should be uppercased and found in valid options.
+    # Assuming "DATAOWNER" is one of the valid options from OwnershipTypeClass.
+    input_type = "dataowner"
+    result = validate_ownership_type(input_type)
+    assert result == ("DATAOWNER", None)
+
+
+def test_validate_ownership_type_non_urn_invalid():
+    # Non-urn input that is not valid should raise ValueError.
+    with pytest.raises(ValueError):
+        validate_ownership_type("invalid_type")
+
+
+def test_operation_processor_list_values():
+    """Test that list values are properly handled in operation definitions."""
+    raw_props = {
+        "owners_list": [
+            "owner1@company.com",
+            "owner2@company.com",
+            "owner3@company.com",
+        ],
+        "tags_list": ["tag1", "tag2", "tag3"],
+        "mixed_list": ["match1", "nomatch", "match2"],
+    }
+
+    processor = OperationProcessor(
+        operation_defs={
+            "owners_list": {
+                "match": ".*@company.com",
+                "operation": "add_owner",
+                "config": {"owner_type": "user"},
+            },
+            "tags_list": {
+                "match": "tag.*",
+                "operation": "add_tag",
+                "config": {"tag": "list_{{ $match }}"},
+            },
+            "mixed_list": {
+                "match": "match.*",
+                "operation": "add_term",
+                "config": {"term": "{{ $match }}"},
+            },
+        },
+        strip_owner_email_id=True,
+    )
+
+    aspect_map = processor.process(raw_props)
+
+    # Test owners from list
+    assert "add_owner" in aspect_map
+    ownership_aspect: OwnershipClass = aspect_map["add_owner"]
+    assert len(ownership_aspect.owners) == 3
+    owner_urns = {owner.owner for owner in ownership_aspect.owners}
+    expected_owners = {
+        "urn:li:corpuser:owner1",
+        "urn:li:corpuser:owner2",
+        "urn:li:corpuser:owner3",
+    }
+    assert owner_urns == expected_owners
+
+    # Test tags from list - note: tags use the match replacement but join with comma
+    assert "add_tag" in aspect_map
+    tag_aspect: GlobalTagsClass = aspect_map["add_tag"]
+    assert len(tag_aspect.tags) == 1
+    # The matched values get joined with comma, and commas get URL-encoded in URNs
+    assert tag_aspect.tags[0].tag == "urn:li:tag:list_tag1%2Ctag2%2Ctag3"
+
+    # Test terms from list - only matching items
+    assert "add_term" in aspect_map
+    term_aspect: GlossaryTermsClass = aspect_map["add_term"]
+    assert len(term_aspect.terms) == 1
+    # The matched values get joined with comma - terms don't get URL-encoded
+    assert term_aspect.terms[0].urn == "urn:li:glossaryTerm:match1,match2"
+
+
+def test_operation_processor_add_structured_property_default_value():
+    """Default value should be the captured regex match (mirrors add_tag/add_term)."""
+    raw_props = {"data_load_frequency": "hourly"}
+
+    processor = OperationProcessor(
+        operation_defs={
+            "data_load_frequency": {
+                "match": ".*",
+                "operation": "add_structured_property",
+                "config": {
+                    "structured_property_urn": (
+                        "urn:li:structuredProperty:data.load.frequency"
+                    ),
+                },
+            },
+        },
+    )
+
+    aspect_map = processor.process(raw_props)
+    assert "add_structured_property" in aspect_map
+    sp_aspect: StructuredPropertiesClass = aspect_map["add_structured_property"]
+    assert len(sp_aspect.properties) == 1
+    assignment = sp_aspect.properties[0]
+    assert assignment.propertyUrn == "urn:li:structuredProperty:data.load.frequency"
+    assert list(assignment.values) == ["hourly"]
+
+
+def test_operation_processor_add_structured_property_short_id():
+    """The structured_property_urn config also accepts a short qualifiedName."""
+    raw_props = {"region": "us-east-1"}
+
+    processor = OperationProcessor(
+        operation_defs={
+            "region": {
+                "match": ".*",
+                "operation": "add_structured_property",
+                "config": {"structured_property_urn": "io.acme.region"},
+            },
+        },
+    )
+
+    aspect_map = processor.process(raw_props)
+    assert "add_structured_property" in aspect_map
+    assignment = aspect_map["add_structured_property"].properties[0]
+    assert assignment.propertyUrn == "urn:li:structuredProperty:io.acme.region"
+    assert list(assignment.values) == ["us-east-1"]
+
+
+def test_operation_processor_add_structured_property_explicit_value():
+    """An explicit `value` overrides the default `{{ $match }}` substitution."""
+    raw_props = {"frequency": "anything"}
+
+    processor = OperationProcessor(
+        operation_defs={
+            "frequency": {
+                "match": ".*",
+                "operation": "add_structured_property",
+                "config": {
+                    "structured_property_urn": "io.acme.frequency",
+                    "value": "hourly",
+                },
+            },
+        },
+    )
+
+    aspect_map = processor.process(raw_props)
+    assignment = aspect_map["add_structured_property"].properties[0]
+    assert list(assignment.values) == ["hourly"]
+
+
+def test_operation_processor_add_structured_property_match_substitution():
+    """`{{ $match }}` placeholders should be substituted with the captured match."""
+    raw_props = {"region": "us-east-1"}
+
+    processor = OperationProcessor(
+        operation_defs={
+            "region": {
+                "match": ".*",
+                "operation": "add_structured_property",
+                "config": {
+                    "structured_property_urn": "io.acme.region",
+                    "value": "aws-{{ $match }}",
+                },
+            },
+        },
+    )
+
+    aspect_map = processor.process(raw_props)
+    assignment = aspect_map["add_structured_property"].properties[0]
+    assert list(assignment.values) == ["aws-us-east-1"]
+
+
+def test_operation_processor_add_structured_property_numeric_coercion():
+    """Numeric meta values should be coerced to double for PrimitivePropertyValue."""
+    raw_props = {"retention_days": 30}
+
+    processor = OperationProcessor(
+        operation_defs={
+            "retention_days": {
+                "match": 30,
+                "operation": "add_structured_property",
+                "config": {"structured_property_urn": "io.acme.retention.days"},
+            },
+        },
+    )
+
+    aspect_map = processor.process(raw_props)
+    assignment = aspect_map["add_structured_property"].properties[0]
+    assert list(assignment.values) == [30.0]
+    assert isinstance(assignment.values[0], float)
+
+
+def test_operation_processor_add_structured_property_value_type_number():
+    """`value_type: number` coerces a string literal value into a double."""
+    raw_props = {"score": "anything"}
+
+    processor = OperationProcessor(
+        operation_defs={
+            "score": {
+                "match": ".*",
+                "operation": "add_structured_property",
+                "config": {
+                    "structured_property_urn": "io.acme.score",
+                    "value": "0.95",
+                    "value_type": "number",
+                },
+            },
+        },
+    )
+
+    aspect_map = processor.process(raw_props)
+    assignment = aspect_map["add_structured_property"].properties[0]
+    assert list(assignment.values) == [0.95]
+
+
+def test_operation_processor_add_structured_property_aggregates_by_urn():
+    """Multiple rules targeting the same URN should aggregate values into one assignment."""
+    raw_props = {"domain": "finance", "subdomain": "treasury"}
+
+    processor = OperationProcessor(
+        operation_defs={
+            "domain": {
+                "match": ".*",
+                "operation": "add_structured_property",
+                "config": {"structured_property_urn": "io.acme.scope"},
+            },
+            "subdomain": {
+                "match": ".*",
+                "operation": "add_structured_property",
+                "config": {"structured_property_urn": "io.acme.scope"},
+            },
+        },
+    )
+
+    aspect_map = processor.process(raw_props)
+    assert len(aspect_map["add_structured_property"].properties) == 1
+    assignment = aspect_map["add_structured_property"].properties[0]
+    assert assignment.propertyUrn == "urn:li:structuredProperty:io.acme.scope"
+    assert sorted(assignment.values) == ["finance", "treasury"]
+
+
+def test_operation_processor_add_structured_property_multiple_urns():
+    """Multiple rules targeting different URNs should produce multiple assignments."""
+    raw_props = {"region": "us-east-1", "tier": "gold"}
+
+    processor = OperationProcessor(
+        operation_defs={
+            "region": {
+                "match": ".*",
+                "operation": "add_structured_property",
+                "config": {"structured_property_urn": "io.acme.region"},
+            },
+            "tier": {
+                "match": ".*",
+                "operation": "add_structured_property",
+                "config": {"structured_property_urn": "io.acme.tier"},
+            },
+        },
+    )
+
+    aspect_map = processor.process(raw_props)
+    assignments = {
+        a.propertyUrn: list(a.values)
+        for a in aspect_map["add_structured_property"].properties
+    }
+    assert assignments == {
+        "urn:li:structuredProperty:io.acme.region": ["us-east-1"],
+        "urn:li:structuredProperty:io.acme.tier": ["gold"],
+    }
+
+
+def test_operation_processor_add_structured_property_missing_urn_skipped():
+    """A rule missing structured_property_urn should be silently dropped (with a warning)."""
+    raw_props = {"x": "value"}
+
+    processor = OperationProcessor(
+        operation_defs={
+            "x": {
+                "match": ".*",
+                "operation": "add_structured_property",
+                "config": {"value": "value"},
+            },
+        },
+    )
+
+    aspect_map = processor.process(raw_props)
+    assert "add_structured_property" not in aspect_map
+
+
+def test_operation_processor_add_structured_property_invalid_value_type():
+    """`value_type: number` with a non-numeric value should be dropped."""
+    raw_props = {"score": "not_a_number"}
+
+    processor = OperationProcessor(
+        operation_defs={
+            "score": {
+                "match": ".*",
+                "operation": "add_structured_property",
+                "config": {
+                    "structured_property_urn": "io.acme.score",
+                    "value_type": "number",
+                },
+            },
+        },
+    )
+
+    aspect_map = processor.process(raw_props)
+    assert "add_structured_property" not in aspect_map
+
+
+def test_operation_processor_datahub_props_structured_properties():
+    """The `datahub:` shorthand bag accepts a `structured_properties` map."""
+    raw_props = {
+        "datahub": {
+            "structured_properties": {
+                "io.acme.frequency": "hourly",
+                "io.acme.retention_days": 30,
+                "io.acme.regions": ["us-east-1", "eu-west-1"],
+            },
+        },
+    }
+
+    processor = OperationProcessor(operation_defs={})
+    aspect_map = processor.process(raw_props)
+
+    assert "add_structured_property" in aspect_map
+    assignments = {
+        a.propertyUrn: list(a.values)
+        for a in aspect_map["add_structured_property"].properties
+    }
+    assert assignments == {
+        "urn:li:structuredProperty:io.acme.frequency": ["hourly"],
+        "urn:li:structuredProperty:io.acme.retention_days": [30.0],
+        "urn:li:structuredProperty:io.acme.regions": ["us-east-1", "eu-west-1"],
+    }
+
+
+def test_operation_processor_add_structured_property_bool_value():
+    """Boolean meta values (e.g. `pii: true`) are stringified rather than
+    silently coerced to 1.0/0.0 via Python's bool-is-int subtype quirk."""
+    raw_props = {"pii": True}
+
+    processor = OperationProcessor(
+        operation_defs={
+            "pii": {
+                "match": True,
+                "operation": "add_structured_property",
+                "config": {"structured_property_urn": "io.acme.pii"},
+            },
+        },
+    )
+
+    aspect_map = processor.process(raw_props)
+    assignment = aspect_map["add_structured_property"].properties[0]
+    assert list(assignment.values) == ["True"]
+    assert isinstance(assignment.values[0], str)
+
+
+def test_operation_processor_add_structured_property_invalid_urn():
+    """An invalid structured_property_urn (e.g. wrong entity type from a
+    typo) is logged and the rule is skipped without breaking the run."""
+    raw_props = {"x": "value"}
+
+    processor = OperationProcessor(
+        operation_defs={
+            "x": {
+                "match": ".*",
+                "operation": "add_structured_property",
+                "config": {
+                    # common typo: tag URN where structuredProperty URN was meant
+                    "structured_property_urn": "urn:li:tag:io.acme.something",
+                },
+            },
+        },
+    )
+
+    aspect_map = processor.process(raw_props)
+    assert "add_structured_property" not in aspect_map
+
+
+def test_operation_processor_add_structured_property_list_value_template():
+    """A list-typed `value` with `{{ $match }}` substitutes the capture into
+    each string element while preserving non-string elements as-is."""
+    raw_props = {"region": "us-east-1"}
+
+    processor = OperationProcessor(
+        operation_defs={
+            "region": {
+                "match": ".*",
+                "operation": "add_structured_property",
+                "config": {
+                    "structured_property_urn": "io.acme.region",
+                    "value": ["aws-{{ $match }}", "azure-{{ $match }}"],
+                },
+            },
+        },
+    )
+
+    aspect_map = processor.process(raw_props)
+    assignment = aspect_map["add_structured_property"].properties[0]
+    assert list(assignment.values) == ["aws-us-east-1", "azure-us-east-1"]
+
+
+def test_operation_processor_add_structured_property_empty_value_skipped():
+    """An empty list value coerces to no values and the rule is dropped
+    rather than producing an empty assignment that would fail server-side
+    validation."""
+    raw_props: Dict[str, Any] = {"labels": []}
+
+    processor = OperationProcessor(
+        operation_defs={
+            "labels": {
+                "match": ".*",
+                "operation": "add_structured_property",
+                "config": {"structured_property_urn": "io.acme.labels"},
+            },
+        },
+    )
+
+    aspect_map = processor.process(raw_props)
+    assert "add_structured_property" not in aspect_map

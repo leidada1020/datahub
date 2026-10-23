@@ -1,0 +1,66 @@
+import { ChartLine } from '@phosphor-icons/react/dist/csr/ChartLine';
+import { Database as DatabaseIcon } from '@phosphor-icons/react/dist/csr/Database';
+import { Funnel } from '@phosphor-icons/react/dist/csr/Funnel';
+import { Graph } from '@phosphor-icons/react/dist/csr/Graph';
+import { Stack } from '@phosphor-icons/react/dist/csr/Stack';
+import { Table as TableIcon } from '@phosphor-icons/react/dist/csr/Table';
+import React from 'react';
+
+import TableauEmbeddedDataSourceLogo from '@images/tableau-embedded-data-source.svg?react';
+import TableauPublishedDataSourceLogo from '@images/tableau-published-data-source.svg?react';
+import TableauWorkbookLogo from '@images/tableau-workbook.svg?react';
+import VertexAIPipelineTaskLogo from '@images/vertexai-pipeline-task.svg?react';
+
+export enum SubType {
+    Database = 'Database',
+    Schema = 'Schema',
+    Dataset = 'Dataset',
+    Project = 'Project',
+    View = 'View',
+    TableauWorksheet = 'Worksheet',
+    TableauWorkbook = 'Workbook',
+    TableauPublishedDataSource = 'Published Data Source',
+    TableauEmbeddedDataSource = 'Embedded Data Source',
+    Looker = 'Look',
+    DbtSource = 'Source',
+    VertexAIPipelineTask = 'Pipeline Task',
+}
+
+export const TYPE_ICON_CLASS_NAME = 'typeIcon';
+
+export function getSubTypeIcon(subType?: string, size?: number | string): JSX.Element | undefined {
+    if (!subType) return undefined;
+    const iconSize = size || '1em';
+    const lowerSubType = subType.toLowerCase();
+    if (lowerSubType === SubType.Database.toLowerCase()) {
+        return <DatabaseIcon className={TYPE_ICON_CLASS_NAME} size={iconSize} color="currentColor" />;
+    }
+    if (lowerSubType === SubType.Schema.toLowerCase()) {
+        return <Stack className={TYPE_ICON_CLASS_NAME} size={iconSize} color="currentColor" />;
+    }
+    if (lowerSubType === SubType.Dataset.toLowerCase()) {
+        return <TableIcon className={TYPE_ICON_CLASS_NAME} size={iconSize} color="currentColor" />;
+    }
+    if (lowerSubType === SubType.Project.toLowerCase()) {
+        return <Graph className={TYPE_ICON_CLASS_NAME} size={iconSize} color="currentColor" />;
+    }
+    if (lowerSubType === SubType.View.toLowerCase()) {
+        return <Funnel className={TYPE_ICON_CLASS_NAME} size={iconSize} color="currentColor" />;
+    }
+    if (lowerSubType === SubType.TableauWorkbook.toLowerCase()) {
+        return <TableauWorkbookLogo className={TYPE_ICON_CLASS_NAME} />;
+    }
+    if (lowerSubType === SubType.TableauPublishedDataSource.toLowerCase()) {
+        return <TableauPublishedDataSourceLogo className={TYPE_ICON_CLASS_NAME} />;
+    }
+    if (lowerSubType === SubType.TableauEmbeddedDataSource.toLowerCase()) {
+        return <TableauEmbeddedDataSourceLogo className={TYPE_ICON_CLASS_NAME} />;
+    }
+    if (lowerSubType === SubType.TableauWorksheet.toLowerCase()) {
+        return <ChartLine className={TYPE_ICON_CLASS_NAME} size={iconSize} color="currentColor" />;
+    }
+    if (lowerSubType === SubType.VertexAIPipelineTask.toLowerCase()) {
+        return <VertexAIPipelineTaskLogo className={TYPE_ICON_CLASS_NAME} />;
+    }
+    return undefined;
+}

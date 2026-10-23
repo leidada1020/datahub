@@ -1,0 +1,28 @@
+import groovy.json.JsonSlurper
+import org.apache.tools.ant.filters.ReplaceTokens
+
+
+def detailedVersionString = "0.0.0-unknown-SNAPSHOT"
+
+task readJsonData {
+  def inputFile = file("${rootProject.buildDir}/version.json")
+
+  if (inputFile.exists()) {
+    def jsonSlurper = new JsonSlurper()
+    def data = jsonSlurper.parse(inputFile)
+
+    detailedVersionString = data.fullVersion
+    version = data.javaVersion
+  } else {
+    println "JSON file not found: ${inputFile.path}"
+  }
+}
+
+processResources {
+  filter(ReplaceTokens, tokens:[fullVersion: detailedVersionString])
+}
+
+task printVersionDetails() {
+  println("fullVersion=" + detailedVersionString)
+  println("version=" +  version)
+}

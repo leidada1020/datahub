@@ -1,0 +1,101 @@
+import { Loader } from '@components';
+import React, { useCallback, useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import StatsSidebarColumnTab from '@app/entityV2/shared/tabs/Dataset/Schema/components/SchemaFieldDrawer/StatsSidebarColumnTab';
+import { StatsSidebarContent } from '@app/entityV2/shared/tabs/Dataset/Schema/components/SchemaFieldDrawer/StatsSidebarContent';
+import StatsSidebarHeader, {
+    StatsViewType,
+} from '@app/entityV2/shared/tabs/Dataset/Schema/components/SchemaFieldDrawer/StatsSidebarHeader';
+import { LOOKBACK_WINDOWS, LookbackWindow } from '@app/entityV2/shared/tabs/Dataset/Stats/lookbackWindows';
+import { getFixedLookbackWindow, toLocalDateString, toLocalTimeString } from '@app/sharedV2/time/timeUtils';
+
+import { DatasetFieldProfile, DatasetProfile, SchemaField } from '@types';
+
+export interface StatsProps {
+    properties: {
+        expandedField: SchemaField;
+        fieldProfile: DatasetFieldProfile | undefined;
+        profiles: DatasetProfile[];
+        fetchDataWithLookbackWindow: (lookbackWindow: any) => void;
+        profilesDataLoading: boolean;
+    };
+}
+
+const LoadingContainer = styled.div`
+    margin-top: 50%;
+    width: 100%;
+    text-align: center;
+`;
+const LoadingText = styled.div`
+    margin-top: 18px;
+    font-size: 12px;
+`;
+
+export default function StatsSidebarView({
+    properties: { expandedField, fieldProfile, profiles, fetchDataWithLookbackWindow, profilesDataLoading },
+}: StatsProps) {
+    const { t } = useTranslation('entity.profile.schema');
+    const { t: tc } = useTranslation('common.feedback');
+    const [viewType, setViewType] = useState(StatsViewType.LATEST);
+    const [lookbackWindow, setLookbackWindow] = useState<LookbackWindow>(LOOKBACK_WINDOWS.QUARTER);
+
+    /**
+     * Handles the change of the lookback window in the UI.
+     * Updates the selected lookback window and fetches data with the new window size.
+     * @param lookback The new lookback window selected.
+     */
+    const handleLockbackWindowChange = useCallback(
+        (lookback: LookbackWindow) => {
+            setLookbackWindow(lookback);
+            // Fetch data with the new lookback window size
+            fetchDataWithLookbackWindow(getFixedLookbackWindow(lookback.windowSize));
+        },
+        [fetchDataWithLookbackWindow, setLookbackWindow],
+    );
+
+    useEffect(() => {
+        handleLockbackWindowChange(LOOKBACK_WINDOWS.QUARTER);
+    }, [handleLockbackWindowChange]);
+
+    // Get the latest profile information
+    const latestProfile = profiles && profiles[0];
+    const reportedAt =
+        latestProfile &&
+        t('statsSidebar.reportedAt', {
+            date: toLocalDateString(latestProfile?.timestampMillis),
+            time: toLocalTimeString(latestProfile?.timestampMillis),
+        });
+
+    // Components for insight view and historical stats view
+    const insightView = <StatsSidebarContent properties={{ expandedField, fieldProfile, profiles }} />;
+    const historicalStats = (
+        <StatsSidebarColumnTab
+            properties={{ expandedField, fieldProfile, profiles }}
+            lookbackWindow={lookbackWindow as LookbackWindow}
+        />
+    );
+
+    return (
+        <>
+            {/* Stats sidebar header component */}
+            <StatsSidebarHeader
+                activeTab={viewType}
+                setActiveTab={setViewType}
+                lookbackWindow={lookbackWindow}
+                setLookbackWindow={handleLockbackWindowChange}
+                reportedAt={reportedAt}
+            />
+
+            {profilesDataLoading && (
+                <LoadingContainer>
+                    <Loader size="md" />
+                    <LoadingText>{tc('loading')}</LoadingText>
+                </LoadingContainer>
+            )}
+            {/* Conditional rendering based on active tab */}
+            {!profilesDataLoading && (viewType === StatsViewType.HISTORICAL ? historicalStats : insightView)}
+        </>
+    );
+}

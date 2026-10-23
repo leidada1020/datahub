@@ -1,0 +1,32 @@
+import { Eye } from '@phosphor-icons/react/dist/csr/Eye';
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { SummaryTabHeaderTitle, SummaryTabHeaderWrapper } from '@app/entityV2/shared/summary/HeaderComponents';
+import { safeUrl } from '@app/sharedV2/urlUtils';
+
+const Wrapper = styled.div`
+    height: fit-content;
+`;
+
+const StyledIframe = styled.iframe`
+    width: 100%;
+    height: 70vh;
+`;
+
+interface Props {
+    embedUrl: string;
+}
+
+export default function EmbedPreview({ embedUrl }: Props) {
+    const { t: tc } = useTranslation('common.actions');
+    return (
+        <Wrapper>
+            <SummaryTabHeaderWrapper>
+                <SummaryTabHeaderTitle icon={<Eye />} title={tc('preview')} />
+            </SummaryTabHeaderWrapper>
+            <StyledIframe src={safeUrl(embedUrl)} frameBorder={0} />
+        </Wrapper>
+    );
+}

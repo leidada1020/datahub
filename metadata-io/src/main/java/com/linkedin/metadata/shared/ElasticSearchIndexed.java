@@ -1,0 +1,58 @@
+package com.linkedin.metadata.shared;
+
+import com.linkedin.common.urn.Urn;
+import com.linkedin.metadata.search.elasticsearch.indexbuilder.ESIndexBuilder;
+import com.linkedin.metadata.search.elasticsearch.indexbuilder.ReindexConfig;
+import com.linkedin.structured.StructuredPropertyDefinition;
+import com.linkedin.util.Pair;
+import io.datahubproject.metadata.context.OperationContext;
+import java.io.IOException;
+import java.util.Collection;
+import java.util.List;
+import javax.annotation.Nonnull;
+
+public interface ElasticSearchIndexed {
+  /**
+   * The index configurations for the given service with StructuredProperties applied.
+   *
+   * @param properties The structured properties to apply to the index mappings
+   * @return List of reindex configurations
+   */
+  List<ReindexConfig> buildReindexConfigs(
+      @Nonnull OperationContext opContext,
+      Collection<Pair<Urn, StructuredPropertyDefinition>> properties)
+      throws IOException;
+
+  ESIndexBuilder getIndexBuilder();
+
+  /**
+   * Builder for the cluster that owns {@code indexName}. Graph, timeseries and system-metadata
+   * services are 1:1 with a cluster and keep the no-arg builder. Entity search overrides this when
+   * Search V2 / V3 / semantic live on different clusters.
+   */
+  default ESIndexBuilder getIndexBuilder(@Nonnull String indexName) {
+    return getIndexBuilder();
+  }
+
+  /**
+   * Mirrors the service's functions which are expected to build/reindex as needed based on the
+   * reindex configurations above
+   */
+  void reindexAll(
+      @Nonnull OperationContext opContext,
+      Collection<Pair<Urn, StructuredPropertyDefinition>> properties)
+      throws IOException;
+
+  default void tweakReplicasAll(
+      @Nonnull OperationContext opContext,
+      Collection<Pair<Urn, StructuredPropertyDefinition>> properties,
+      boolean dryRun) {
+    try {
+      for (ReindexConfig config : buildReindexConfigs(opContext, properties)) {
+        getIndexBuilder(config.name()).tweakReplicas(opContext, config, dryRun);
+      }
+    } catch (IOException e) {
+      throw new RuntimeException(e);
+    }
+  }
+}

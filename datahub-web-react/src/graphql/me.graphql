@@ -1,0 +1,87 @@
+query getMe {
+    me {
+        corpUser {
+            type
+            urn
+            username
+            info {
+                active
+                displayName
+                title
+                firstName
+                lastName
+                fullName
+                email
+            }
+            editableProperties {
+                displayName
+                title
+                pictureLink
+                teams
+                skills
+                persona {
+                    urn
+                }
+                platforms {
+                    urn
+                }
+            }
+            settings {
+                appearance {
+                    showSimplifiedHomepage
+                }
+                views {
+                    defaultView {
+                        urn
+                    }
+                }
+                homePage {
+                    pageTemplate {
+                        ...PageTemplate
+                    }
+                    dismissedAnnouncementUrns
+                }
+                locale {
+                    language
+                }
+            }
+        }
+        platformPrivileges {
+            viewAnalytics
+            managePolicies
+            manageIdentities
+            generatePersonalAccessTokens
+            manageIngestion
+            manageSecrets
+            manageTokens
+            manageDomains
+            viewTests
+            manageTests
+            manageGlossaries
+            manageUserCredentials
+            manageTags
+            viewManageTags
+            createDomains
+            createTags
+            createLogicalModels
+            manageGlobalViews
+            manageGlobalSettings
+            manageOwnershipTypes
+            manageGlobalAnnouncements
+            createBusinessAttributes
+            manageBusinessAttributes
+            manageStructuredProperties
+            viewStructuredPropertiesPage
+            manageApplications
+            manageFeatures
+            manageHomePageTemplates
+            manageDocuments
+            createDocuments
+            manageServiceAccounts
+        }
+    }
+}
+
+mutation updateUserSetting($input: UpdateUserSettingInput!) {
+    updateUserSetting(input: $input)
+}

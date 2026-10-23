@@ -1,0 +1,288 @@
+import { Form } from 'antd';
+import styled, { keyframes } from 'styled-components';
+
+import { Button } from '@src/alchemy-components';
+
+export const ListContainer = styled.div`
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    overflow: auto;
+    @media (max-width: 768px) {
+        max-width: 50vw;
+    }
+    @media (max-width: 1024px) {
+        max-width: 35vw;
+    }
+    @media (max-width: 1440px) {
+        max-width: 15vw;
+    }
+    @media (max-width: 1680px) {
+        max-width: 22vw;
+    }
+    @media (max-width: 1920px) {
+        max-width: 20vw;
+    }
+    @media (min-width: 1920px) {
+        max-width: 15vw;
+    }
+`;
+
+export const ListItemContainer = styled.div`
+    display: flex;
+    border-radius: 200px;
+    padding: 4px;
+    min-width: fit-content;
+`;
+
+export const DescriptionSection = styled.div`
+    margin-bottom: 30px;
+`;
+
+export const DetailsSection = styled.div`
+    margin-bottom: 30px;
+    line-height: 17.57px;
+    display: flex;
+    align-items: center;
+`;
+
+export const DetailsLabel = styled.div`
+    margin-right: 60px;
+    width: 20%;
+    font-weight: 600;
+    color: ${(props) => props.theme.colors.textSecondary};
+    font-size: 12px;
+`;
+
+export const ActivitySection = styled.div`
+    display: flex;
+    flex-direction: column;
+`;
+
+export const ActivityLabelSection = styled.div`
+    font-weight: 500;
+    font-size: 18px;
+    color: ${(props) => props.theme.colors.text};
+    padding: 8px 4px;
+    margin-bottom: 8px;
+`;
+
+export const TimelineWrapper = styled.div`
+    margin-left: 12px;
+    margin-top: 16px;
+`;
+
+export const ContentRow = styled.div`
+    display: flex;
+    flex-direction: column;
+`;
+
+export const Content = styled.div`
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 0px;
+    top: -8px;
+    margin-left: 11px;
+`;
+
+export const ActivityStatusText = styled.div`
+    font-size: 14px;
+    color: ${(props) => props.theme.colors.text};
+    font-weight: 500;
+    a {
+        color: inherit;
+        &:hover {
+            color: inherit;
+        }
+    }
+`;
+
+export const Header = styled.div`
+    display: flex;
+    align-items: center;
+    margin-bottom: 1rem;
+`;
+
+export const Divider = styled.div`
+    border-top: 1px solid ${(props) => props.theme.colors.border};
+    margin: 16px 0;
+`;
+
+export const Container = styled.div`
+    padding: 20px;
+    width: 100%;
+`;
+
+export const Text = styled.div`
+    font-size: 12px;
+    color: ${(props) => props.theme.colors.hyperlinks};
+    text-decoration: underline;
+    &&:hover {
+        cursor: pointer;
+    }
+`;
+
+export const CategoryText = styled.div`
+    font-size: 14px;
+    font-weight: 400;
+    color: ${(props) => props.theme.colors.text};
+`;
+
+export const SelectFormItem = styled(Form.Item)<{ customStyle?: React.CSSProperties }>`
+    width: auto !important;
+    .ant-form-item-row {
+        display: flex !important;
+        flex-direction: ${({ customStyle }) => customStyle?.flexDirection || 'row !important'};
+        justify-content: space-between;
+        align-items: ${({ customStyle }) => customStyle?.alignItems || 'center'};
+        flex-wrap: nowrap;
+    }
+    .ant-form-item-control {
+        width: auto !important;
+    }
+    .ant-form-item-label {
+        min-width: 25%;
+    }
+    .ant-form-item-label > label {
+        color: ${({ customStyle, theme }) => customStyle?.color || `${theme.colors.text} !important`};
+    }
+    .ant-form-item-label > label.ant-form-item-required::before {
+        content: none;
+    }
+`;
+
+export const StyledForm = styled(Form)`
+    max-width: 600px;
+`;
+
+export const InputFormItem = styled(Form.Item)`
+    margin-bottom: 16px;
+    font-size: large;
+    font-weight: 500;
+    line-height: 20.08px;
+    text-align: left;
+    .ant-form-item-label > label {
+        color: ${(props) => props.theme.colors.text} !important;
+    }
+`;
+
+export const SaveButton = styled(Button)<{ disabled: boolean }>`
+    width: 100%;
+    height: 36px;
+    border-radius: 4px;
+    border: 1px solid ${(props) => props.theme.colors.borderBrand};
+    background-color: ${({ disabled, theme }) => (disabled ? theme.colors.bgDisabled : theme.colors.buttonFillBrand)};
+    font-size: 16px;
+    font-weight: 600;
+    line-height: 22.59px;
+    justify-content: center;
+    color: ${({ disabled, theme }) => (disabled ? theme.colors.textDisabled : theme.colors.bg)};
+`;
+
+export const IncidentFooter = styled.div`
+    width: 100%;
+    padding: 16px;
+    border-top: 1px solid ${(props) => props.theme.colors.border};
+    box-shadow: ${(props) => props.theme.colors.shadowSm};
+    max-height: 68px;
+    position: absolute;
+    bottom: 0;
+    background-color: ${(props) => props.theme.colors.bg};
+`;
+
+export const StyledFormElements = styled.div`
+    margin: 16px;
+    overflow-y: auto;
+    overflow-x: hidden;
+    height: 84vh;
+    font-size: large;
+    font-weight: 500;
+    line-height: 20.08px;
+    text-align: left;
+    @media (max-width: 1024px) {
+        height: 80vh;
+    }
+    @media (max-width: 1440px) {
+        height: 84vh;
+    }
+    padding: 4px;
+`;
+
+export const SelectWrapper = styled.div``;
+export const AssetWrapper = styled.div`
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+`;
+
+export const LoadingWrapper = styled.div`
+    display: flex;
+    justify-content: center;
+    margin: 5px;
+`;
+
+export const LinkedAssets = styled.div`
+    display: flex;
+    gap: 5px;
+    flex-wrap: wrap;
+`;
+
+export const StyledHeader = styled.div`
+    display: flex;
+    height: 64px;
+    align-items: center;
+    padding: 16px;
+    justify-content: space-between;
+    box-shadow: ${(props) => props.theme.colors.shadowSm};
+`;
+
+export const StyledHeaderTitleContainer = styled.div`
+    display: flex;
+    align-items: center;
+`;
+
+export const StyledHeaderActions = styled.div`
+    display: flex;
+    gap: 20px;
+    align-items: center;
+    color: ${(props) => props.theme.colors.textTertiary};
+    cursor: pointer;
+`;
+
+export const StyledTitle = styled.span`
+    font-size: large;
+    font-weight: 700;
+    line-height: 20.08px;
+    text-align: left;
+    color: ${(props) => props.theme.colors.text};
+`;
+
+const spin = keyframes`
+  100% {
+    transform: rotate(360deg);
+  }
+`;
+
+export const StyledSpinner = styled.div`
+    width: 16px;
+    height: 16px;
+    margin-right: 8px;
+    border: 2px solid ${(props) => props.theme.colors.border};
+    color: ${(props) => props.theme.colors.textTertiary};
+    border-top: 2px solid transparent;
+    border-radius: 50%;
+    animation: ${spin} 0.8s linear infinite;
+    display: inline-block;
+`;
+
+export const ForPlatformWrapper = styled.div`
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    font-size: 0.75rem;
+    margin-left: 12px;
+    padding-left: 12px;
+    border-left: 0.5px solid ${(props) => props.theme.colors.border};
+`;

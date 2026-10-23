@@ -1,0 +1,241 @@
+import { Avatar } from '@components';
+import { PencilSimple } from '@phosphor-icons/react/dist/csr/PencilSimple';
+import { Plus } from '@phosphor-icons/react/dist/csr/Plus';
+import { Trash } from '@phosphor-icons/react/dist/csr/Trash';
+import React, { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { AvatarType } from '@components/components/AvatarStack/types';
+
+import CreateEntityAnnouncementModal from '@app/entityV2/shared/announce/CreateEntityAnnouncementModal';
+import EmptySectionText from '@app/entityV2/shared/containers/profile/sidebar/EmptySectionText';
+import SectionActionButton from '@app/entityV2/shared/containers/profile/sidebar/SectionActionButton';
+import { SidebarSection } from '@app/entityV2/shared/containers/profile/sidebar/SidebarSection';
+import CompactMarkdownViewer from '@app/entityV2/shared/tabs/Documentation/components/CompactMarkdownViewer';
+import SchemaEditableContext from '@app/sharedV2/SchemaEditableContext';
+import { ConfirmationModal } from '@app/sharedV2/modals/ConfirmationModal';
+import dayjs from '@utils/dayjs';
+
+import { useDeletePostMutation } from '@graphql/post.generated';
+import { Post } from '@types';
+
+const ContentWrapper = styled.div`
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+`;
+
+interface Props {
+    urn: string;
+    subResource?: string;
+    notes?: Post[];
+    refetch?: () => void;
+    showEmpty?: boolean;
+}
+
+export default function NotesSection({ urn, subResource, notes, refetch, showEmpty }: Props) {
+    const { t } = useTranslation('entity.shared.profile');
+    const isSchemaEditable = React.useContext(SchemaEditableContext);
+    const [showAddModal, setShowAddModal] = useState(false);
+
+    const content = notes?.length ? (
+        <ContentWrapper>
+            {notes?.map((note) => (
+                <SidebarNote
+                    key={note.urn}
+                    note={note}
+                    parentUrn={urn}
+                    parentSubResource={subResource}
+                    refetch={refetch}
+                />
+            ))}
+        </ContentWrapper>
+    ) : (
+        <EmptySectionText message={t('notes.empty')} />
+    );
+
+    if (!showEmpty && !notes?.length) return null;
+    return (
+        <>
+            <SidebarSection
+                title={t('notes.title')}
+                content={content}
+                extra={
+                    isSchemaEditable && (
+                        <SectionActionButton
+                            icon={Plus}
+                            onClick={(event) => {
+                                setShowAddModal(true);
+                                event.stopPropagation();
+                            }}
+                        />
+                    )
+                }
+            />
+            {showAddModal && (
+                <CreateEntityAnnouncementModal
+                    urn={urn}
+                    subResource={subResource}
+                    // refetch after 2 seconds on create to ensure the new note is visible
+                    onCreate={refetch}
+                    onClose={() => setShowAddModal(false)}
+                />
+            )}
+        </>
+    );
+}
+
+const NoteEditWrapper = styled.div`
+    display: none;
+    position: relative;
+`;
+
+const NoteEditIcons = styled.div`
+    display: flex;
+    gap: 5px;
+
+    position: absolute;
+    right: -9px;
+`;
+
+const NoteWrapper = styled.div`
+    display: flex;
+    justify-content: space-between;
+    max-width: 100%;
+
+    :hover {
+        ${NoteEditWrapper} {
+            display: inline;
+        }
+    }
+`;
+
+const NoteContent = styled.div`
+    border-left: 2px solid ${(props) => props.theme.colors.borderBrand};
+    padding: 2px 0 5px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    max-width: inherit;
+`;
+
+const NoteHeader = styled.div`
+    align-items: center;
+    display: flex;
+    font-size: 12px;
+    color: ${(props) => props.theme.colors.textTertiary};
+`;
+
+const NoteTime = styled.div`
+    overflow: hidden;
+    text-overflow: ellipsis;
+`;
+
+const NoteOwner = styled.div`
+    min-width: 24px;
+`;
+
+const NoteTitle = styled.div`
+    font-size: 16px;
+    font-weight: 600;
+    line-height: 20px;
+    max-width: inherit;
+    overflow: hidden;
+    text-overflow: ellipsis;
+`;
+
+const NoteDescriptionContainer = styled.div`
+    flex: 1;
+
+    .remirror-editor.ProseMirror,
+    .datahub-editor-content {
+        font-size: 12px;
+        padding: 0;
+        max-width: 400px;
+    }
+
+    p {
+        margin-bottom: 0;
+    }
+`;
+
+interface NoteProps {
+    note: Post;
+    parentUrn: string;
+    parentSubResource?: string;
+    refetch?: () => void;
+}
+
+function SidebarNote({ note, parentUrn, parentSubResource, refetch }: NoteProps) {
+    const { t } = useTranslation('entity.shared.profile');
+    const isSchemaEditable = React.useContext(SchemaEditableContext);
+    const [showEditModal, setShowEditModal] = useState(false);
+    const [showDeleteModal, setShowDeleteModal] = useState(false);
+
+    const [deletePost] = useDeletePostMutation();
+
+    const time = dayjs(note.lastModified.time);
+    const isToday = time.isSame(dayjs(), 'day');
+    const isYesterday = time.isSame(dayjs().subtract(1, 'day'), 'day');
+    const formattedTime = time.format('h:mm A');
+    let dateTimeText: string;
+    if (isToday) {
+        dateTimeText = t('notes.todayAt', { time: formattedTime });
+    } else if (isYesterday) {
+        dateTimeText = t('notes.yesterdayAt', { time: formattedTime });
+    } else {
+        dateTimeText = t('notes.dateAtTime', { date: time.format('MMM D, YYYY'), time: formattedTime });
+    }
+
+    // parsedName should strip the urn:li:corpuser: prefix from actor
+    const parsedName = note?.lastModified?.actor?.split(':')?.slice(-1)[0] || '';
+
+    return (
+        <NoteWrapper>
+            <NoteContent>
+                <NoteHeader>
+                    <NoteOwner>
+                        {note.lastModified.actor && <Avatar name={parsedName} type={AvatarType.user} size="sm" />}
+                    </NoteOwner>
+                    <NoteTime>{dateTimeText}</NoteTime>
+                </NoteHeader>
+                <NoteTitle>{note.content.title}</NoteTitle>
+                {note.content.description && (
+                    <NoteDescriptionContainer>
+                        <CompactMarkdownViewer content={note.content.description} />
+                    </NoteDescriptionContainer>
+                )}
+            </NoteContent>
+            {isSchemaEditable && (
+                <NoteEditWrapper>
+                    <NoteEditIcons>
+                        <SectionActionButton icon={PencilSimple} onClick={() => setShowEditModal(true)} />
+                        <SectionActionButton icon={Trash} onClick={() => setShowDeleteModal(true)} />
+                    </NoteEditIcons>
+                </NoteEditWrapper>
+            )}
+            {showEditModal && (
+                <CreateEntityAnnouncementModal
+                    urn={parentUrn}
+                    subResource={parentSubResource}
+                    editData={{ urn: note.urn, ...note.content }}
+                    onClose={() => setShowEditModal(false)}
+                    onEdit={refetch}
+                />
+            )}
+            <ConfirmationModal
+                isOpen={showDeleteModal}
+                handleClose={() => setShowDeleteModal(false)}
+                handleConfirm={() =>
+                    deletePost({ variables: { urn: note.urn } }).then(() => {
+                        setShowDeleteModal(false);
+                        refetch?.();
+                    })
+                }
+                modalTitle={t('notes.deleteTitle')}
+                modalText={t('notes.deleteConfirmation')}
+            />
+        </NoteWrapper>
+    );
+}

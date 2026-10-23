@@ -1,0 +1,476 @@
+import logging
+from typing import Iterable, Optional
+
+from datahub.configuration.common import AllowDenyPattern
+from datahub.ingestion.api.common import PipelineContext
+from datahub.ingestion.api.decorators import (
+    SupportStatus,
+    capability,
+    config_class,
+    platform_name,
+    support_status,
+)
+from datahub.ingestion.api.source import (
+    SourceCapability,
+    TestableSource,
+    TestConnectionReport,
+)
+from datahub.ingestion.api.workunit import MetadataWorkUnit
+from datahub.ingestion.source.bigquery_v2.bigquery_audit import (
+    BigQueryShardPatternMatcher,
+)
+from datahub.ingestion.source.bigquery_v2.bigquery_config import (
+    EXTRACT_COLUMN_LINEAGE_IGNORED_MESSAGE,
+    LINKED_DATASET_LINEAGE_NEEDS_TABLE_LINEAGE_MESSAGE,
+    BigQueryV2Config,
+)
+from datahub.ingestion.source.bigquery_v2.bigquery_report import BigQueryV2Report
+from datahub.ingestion.source.bigquery_v2.bigquery_schema import (
+    BigQuerySchemaApi,
+    get_projects,
+)
+from datahub.ingestion.source.bigquery_v2.bigquery_schema_gen import (
+    BigQuerySchemaGenerator,
+)
+from datahub.ingestion.source.bigquery_v2.bigquery_sharing import (
+    BigQuerySharingHandler,
+)
+from datahub.ingestion.source.bigquery_v2.bigquery_test_connection import (
+    BigQueryTestConnection,
+)
+from datahub.ingestion.source.bigquery_v2.common import (
+    BigQueryFilter,
+    BigQueryIdentifierBuilder,
+)
+from datahub.ingestion.source.bigquery_v2.lineage import BigqueryLineageExtractor
+from datahub.ingestion.source.bigquery_v2.profiling.profiler import BigqueryProfiler
+from datahub.ingestion.source.bigquery_v2.queries_extractor import (
+    BigQueryQueriesExtractor,
+    BigQueryQueriesExtractorConfig,
+)
+from datahub.ingestion.source.bigquery_v2.usage import BigQueryUsageExtractor
+from datahub.ingestion.source.common.subtypes import SourceCapabilityModifier
+from datahub.ingestion.source.state.profiling_state_handler import ProfilingHandler
+from datahub.ingestion.source.state.redundant_run_skip_handler import (
+    RedundantLineageRunSkipHandler,
+    RedundantQueriesRunSkipHandler,
+    RedundantUsageRunSkipHandler,
+)
+from datahub.ingestion.source.state.stateful_ingestion_base import (
+    StatefulIngestionSourceBase,
+)
+from datahub.ingestion.source_report.ingestion_stage import QUERIES_EXTRACTION
+from datahub.sql_parsing.schema_resolver import SchemaResolver
+from datahub.sql_parsing.schema_resolver_provider import provide_schema_resolver
+from datahub.utilities.registries.domain_registry import DomainRegistry
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+
+@platform_name("BigQuery", doc_order=1)
+@config_class(BigQueryV2Config)
+@support_status(SupportStatus.GA)
+@capability(  # DataPlatformAspect is set to project id, but not added to urns as project id is in the container path
+    SourceCapability.PLATFORM_INSTANCE,
+    "Platform instance is pre-set to the BigQuery project id",
+    supported=False,
+)
+@capability(SourceCapability.DOMAINS, "Supported via the `domain` config field")
+@capability(
+    SourceCapability.CONTAINERS,
+    "Enabled by default",
+    subtype_modifier=[
+        SourceCapabilityModifier.BIGQUERY_PROJECT,
+        SourceCapabilityModifier.BIGQUERY_DATASET,
+        # Emitted in place of BIGQUERY_DATASET when include_linked_dataset_lineage is on.
+        SourceCapabilityModifier.BIGQUERY_LINKED_DATASET,
+    ],
+)
+@capability(SourceCapability.SCHEMA_METADATA, "Enabled by default")
+@capability(
+    SourceCapability.DATA_PROFILING,
+    "Optionally enabled via configuration",
+)
+@capability(SourceCapability.DESCRIPTIONS, "Enabled by default")
+@capability(SourceCapability.LINEAGE_COARSE, "Optionally enabled via configuration")
+@capability(SourceCapability.LINEAGE_FINE, "Optionally enabled via configuration")
+@capability(
+    SourceCapability.USAGE_STATS,
+    "Enabled by default, can be disabled via configuration `include_usage_statistics`",
+)
+@capability(
+    SourceCapability.OPERATION_CAPTURE,
+    "Enabled by default via usage extraction, can be disabled via `usage.include_operational_stats`",
+)
+@capability(
+    SourceCapability.PARTITION_SUPPORT,
+    "Enabled by default, partition keys and clustering keys are supported.",
+)
+@capability(SourceCapability.TEST_CONNECTION, "Enabled by default")
+@capability(
+    SourceCapability.PROBE,
+    "Check what a recipe would ingest before running it, with `datahub recipe probe`",
+)
+class BigqueryV2Source(StatefulIngestionSourceBase, TestableSource):
+    def __init__(self, ctx: PipelineContext, config: BigQueryV2Config):
+        super().__init__(config, ctx)
+        self.config: BigQueryV2Config = config
+        self.report: BigQueryV2Report = BigQueryV2Report()
+        self.platform: str = "bigquery"
+
+        self.domain_registry: Optional[DomainRegistry] = None
+        if self.config.domain:
+            self.domain_registry = DomainRegistry(
+                cached_domains=[k for k in self.config.domain], graph=self.ctx.graph
+            )
+
+        self.shard_matcher = BigQueryShardPatternMatcher(
+            self.config.sharded_table_pattern
+        )
+
+        self.bigquery_data_dictionary = BigQuerySchemaApi(
+            report=self.report.schema_api_perf,
+            projects_client=config.get_projects_client(),
+            client=config.get_bigquery_client(),
+        )
+        if self.config.extract_policy_tags_from_catalog:
+            self.bigquery_data_dictionary.datacatalog_client = (
+                self.config.get_policy_tag_manager_client()
+            )
+
+        with self.report.init_schema_resolver_timer:
+            self.sql_parser_schema_resolver = self._init_schema_resolver()
+
+        self.filters = BigQueryFilter(self.config, self.report)
+        self.identifiers = BigQueryIdentifierBuilder(self.config, self.report)
+
+        redundant_lineage_run_skip_handler: Optional[RedundantLineageRunSkipHandler] = (
+            None
+        )
+        if (
+            self.config.enable_stateful_lineage_ingestion
+            and not self.config.use_queries_v2
+        ):
+            redundant_lineage_run_skip_handler = RedundantLineageRunSkipHandler(
+                source=self,
+                config=self.config,
+                pipeline_name=self.ctx.pipeline_name,
+                run_id=self.ctx.run_id,
+            )
+
+        # For database, schema, tables, views, snapshots etc
+        self.lineage_extractor = BigqueryLineageExtractor(
+            config,
+            self.report,
+            schema_resolver=self.sql_parser_schema_resolver,
+            identifiers=self.identifiers,
+            filters=self.filters,
+            redundant_run_skip_handler=redundant_lineage_run_skip_handler,
+        )
+
+        redundant_usage_run_skip_handler: Optional[RedundantUsageRunSkipHandler] = None
+        if self.config.enable_stateful_usage_ingestion:
+            redundant_usage_run_skip_handler = RedundantUsageRunSkipHandler(
+                source=self,
+                config=self.config,
+                pipeline_name=self.ctx.pipeline_name,
+                run_id=self.ctx.run_id,
+            )
+
+        self.usage_extractor = BigQueryUsageExtractor(
+            config,
+            self.report,
+            schema_resolver=self.sql_parser_schema_resolver,
+            identifiers=self.identifiers,
+            redundant_run_skip_handler=redundant_usage_run_skip_handler,
+        )
+
+        self.profiling_state_handler: Optional[ProfilingHandler] = None
+        if self.config.enable_stateful_profiling:
+            self.profiling_state_handler = ProfilingHandler(
+                source=self,
+                config=self.config,
+                pipeline_name=self.ctx.pipeline_name,
+                run_id=self.ctx.run_id,
+            )
+        self.profiler = BigqueryProfiler(
+            config, self.report, self.profiling_state_handler
+        )
+
+        self.sharing_handler: Optional[BigQuerySharingHandler] = None
+        if self.config.include_linked_dataset_lineage:
+            self.sharing_handler = BigQuerySharingHandler(
+                config=self.config,
+                report=self.report,
+                identifiers=self.identifiers,
+                client=config.get_bigquery_client(),
+                projects_client=config.get_projects_client(),
+            )
+
+        self.bq_schema_extractor = BigQuerySchemaGenerator(
+            self.config,
+            self.report,
+            self.bigquery_data_dictionary,
+            self.domain_registry,
+            self.sql_parser_schema_resolver,
+            self.profiler,
+            self.identifiers,
+            self.filters,
+            self.shard_matcher,
+            self.ctx.graph,
+            self.sharing_handler,
+        )
+
+        self.add_config_to_report()
+
+    @classmethod
+    def create(cls, config_dict: dict, ctx: PipelineContext) -> "BigqueryV2Source":
+        config = BigQueryV2Config.model_validate(config_dict)
+        return cls(ctx, config)
+
+    @staticmethod
+    def test_connection(config_dict: dict) -> TestConnectionReport:
+        return BigQueryTestConnection.test_connection(config_dict)
+
+    def _init_schema_resolver(self) -> SchemaResolver:
+        """
+        The ininitialization of SchemaResolver prefetches all existing urns and schemas in the env/platform/instance.
+        Because of that, it's important all classes requiring a SchemaResolver use this instance, as it has an already pre-populated cache.
+        An alternative strategy would be to do an on-demand resolution of the urns/schemas.
+
+        TODO: prove pre-fetch is better strategy than on-demand resolution or make this behaviour configurable.
+        """
+        schema_resolution_required = (
+            self.config.use_queries_v2 or self.config.lineage_use_sql_parser
+        )
+        schema_ingestion_enabled = (
+            self.config.include_schema_metadata
+            and self.config.include_tables
+            and self.config.include_views
+            and self.config.include_table_snapshots
+        )
+
+        if schema_resolution_required and not schema_ingestion_enabled:
+            if self.ctx.graph:
+                try:
+                    return provide_schema_resolver(
+                        graph=self.ctx.graph,
+                        platform=self.platform,
+                        platform_instance=self.config.platform_instance,
+                        env=self.config.env,
+                        batch_size=self.config.schema_resolution_batch_size,
+                    )
+                except Exception as e:
+                    self.report.warning(
+                        message="Failed to bulk-load schemas from DataHub for SQL lineage. "
+                        "Lineage resolution will proceed with an empty schema resolver.",
+                        exc=e,
+                        log=False,
+                    )
+            else:
+                logger.warning(
+                    "Failed to load schema info from DataHub as DataHubGraph is missing. "
+                    "Use `datahub-rest` sink OR provide `datahub-api` config in recipe. ",
+                )
+        return SchemaResolver(platform=self.platform, env=self.config.env)
+
+    def _warn_deprecated_configs(self):
+        if (
+            self.config.match_fully_qualified_names is not None
+            and not self.config.match_fully_qualified_names
+            and self.config.schema_pattern is not None
+            and self.config.schema_pattern != AllowDenyPattern.allow_all()
+        ):
+            self.report.warning(
+                message="Please update `schema_pattern` to match against fully qualified schema name `<database_name>.<schema_name>` and set config `match_fully_qualified_names : True`."
+                "Current default `match_fully_qualified_names: False` is only to maintain backward compatibility. "
+                "The config option `match_fully_qualified_names` will be removed in future and the default behavior will be like `match_fully_qualified_names: True`.",
+                context="Config option deprecation warning",
+                title="Config option deprecation warning",
+                log=False,
+            )
+
+        # Unlike the forwarded usage.start_time/end_time/bucket_duration/max_query_duration
+        # fields, these two are never popped from self.config.usage, so we can still see
+        # here whether the user set them - surface it in the structured report (visible
+        # in the UI), not just the config-validation-time logger.warning.
+        if self.config.use_queries_v2:
+            if self.config.usage.include_read_operational_stats:
+                self.report.warning(
+                    message="`usage.include_read_operational_stats` is only supported with the legacy extraction path "
+                    "(`use_queries_v2: False`) and is ignored under queries-v2.",
+                    context="Config option deprecation warning",
+                    title="Config option deprecation warning",
+                    log=False,
+                )
+            if self.config.usage.apply_view_usage_to_tables:
+                self.report.warning(
+                    message="`usage.apply_view_usage_to_tables` is only supported with the legacy extraction path "
+                    "(`use_queries_v2: False`) and is ignored under queries-v2.",
+                    context="Config option deprecation warning",
+                    title="Config option deprecation warning",
+                    log=False,
+                )
+            # `extract_column_lineage` defaults to False, so an explicit False is only
+            # detectable via `model_fields_set`.
+            if "extract_column_lineage" in self.config.model_fields_set:
+                self.report.warning(
+                    message=EXTRACT_COLUMN_LINEAGE_IGNORED_MESSAGE,
+                    context="Config option deprecation warning",
+                    title="Config option deprecation warning",
+                    log=False,
+                )
+
+        # Config validators already log these pairings; dual-site to the report because
+        # UI-driven ingestion only surfaces report warnings.
+        if (
+            self.config.extract_subscriptions_from_analytics_hub
+            and not self.config.include_linked_dataset_lineage
+        ):
+            self.report.warning(
+                message="`extract_subscriptions_from_analytics_hub` has no effect while "
+                "`include_linked_dataset_lineage` is False; linked datasets are not "
+                "detected, so there is nothing to attach subscription properties to.",
+                title="Analytics Hub subscriptions will not be extracted",
+                log=False,
+            )
+        if (
+            self.config.include_linked_dataset_lineage
+            and not self.config.include_table_lineage
+        ):
+            self.report.warning(
+                message=LINKED_DATASET_LINEAGE_NEEDS_TABLE_LINEAGE_MESSAGE,
+                title="Linked-dataset COPY lineage will not be emitted",
+                log=False,
+            )
+
+    def _build_queries_extractor_config(self) -> BigQueryQueriesExtractorConfig:
+        return BigQueryQueriesExtractorConfig(
+            window=self.config,
+            user_email_pattern=self.config.usage.user_email_pattern,
+            pushdown_deny_usernames=self.config.pushdown_deny_usernames,
+            pushdown_allow_usernames=self.config.pushdown_allow_usernames,
+            include_lineage=self.config.include_table_lineage,
+            include_usage_statistics=self.config.include_usage_statistics,
+            include_operations=self.config.usage.include_operational_stats,
+            include_queries=self.config.include_queries,
+            include_query_usage_statistics=self.config.include_query_usage_statistics,
+            capture_job_labels_as_query_properties=self.config.capture_job_labels_as_query_properties,
+            top_n_queries=self.config.usage.top_n_queries,
+            format_sql_queries=self.config.usage.format_sql_queries,
+            include_top_n_queries=self.config.usage.include_top_n_queries,
+            queries_character_limit=self.config.usage.queries_character_limit,
+            region_qualifiers=self.config.region_qualifiers,
+            region_qualifiers_auto_discovery=self.config.region_qualifiers_auto_discovery,
+        )
+
+    def get_workunits_internal(self) -> Iterable[MetadataWorkUnit]:
+        self._warn_deprecated_configs()
+        projects = get_projects(
+            self.bq_schema_extractor.schema_api,
+            self.report,
+            self.filters,
+        )
+        if not projects:
+            return
+
+        for project in projects:
+            yield from self.bq_schema_extractor.get_project_workunits(project)
+
+        # Must run before the View and Snapshot Lineage stage below: that stage flushes the
+        # aggregator, so the COPY mappings have to be registered first to be emitted.
+        if self.sharing_handler is not None and self.config.include_table_lineage:
+            self.sharing_handler.register_known_lineage(
+                self.lineage_extractor.aggregator,
+                self.bq_schema_extractor.table_refs,
+            )
+
+        with self.report.new_stage("*: View and Snapshot Lineage"):
+            yield from self.lineage_extractor.get_lineage_workunits_for_views_and_snapshots(
+                [p.id for p in projects],
+                self.bq_schema_extractor.view_refs_by_project,
+                self.bq_schema_extractor.view_definitions,
+                self.bq_schema_extractor.snapshot_refs_by_project,
+                self.bq_schema_extractor.snapshots_by_ref,
+            )
+
+        if self.config.use_queries_v2:
+            # if both usage and lineage are disabled then skip queries extractor piece
+            if (
+                not self.config.include_usage_statistics
+                and not self.config.include_table_lineage
+            ):
+                return
+
+            redundant_queries_run_skip_handler: Optional[
+                RedundantQueriesRunSkipHandler
+            ] = None
+            if self.config.enable_stateful_time_window:
+                redundant_queries_run_skip_handler = RedundantQueriesRunSkipHandler(
+                    source=self,
+                    config=self.config,
+                    pipeline_name=self.ctx.pipeline_name,
+                    run_id=self.ctx.run_id,
+                )
+
+            with (
+                self.report.new_stage(f"*: {QUERIES_EXTRACTION}"),
+                BigQueryQueriesExtractor(
+                    connection=self.config.get_bigquery_client(),
+                    schema_api=self.bq_schema_extractor.schema_api,
+                    config=self._build_queries_extractor_config(),
+                    structured_report=self.report,
+                    filters=self.filters,
+                    identifiers=self.identifiers,
+                    redundant_run_skip_handler=redundant_queries_run_skip_handler,
+                    schema_resolver=self.sql_parser_schema_resolver,
+                    discovered_tables=self.bq_schema_extractor.table_refs,
+                    discovered_locations=self.bq_schema_extractor.discovered_locations,
+                ) as queries_extractor,
+            ):
+                self.report.queries_extractor = queries_extractor.report
+                yield from queries_extractor.get_workunits_internal()
+        else:
+            if self.config.include_usage_statistics:
+                yield from self.usage_extractor.get_usage_workunits(
+                    [p.id for p in projects], self.bq_schema_extractor.table_refs
+                )
+
+            if self.config.include_table_lineage:
+                yield from self.lineage_extractor.get_lineage_workunits(
+                    [p.id for p in projects],
+                    self.bq_schema_extractor.table_refs,
+                )
+
+        # Lineage BQ to GCS
+        if (
+            self.config.include_table_lineage
+            and self.bq_schema_extractor.external_tables
+        ):
+            for dataset_urn, table in self.bq_schema_extractor.external_tables.items():
+                yield from self.lineage_extractor.gen_lineage_workunits_for_external_table(
+                    dataset_urn, table.ddl, graph=self.ctx.graph
+                )
+
+    def get_report(self) -> BigQueryV2Report:
+        return self.report
+
+    def add_config_to_report(self):
+        self.report.include_table_lineage = self.config.include_table_lineage
+        self.report.use_date_sharded_audit_log_tables = (
+            self.config.use_date_sharded_audit_log_tables
+        )
+        self.report.log_page_size = self.config.log_page_size
+        self.report.use_exported_bigquery_audit_metadata = (
+            self.config.use_exported_bigquery_audit_metadata
+        )
+        self.report.stateful_lineage_ingestion_enabled = (
+            self.config.enable_stateful_lineage_ingestion
+        )
+        self.report.stateful_usage_ingestion_enabled = (
+            self.config.enable_stateful_usage_ingestion
+        )
+        self.report.window_start_time, self.report.window_end_time = (
+            self.config.start_time,
+            self.config.end_time,
+        )

@@ -1,0 +1,108 @@
+namespace com.linkedin.knowledge
+
+import com.linkedin.common.AuditStamp
+import com.linkedin.common.CustomProperties
+
+/**
+ * Information about a document
+ */
+@Aspect = {
+  "name": "documentInfo"
+}
+record DocumentInfo includes CustomProperties {
+
+    /**
+     * Optional title for the document. 
+     */
+    @Searchable = {
+      "fieldType": "WORD_GRAM",
+      "enableAutocomplete": true,
+      "boostScore": 10.0,
+      "fieldNameAliases": [ "_entityName" ],
+      "v3": {
+        "searchLabel": "name",
+        "mappings": [
+          { "type": "KEYWORD" },
+          { "subfield": "text", "type": "TEXT" },
+          { "subfield": "stemmed", "type": "STEMMED" }
+        ]
+      }
+    }
+    title: optional string
+
+    /**
+     * Information about the external source of this document. 
+     * Only populated for third-party documents ingested from external systems.
+     */
+    source: optional DocumentSource
+
+    /**
+     * Status of the document (published, unpublished.)
+     */
+    status: DocumentStatus
+
+    /**
+     * Content of the document
+     */
+     contents: DocumentContents
+
+     /**
+      * The time and actor who created the document.
+      * Search V3 does not index this stamp. The write is systemMetadata.aspectCreated,
+      * copied to _system.created.time and _system.created.actor.
+      */
+    @deprecated = "Use systemMetadata.aspectCreated instead."
+    @Searchable = {
+      "/actor": {
+        "fieldName": "creator",
+        "fieldType": "URN",
+        "queryByDefault": false,
+        "v3": { "enabled": false }
+      },
+      "/time": {
+        "fieldName": "createdAt",
+        "fieldType": "DATETIME",
+        "queryByDefault": false,
+        "v3": { "enabled": false }
+      }
+    }
+    created: AuditStamp
+
+    /**
+     * The time and actor who last modified the document (any field).
+     * Search V3 does not index this stamp. The write is systemMetadata.aspectModified,
+     * copied to _system.modified.time and _system.modified.actor.
+     */
+    @deprecated = "Use systemMetadata.aspectModified instead."
+    @Searchable = {
+      "/actor": {
+        "fieldName": "lastModifiedBy",
+        "fieldType": "URN",
+        "queryByDefault": false,
+        "v3": { "enabled": false }
+      },
+      "/time": {
+        "fieldName": "lastModifiedAt",
+        "fieldType": "DATETIME",
+        "queryByDefault": false,
+        "addToFilters": false,
+        "v3": { "enabled": false }
+      }
+    }
+    lastModified: AuditStamp
+    
+    /**
+     * Assets referenced by or related to this document. 
+     */
+    relatedAssets: optional array[RelatedAsset]
+
+    /**
+     * Documents referenced by or related to this document. 
+     */
+    relatedDocuments: optional array[RelatedDocument]
+
+    /**
+     * Parent article for this asset. 
+     */
+    parentDocument: optional ParentDocument
+}

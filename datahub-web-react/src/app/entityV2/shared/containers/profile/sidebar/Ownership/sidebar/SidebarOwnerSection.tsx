@@ -1,0 +1,141 @@
+import { Plus } from '@phosphor-icons/react/dist/csr/Plus';
+import React, { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components/macro';
+
+import { useEntityData, useMutationUrn, useRefetch } from '@app/entity/shared/EntityContext';
+import { isPropagated } from '@app/entity/shared/propagation/utils';
+import { EMPTY_MESSAGES } from '@app/entityV2/shared/constants';
+import EmptySectionText from '@app/entityV2/shared/containers/profile/sidebar/EmptySectionText';
+import { EditOwnersModal } from '@app/entityV2/shared/containers/profile/sidebar/Ownership/EditOwnersModal';
+import { getOwnershipTypeName } from '@app/entityV2/shared/containers/profile/sidebar/Ownership/ownershipUtils';
+import { OwnershipTypeSection } from '@app/entityV2/shared/containers/profile/sidebar/Ownership/sidebar/OwnershipTypeSection';
+import SectionActionButton from '@app/entityV2/shared/containers/profile/sidebar/SectionActionButton';
+import { SidebarSection } from '@app/entityV2/shared/containers/profile/sidebar/SidebarSection';
+import { ENTITY_PROFILE_OWNERS_ID } from '@app/onboarding/config/EntityProfileOnboardingConfig';
+import { dedupeByUrn } from '@src/utils/dedupeByUrn';
+
+import { Owner, OwnershipType, OwnershipTypeEntity } from '@types';
+
+const Content = styled.div`
+    display: flex;
+    align-items: center;
+    justify-content: start;
+    flex-wrap: wrap;
+`;
+
+const OwnershipSections = styled.div`
+    display: flex;
+    align-items: start;
+    justify-content: start;
+    flex-wrap: wrap;
+    max-width: 100%;
+    gap: 4px;
+`;
+
+interface Props {
+    properties?: any;
+    readOnly?: boolean;
+}
+
+export const SidebarOwnerSection = ({ properties, readOnly }: Props) => {
+    const { t } = useTranslation('entity.shared.containers');
+    const { entityType, entityData } = useEntityData();
+    const mutationUrn = useMutationUrn();
+
+    const refetch = useRefetch();
+    const [showAddModal, setShowAddModal] = useState(false);
+
+    const ownersEmpty = !entityData?.ownership?.owners?.length;
+    const ownershipTypesMap: Map<string, OwnershipTypeEntity> = new Map();
+    const ownersByTypeMap: Map<string, Owner[]> = new Map();
+    entityData?.ownership?.owners?.forEach((owner) => {
+        const ownershipType = owner?.ownershipType;
+        const ownershipTypeName = getOwnershipTypeName(ownershipType);
+        // If ownership type is not in the map, add it
+        if (ownershipType && !ownershipTypesMap.has(ownershipTypeName)) {
+            ownershipTypesMap.set(ownershipTypeName, ownershipType);
+        }
+        if (!ownersByTypeMap.has(ownershipTypeName)) {
+            ownersByTypeMap.set(ownershipTypeName, []);
+        }
+        ownersByTypeMap.get(ownershipTypeName)?.push(owner);
+    });
+    // Sort ownership types by name alphabetically
+    const ownershipTypeNames = Array.from(ownershipTypesMap.keys()).sort();
+
+    let defaultOwnerTypeUrn = 'urn:li:ownershipType:__system__technical_owner';
+    switch (properties?.defaultOwnerType) {
+        case OwnershipType.TechnicalOwner:
+            defaultOwnerTypeUrn = 'urn:li:ownershipType:__system__technical_owner';
+            break;
+        case OwnershipType.BusinessOwner:
+            defaultOwnerTypeUrn = 'urn:li:ownershipType:__system__business_owner';
+            break;
+        case OwnershipType.DataSteward:
+            defaultOwnerTypeUrn = 'urn:li:ownershipType:__system__data_steward';
+            break;
+        default:
+            break;
+    }
+
+    const canEditOwners = !!entityData?.privileges?.canEditOwners;
+
+    return (
+        <div id={ENTITY_PROFILE_OWNERS_ID}>
+            <SidebarSection
+                title={t('sidebar.ownership.sectionTitle')}
+                content={
+                    <Content>
+                        <OwnershipSections>
+                            {ownershipTypeNames.map((ownershipTypeName) => {
+                                const ownershipType = ownershipTypesMap.get(ownershipTypeName) as OwnershipTypeEntity;
+                                // Guard against the same owner urn appearing more than once with different
+                                // attribution, preferring the non-propagated (manually applied) entry
+                                const owners = dedupeByUrn(
+                                    ownersByTypeMap.get(ownershipTypeName) as Owner[],
+                                    (owner) => owner.owner.urn,
+                                    (owner) => isPropagated(owner.attribution?.sourceDetail),
+                                );
+                                return (
+                                    <OwnershipTypeSection
+                                        key={ownershipTypeName}
+                                        ownershipType={ownershipType}
+                                        owners={owners}
+                                        readOnly={readOnly}
+                                    />
+                                );
+                            })}
+                        </OwnershipSections>
+                        {ownersEmpty && <EmptySectionText message={EMPTY_MESSAGES.owners.title} />}
+                    </Content>
+                }
+                extra={
+                    !readOnly && (
+                        <SectionActionButton
+                            icon={Plus}
+                            onClick={(event) => {
+                                setShowAddModal(true);
+                                event.stopPropagation();
+                            }}
+                            actionPrivilege={canEditOwners}
+                            dataTestId="add-owners-button"
+                        />
+                    )
+                }
+            />
+            {showAddModal && (
+                <EditOwnersModal
+                    urns={[mutationUrn]}
+                    defaultOwnerType={defaultOwnerTypeUrn}
+                    hideOwnerType={properties?.hideOwnerType || false}
+                    entityType={entityType}
+                    refetch={refetch}
+                    onCloseModal={() => {
+                        setShowAddModal(false);
+                    }}
+                />
+            )}
+        </div>
+    );
+};

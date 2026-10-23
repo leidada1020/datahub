@@ -1,0 +1,2885 @@
+package com.linkedin.metadata.search.query.request;
+
+import static com.linkedin.metadata.Constants.DATASET_ENTITY_NAME;
+import static com.linkedin.metadata.Constants.STATUS_ASPECT_NAME;
+import static com.linkedin.metadata.config.search.EntityTypeListConfig.DEFAULT_SEARCH_ENTITY_TYPES;
+import static com.linkedin.metadata.config.search.EntityTypeListConfig.parseCsv;
+import static com.linkedin.metadata.search.elasticsearch.query.request.SearchQueryBuilder.STRUCTURED_QUERY_PREFIX;
+import static com.linkedin.metadata.utils.CriterionUtils.buildCriterion;
+import static com.linkedin.metadata.utils.CriterionUtils.buildExistsCriterion;
+import static com.linkedin.metadata.utils.CriterionUtils.buildIsNullCriterion;
+import static com.linkedin.metadata.utils.SearchUtil.*;
+import static io.datahubproject.test.search.SearchTestUtils.TEST_ES_SEARCH_CONFIG;
+import static io.datahubproject.test.search.SearchTestUtils.TEST_OS_SEARCH_CONFIG;
+import static io.datahubproject.test.search.SearchTestUtils.TEST_SEARCH_SERVICE_CONFIG;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+import static org.testng.Assert.*;
+
+import com.datahub.context.OperationFingerprint;
+import com.datahub.util.exception.ESQueryException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
+import com.linkedin.common.urn.Urn;
+import com.linkedin.data.DataMap;
+import com.linkedin.data.template.StringArray;
+import com.linkedin.datahub.graphql.generated.EntityType;
+import com.linkedin.datahub.graphql.types.entitytype.EntityTypeMapper;
+import com.linkedin.entity.Aspect;
+import com.linkedin.metadata.TestEntitySpecBuilder;
+import com.linkedin.metadata.aspect.AspectRetriever;
+import com.linkedin.metadata.aspect.GraphRetriever;
+import com.linkedin.metadata.config.search.ElasticSearchConfiguration;
+import com.linkedin.metadata.config.search.EntityIndexConfiguration;
+import com.linkedin.metadata.config.search.EntityIndexVersionConfiguration;
+import com.linkedin.metadata.config.search.ExactMatchConfiguration;
+import com.linkedin.metadata.config.search.PartialConfiguration;
+import com.linkedin.metadata.config.search.SearchServiceConfiguration;
+import com.linkedin.metadata.config.search.SearchValidationConfiguration;
+import com.linkedin.metadata.config.search.WordGramConfiguration;
+import com.linkedin.metadata.config.search.custom.CustomSearchConfiguration;
+import com.linkedin.metadata.config.search.custom.FieldConfiguration;
+import com.linkedin.metadata.config.search.custom.HighlightFields;
+import com.linkedin.metadata.config.shared.LimitConfig;
+import com.linkedin.metadata.config.shared.ResultsLimitConfig;
+import com.linkedin.metadata.entity.SearchRetriever;
+import com.linkedin.metadata.models.EntitySpec;
+import com.linkedin.metadata.models.StructuredPropertyUtils;
+import com.linkedin.metadata.query.filter.Condition;
+import com.linkedin.metadata.query.filter.ConjunctiveCriterion;
+import com.linkedin.metadata.query.filter.ConjunctiveCriterionArray;
+import com.linkedin.metadata.query.filter.Criterion;
+import com.linkedin.metadata.query.filter.CriterionArray;
+import com.linkedin.metadata.query.filter.Filter;
+import com.linkedin.metadata.query.filter.SortCriterion;
+import com.linkedin.metadata.query.filter.SortOrder;
+import com.linkedin.metadata.search.MatchedFieldArray;
+import com.linkedin.metadata.search.ScrollResult;
+import com.linkedin.metadata.search.SearchEntity;
+import com.linkedin.metadata.search.SearchResult;
+import com.linkedin.metadata.search.elasticsearch.index.entity.v3.SearchFieldResolver;
+import com.linkedin.metadata.search.elasticsearch.index.entity.v3.V3SearchFields;
+import com.linkedin.metadata.search.elasticsearch.query.filter.QueryFilterRewriteChain;
+import com.linkedin.metadata.search.elasticsearch.query.request.SearchRequestHandler;
+import io.datahubproject.metadata.context.OperationContext;
+import io.datahubproject.metadata.context.RetrieverContext;
+import io.datahubproject.test.metadata.context.TestOperationContexts;
+import io.datahubproject.test.search.config.SearchCommonTestConfiguration;
+import java.util.AbstractList;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+import org.apache.lucene.search.Explanation;
+import org.apache.lucene.search.TotalHits;
+import org.opensearch.OpenSearchException;
+import org.opensearch.action.search.SearchRequest;
+import org.opensearch.action.search.SearchResponse;
+import org.opensearch.action.search.SearchType;
+import org.opensearch.action.search.ShardSearchFailure;
+import org.opensearch.index.query.BoolQueryBuilder;
+import org.opensearch.index.query.DisMaxQueryBuilder;
+import org.opensearch.index.query.ExistsQueryBuilder;
+import org.opensearch.index.query.MatchQueryBuilder;
+import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.index.query.TermQueryBuilder;
+import org.opensearch.index.query.TermsQueryBuilder;
+import org.opensearch.index.query.functionscore.FunctionScoreQueryBuilder;
+import org.opensearch.search.SearchHit;
+import org.opensearch.search.SearchHits;
+import org.opensearch.search.aggregations.AggregationBuilder;
+import org.opensearch.search.aggregations.AggregationBuilders;
+import org.opensearch.search.aggregations.bucket.terms.TermsAggregationBuilder;
+import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.search.fetch.subphase.FetchSourceContext;
+import org.opensearch.search.fetch.subphase.highlight.HighlightBuilder;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.context.annotation.Import;
+import org.springframework.test.context.testng.AbstractTestNGSpringContextTests;
+import org.testng.Assert;
+import org.testng.annotations.Test;
+
+@Import(SearchCommonTestConfiguration.class)
+public class SearchRequestHandlerTest extends AbstractTestNGSpringContextTests {
+
+  @Autowired
+  @Qualifier("queryOperationContext")
+  private OperationContext operationContext;
+
+  public static ElasticSearchConfiguration testQueryConfig;
+  public static List<String> validHighlightingFields = List.of("urn", "foreignKey");
+  public static StringArray customHighlightFields =
+      new StringArray(
+          List.of(
+              validHighlightingFields.get(0),
+              validHighlightingFields.get(1),
+              "notExistingField",
+              ""));
+
+  static {
+    ExactMatchConfiguration exactMatchConfiguration = new ExactMatchConfiguration();
+    exactMatchConfiguration.setExclusive(false);
+    exactMatchConfiguration.setExactFactor(10.0f);
+    exactMatchConfiguration.setWithPrefix(true);
+    exactMatchConfiguration.setPrefixFactor(6.0f);
+    exactMatchConfiguration.setCaseSensitivityFactor(0.7f);
+    exactMatchConfiguration.setEnableStructured(true);
+
+    WordGramConfiguration wordGramConfiguration = new WordGramConfiguration();
+    wordGramConfiguration.setTwoGramFactor(1.2f);
+    wordGramConfiguration.setThreeGramFactor(1.5f);
+    wordGramConfiguration.setFourGramFactor(1.8f);
+
+    PartialConfiguration partialConfiguration = new PartialConfiguration();
+    partialConfiguration.setFactor(0.4f);
+    partialConfiguration.setUrnFactor(0.7f);
+
+    SearchValidationConfiguration searchValidationConfiguration =
+        new SearchValidationConfiguration();
+
+    testQueryConfig =
+        TEST_OS_SEARCH_CONFIG.toBuilder()
+            .search(
+                TEST_OS_SEARCH_CONFIG.getSearch().toBuilder()
+                    .maxTermBucketSize(20)
+                    .exactMatch(exactMatchConfiguration)
+                    .wordGram(wordGramConfiguration)
+                    .partial(partialConfiguration)
+                    .validation(searchValidationConfiguration)
+                    .build())
+            .entityIndex(
+                TEST_ES_SEARCH_CONFIG.getEntityIndex()) // Preserve entityIndex configuration
+            .bulkDelete(TEST_ES_SEARCH_CONFIG.getBulkDelete())
+            .bulkProcessor(TEST_ES_SEARCH_CONFIG.getBulkProcessor())
+            .buildIndices(TEST_ES_SEARCH_CONFIG.getBuildIndices())
+            // idHashAlgo now travels with entityIndex.v2, preserved above
+            .index(TEST_ES_SEARCH_CONFIG.getIndex())
+            .scroll(TEST_ES_SEARCH_CONFIG.getScroll())
+            .build();
+  }
+
+  @Test
+  public void testDatasetFieldsAndHighlights() {
+    EntitySpec entitySpec = operationContext.getEntityRegistry().getEntitySpec("dataset");
+    SearchRequestHandler datasetHandler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            entitySpec,
+            testQueryConfig,
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            TEST_SEARCH_SERVICE_CONFIG);
+
+    /*
+      Ensure efficient query performance, we do not expect upstream/downstream/fineGrained lineage
+    */
+    List<String> highlightFields =
+        datasetHandler.getDefaultHighlights(operationContext).fields().stream()
+            .map(HighlightBuilder.Field::name)
+            .collect(Collectors.toList());
+    assertTrue(
+        highlightFields.stream()
+            .noneMatch(
+                fieldName -> fieldName.contains("upstream") || fieldName.contains("downstream")),
+        "unexpected lineage fields in highlights: " + highlightFields);
+  }
+
+  @Test
+  public void testCustomHighlights() {
+    SearchRequestHandler requestHandler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            TestEntitySpecBuilder.getSpec(),
+            testQueryConfig,
+            null,
+            mock(QueryFilterRewriteChain.class),
+            TEST_SEARCH_SERVICE_CONFIG);
+    SearchRequest searchRequest =
+        requestHandler.getSearchRequest(
+            operationContext.withSearchFlags(
+                flags ->
+                    flags.setFulltext(false).setCustomHighlightingFields(customHighlightFields)),
+            "testQuery",
+            null,
+            null,
+            0,
+            10,
+            List.of());
+    SearchSourceBuilder sourceBuilder = searchRequest.source();
+    assertNotNull(sourceBuilder.highlighter());
+    assertEquals(sourceBuilder.highlighter().fields().size(), 8);
+    assertTrue(
+        sourceBuilder.highlighter().fields().stream()
+            .map(HighlightBuilder.Field::name)
+            .toList()
+            .containsAll(validHighlightingFields));
+  }
+
+  @Test
+  public void testSearchRequestHandlerHighlightingTurnedOff() {
+    SearchRequestHandler requestHandler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            TestEntitySpecBuilder.getSpec(),
+            testQueryConfig,
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            TEST_SEARCH_SERVICE_CONFIG);
+    SearchRequest searchRequest =
+        requestHandler.getSearchRequest(
+            operationContext.withSearchFlags(
+                flags -> flags.setFulltext(false).setSkipHighlighting(true)),
+            "testQuery",
+            null,
+            null,
+            0,
+            10,
+            List.of());
+    SearchSourceBuilder sourceBuilder = searchRequest.source();
+    assertEquals(sourceBuilder.from(), 0);
+    assertEquals(sourceBuilder.size(), 10);
+    // Filters
+    Collection<AggregationBuilder> aggBuilders =
+        sourceBuilder.aggregations().getAggregatorFactories();
+    // Expect 3 aggregations: textFieldOverride, missing␝textFieldOverride, and _entityType,
+    // _entityType␝typeNames
+    assertEquals(aggBuilders.size(), 4);
+    for (AggregationBuilder aggBuilder : aggBuilders) {
+      if (aggBuilder.getName().startsWith("textFieldOverride")) {
+        TermsAggregationBuilder filterPanelBuilder = (TermsAggregationBuilder) aggBuilder;
+        assertEquals(filterPanelBuilder.field(), "textFieldOverride.keyword");
+      } else if (!aggBuilder.getName().startsWith("_entityType")
+          && !aggBuilder
+              .getName()
+              .equals(
+                  MISSING_SPECIAL_TYPE
+                      + AGGREGATION_SPECIAL_TYPE_DELIMITER
+                      + "textFieldOverride")) {
+        fail("Found unexpected aggregation: " + aggBuilder.getName());
+      }
+    }
+    // Highlights should not be present
+    assertNull(sourceBuilder.highlighter());
+  }
+
+  @Test
+  public void testSearchRequestHandler() {
+    SearchRequestHandler requestHandler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            TestEntitySpecBuilder.getSpec(),
+            testQueryConfig,
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            TEST_SEARCH_SERVICE_CONFIG);
+    SearchRequest searchRequest =
+        requestHandler.getSearchRequest(
+            operationContext.withSearchFlags(
+                flags ->
+                    flags.setFulltext(false).setSkipHighlighting(false).setSkipAggregates(false)),
+            "testQuery",
+            null,
+            null,
+            0,
+            10,
+            List.of());
+    SearchSourceBuilder sourceBuilder = searchRequest.source();
+    assertEquals(sourceBuilder.from(), 0);
+    assertEquals(sourceBuilder.size(), 10);
+    // Filters
+    Collection<AggregationBuilder> aggBuilders =
+        sourceBuilder.aggregations().getAggregatorFactories();
+    // Expect 4 aggregations: textFieldOverride, missing:textFieldOverride, _entityType and
+    // _entityType:typeNames
+    assertEquals(aggBuilders.size(), 4);
+    for (AggregationBuilder aggBuilder : aggBuilders) {
+      if (aggBuilder.getName().startsWith("textFieldOverride")) {
+        TermsAggregationBuilder filterPanelBuilder = (TermsAggregationBuilder) aggBuilder;
+        assertEquals(filterPanelBuilder.field(), "textFieldOverride.keyword");
+      } else if (!aggBuilder.getName().startsWith("_entityType")
+          && !aggBuilder
+              .getName()
+              .equals(
+                  MISSING_SPECIAL_TYPE
+                      + AGGREGATION_SPECIAL_TYPE_DELIMITER
+                      + "textFieldOverride")) {
+        fail("Found unexpected aggregation: " + aggBuilder.getName());
+      }
+    }
+    // Highlights
+    HighlightBuilder highlightBuilder = sourceBuilder.highlighter();
+    List<String> fields =
+        highlightBuilder.fields().stream()
+            .map(HighlightBuilder.Field::name)
+            .collect(Collectors.toList());
+    assertEquals(fields.size(), 32);
+    List<String> highlightableFields =
+        ImmutableList.of(
+            "keyPart1",
+            "textArrayField",
+            "textFieldOverride",
+            "foreignKey",
+            "nestedForeignKey",
+            "nestedArrayStringField",
+            "nestedArrayArrayField",
+            "customProperties",
+            "esObjectField",
+            "wordGramField",
+            "esObjectFieldLong",
+            "esObjectFieldBoolean",
+            "esObjectFieldFloat",
+            "esObjectFieldDouble",
+            "esObjectFieldInteger");
+    highlightableFields.forEach(
+        field -> {
+          assertTrue(fields.contains(field), "Missing: " + field);
+          assertTrue(fields.contains(field + ".*"), "Missing: " + field + ".*");
+        });
+  }
+
+  @Test
+  public void testAggregationsInSearch() {
+    SearchRequestHandler requestHandler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            TestEntitySpecBuilder.getSpec(),
+            testQueryConfig,
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            TEST_SEARCH_SERVICE_CONFIG);
+    final String nestedAggString =
+        String.format("_entityType%stextFieldOverride", AGGREGATION_SEPARATOR_CHAR);
+    SearchRequest searchRequest =
+        requestHandler.getSearchRequest(
+            operationContext.withSearchFlags(
+                flags -> flags.setFulltext(true).setIncludeDefaultFacets(false)),
+            "*",
+            null,
+            null,
+            0,
+            10,
+            List.of(
+                "textFieldOverride",
+                "_entityType",
+                nestedAggString,
+                AGGREGATION_SEPARATOR_CHAR,
+                "not_a_facet"));
+    SearchSourceBuilder sourceBuilder = searchRequest.source();
+    // Filters
+    Collection<AggregationBuilder> aggregationBuilders =
+        sourceBuilder.aggregations().getAggregatorFactories();
+    assertEquals(aggregationBuilders.size(), 3);
+
+    // Expected aggregations
+    AggregationBuilder expectedTextFieldAggregationBuilder =
+        AggregationBuilders.terms("textFieldOverride")
+            .field("textFieldOverride.keyword")
+            .size(testQueryConfig.getSearch().getMaxTermBucketSize());
+    AggregationBuilder expectedEntityTypeAggregationBuilder =
+        AggregationBuilders.terms("_entityType")
+            .field(ES_INDEX_FIELD)
+            .size(testQueryConfig.getSearch().getMaxTermBucketSize())
+            .minDocCount(0);
+    AggregationBuilder expectedNestedAggregationBuilder =
+        AggregationBuilders.terms(nestedAggString)
+            .field(ES_INDEX_FIELD)
+            .size(testQueryConfig.getSearch().getMaxTermBucketSize())
+            .minDocCount(0)
+            .subAggregation(
+                AggregationBuilders.terms(nestedAggString)
+                    .field("textFieldOverride.keyword")
+                    .size(testQueryConfig.getSearch().getMaxTermBucketSize()));
+
+    for (AggregationBuilder builder : aggregationBuilders) {
+      if (builder.getName().equals("textFieldOverride")
+          || builder.getName().equals("_entityType")) {
+        assertTrue(builder.getSubAggregations().isEmpty());
+        if (builder.getName().equalsIgnoreCase("textFieldOverride")) {
+          assertEquals(builder, expectedTextFieldAggregationBuilder);
+        } else {
+          assertEquals(builder, expectedEntityTypeAggregationBuilder);
+        }
+      } else if (builder.getName().equals(nestedAggString)) {
+        assertEquals(builder.getSubAggregations().size(), 1);
+        Optional<AggregationBuilder> subAgg = builder.getSubAggregations().stream().findFirst();
+        assertTrue(subAgg.isPresent());
+        assertEquals(subAgg.get().getName(), nestedAggString);
+        assertEquals(builder, expectedNestedAggregationBuilder);
+      } else {
+        fail("Found unexpected aggregation builder: " + builder.getName());
+      }
+    }
+  }
+
+  @Test
+  public void testFilteredSearch() {
+
+    final SearchRequestHandler requestHandler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            TestEntitySpecBuilder.getSpec(),
+            testQueryConfig,
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            TEST_SEARCH_SERVICE_CONFIG);
+
+    final BoolQueryBuilder testQuery = constructFilterQuery(requestHandler, false);
+
+    testFilterQuery(testQuery);
+
+    final BoolQueryBuilder queryWithRemoved = constructRemovedQuery(requestHandler, false);
+
+    testRemovedQuery(queryWithRemoved);
+
+    final BoolQueryBuilder testQueryScroll = constructFilterQuery(requestHandler, true);
+
+    testFilterQuery(testQueryScroll);
+
+    final BoolQueryBuilder queryWithRemovedScroll = constructRemovedQuery(requestHandler, true);
+
+    testRemovedQuery(queryWithRemovedScroll);
+  }
+
+  private BoolQueryBuilder constructFilterQuery(
+      SearchRequestHandler requestHandler, boolean scroll) {
+    final Criterion filterCriterion = buildCriterion("keyword", Condition.EQUAL, "some value");
+
+    final Filter filterWithoutRemovedCondition =
+        new Filter()
+            .setOr(
+                new ConjunctiveCriterionArray(
+                    new ConjunctiveCriterion()
+                        .setAnd(new CriterionArray(ImmutableList.of(filterCriterion)))));
+
+    final BoolQueryBuilder testQuery;
+    if (scroll) {
+      testQuery =
+          (BoolQueryBuilder)
+              requestHandler
+                  .getSearchRequest(
+                      operationContext.withSearchFlags(flags -> flags.setFulltext(false)),
+                      "testQuery",
+                      filterWithoutRemovedCondition,
+                      null,
+                      null,
+                      null,
+                      "5m",
+                      10,
+                      List.of())
+                  .source()
+                  .query();
+    } else {
+      testQuery =
+          (BoolQueryBuilder)
+              requestHandler
+                  .getSearchRequest(
+                      operationContext.withSearchFlags(flags -> flags.setFulltext(false)),
+                      "testQuery",
+                      filterWithoutRemovedCondition,
+                      null,
+                      0,
+                      10,
+                      List.of())
+                  .source()
+                  .query();
+    }
+    return testQuery;
+  }
+
+  private void testFilterQuery(BoolQueryBuilder testQuery) {
+    Optional<TermQueryBuilder> mustNotHaveRemovedCondition =
+        testQuery.filter().stream()
+            .filter(or -> or instanceof BoolQueryBuilder)
+            .map(or -> (BoolQueryBuilder) or)
+            .flatMap(
+                or -> {
+                  System.out.println("processing: " + or.mustNot());
+                  return or.mustNot().stream();
+                })
+            .filter(and -> and instanceof TermQueryBuilder)
+            .map(and -> (TermQueryBuilder) and)
+            .filter(match -> match.fieldName().equals("removed"))
+            .findAny();
+
+    assertTrue(
+        mustNotHaveRemovedCondition.isPresent(),
+        "Expected must not have removed condition to exist" + " if filter does not have it");
+  }
+
+  private BoolQueryBuilder constructRemovedQuery(
+      SearchRequestHandler requestHandler, boolean scroll) {
+    final Criterion filterCriterion = buildCriterion("keyword", Condition.EQUAL, "some value");
+
+    final Criterion removedCriterion = buildCriterion("removed", Condition.EQUAL, "false");
+
+    final Filter filterWithRemovedCondition =
+        new Filter()
+            .setOr(
+                new ConjunctiveCriterionArray(
+                    new ConjunctiveCriterion()
+                        .setAnd(
+                            new CriterionArray(
+                                ImmutableList.of(filterCriterion, removedCriterion)))));
+
+    final BoolQueryBuilder queryWithRemoved;
+    if (scroll) {
+      queryWithRemoved =
+          (BoolQueryBuilder)
+              requestHandler
+                  .getSearchRequest(
+                      operationContext.withSearchFlags(flags -> flags.setFulltext(false)),
+                      "testQuery",
+                      filterWithRemovedCondition,
+                      null,
+                      null,
+                      null,
+                      "5m",
+                      10,
+                      List.of())
+                  .source()
+                  .query();
+    } else {
+      queryWithRemoved =
+          (BoolQueryBuilder)
+              requestHandler
+                  .getSearchRequest(
+                      operationContext.withSearchFlags(flags -> flags.setFulltext(false)),
+                      "testQuery",
+                      filterWithRemovedCondition,
+                      null,
+                      0,
+                      10,
+                      List.of())
+                  .source()
+                  .query();
+    }
+    return queryWithRemoved;
+  }
+
+  private void testRemovedQuery(BoolQueryBuilder queryWithRemoved) {
+    Optional<MatchQueryBuilder> mustNotHaveRemovedCondition =
+        queryWithRemoved.must().stream()
+            .filter(or -> or instanceof BoolQueryBuilder)
+            .map(or -> (BoolQueryBuilder) or)
+            .flatMap(
+                or -> {
+                  System.out.println("processing: " + or.mustNot());
+                  return or.mustNot().stream();
+                })
+            .filter(and -> and instanceof MatchQueryBuilder)
+            .map(and -> (MatchQueryBuilder) and)
+            .filter(match -> match.fieldName().equals("removed"))
+            .findAny();
+
+    assertFalse(
+        mustNotHaveRemovedCondition.isPresent(),
+        "Expect `must not have removed` condition to not"
+            + " exist because filter already has it a condition for the removed property");
+  }
+
+  // For fields that are one of EDITABLE_FIELD_TO_QUERY_PAIRS, we want to make sure
+  // a filter that has a list of values like below will filter on all values by generating a terms
+  // query
+  //  field EQUAL [value1, value2, ...]
+  @Test
+  public void testFilterFieldTagsByValues() {
+    final Criterion filterCriterion = buildCriterion("fieldTags", Condition.EQUAL, "v1", "v2");
+
+    final BoolQueryBuilder testQuery = getQuery(filterCriterion);
+
+    // bool -> filter -> [bool] -> should -> [bool] -> filter -> [bool] -> should -> [terms]
+    List<TermsQueryBuilder> termsQueryBuilders =
+        testQuery.filter().stream()
+            .filter(or -> or instanceof BoolQueryBuilder)
+            .flatMap(or -> ((BoolQueryBuilder) or).should().stream())
+            .filter(should -> should instanceof BoolQueryBuilder)
+            .flatMap(should -> ((BoolQueryBuilder) should).filter().stream())
+            .filter(must -> must instanceof BoolQueryBuilder)
+            .flatMap(must -> ((BoolQueryBuilder) must).should().stream())
+            .filter(should -> should instanceof TermsQueryBuilder)
+            .map(should -> (TermsQueryBuilder) should)
+            .collect(Collectors.toList());
+
+    assertTrue(termsQueryBuilders.size() == 2, "Expected to find two terms queries");
+    Map<String, List<String>> termsMap = new HashMap<>();
+    termsQueryBuilders.forEach(
+        termsQueryBuilder -> {
+          String field = termsQueryBuilder.fieldName();
+          List<Object> values = termsQueryBuilder.values();
+          List<String> strValues = new ArrayList<>();
+          for (Object value : values) {
+            assertTrue(
+                value instanceof String, "Expected value to be String, got: " + value.getClass());
+            strValues.add((String) value);
+          }
+          Collections.sort(strValues);
+          termsMap.put(field, strValues);
+        });
+
+    assertTrue(termsMap.containsKey("fieldTags.keyword"));
+    assertTrue(termsMap.containsKey("editedFieldTags.keyword"));
+    for (List<String> values : termsMap.values()) {
+      assertTrue(values.size() == 2);
+      assertTrue(values.get(0).equals("v1"));
+      assertTrue(values.get(1).equals("v2"));
+    }
+  }
+
+  // Test fields not in EDITABLE_FIELD_TO_QUERY_PAIRS with a list of values
+  @Test
+  public void testFilterPlatformByValues() {
+    final Criterion filterCriterion =
+        buildCriterion("platform", Condition.EQUAL, "mysql", "bigquery");
+
+    final BoolQueryBuilder testQuery = getQuery(filterCriterion);
+
+    // bool -> filter -> [bool] -> should -> [bool] -> filter -> [terms]
+    List<TermsQueryBuilder> termsQueryBuilders =
+        testQuery.filter().stream()
+            .filter(must -> must instanceof BoolQueryBuilder)
+            .flatMap(must -> ((BoolQueryBuilder) must).should().stream())
+            .filter(should -> should instanceof BoolQueryBuilder)
+            .flatMap(should -> ((BoolQueryBuilder) should).filter().stream())
+            .filter(must -> must instanceof TermsQueryBuilder)
+            .map(must -> (TermsQueryBuilder) must)
+            .collect(Collectors.toList());
+
+    assertTrue(termsQueryBuilders.size() == 1, "Expected to find one terms query");
+    final TermsQueryBuilder termsQueryBuilder = termsQueryBuilders.get(0);
+    assertEquals(termsQueryBuilder.fieldName(), "platform.keyword");
+    Set<String> values = new HashSet<>();
+    termsQueryBuilder
+        .values()
+        .forEach(
+            value -> {
+              assertTrue(value instanceof String);
+              values.add((String) value);
+            });
+
+    assertEquals(values.size(), 2, "Expected two platform filter values");
+    assertTrue(values.contains("mysql"));
+    assertTrue(values.contains("bigquery"));
+  }
+
+  @Test
+  public void testBrowsePathQueryFilter() {
+    // Condition: has `browsePaths` AND does NOT have `browsePathV2`
+    Criterion missingBrowsePathV2 = buildIsNullCriterion("browsePathV2");
+    // Excludes entities without browsePaths
+    Criterion hasBrowsePathV1 = buildExistsCriterion("browsePaths");
+
+    CriterionArray criterionArray = new CriterionArray();
+    criterionArray.add(missingBrowsePathV2);
+    criterionArray.add(hasBrowsePathV1);
+
+    ConjunctiveCriterion conjunctiveCriterion = new ConjunctiveCriterion();
+    conjunctiveCriterion.setAnd(criterionArray);
+
+    ConjunctiveCriterionArray conjunctiveCriterionArray = new ConjunctiveCriterionArray();
+    conjunctiveCriterionArray.add(conjunctiveCriterion);
+
+    Filter filter = new Filter();
+    filter.setOr(conjunctiveCriterionArray);
+
+    BoolQueryBuilder test =
+        SearchRequestHandler.getFilterQuery(
+            operationContext.withSearchFlags(flags -> flags.setFulltext(false)),
+            Collections.emptyList(),
+            filter,
+            new HashMap<>(),
+            QueryFilterRewriteChain.EMPTY);
+
+    assertEquals(test.should().size(), 1);
+
+    BoolQueryBuilder shouldQuery = (BoolQueryBuilder) test.should().get(0);
+    assertEquals(shouldQuery.filter().size(), 2);
+
+    BoolQueryBuilder mustNotHaveV2 = (BoolQueryBuilder) shouldQuery.filter().get(0);
+    assertEquals(((ExistsQueryBuilder) mustNotHaveV2.mustNot().get(0)).fieldName(), "browsePathV2");
+
+    BoolQueryBuilder mustHaveV1 = (BoolQueryBuilder) shouldQuery.filter().get(1);
+    assertEquals(((ExistsQueryBuilder) mustHaveV1.must().get(0)).fieldName(), "browsePaths");
+  }
+
+  @Test
+  public void testV3FilterQueryAlwaysScopesRequestedEntityTypes() {
+    EntityIndexConfiguration entityIndex =
+        EntityIndexConfiguration.builder()
+            .v2(EntityIndexVersionConfiguration.builder().enabled(false).build())
+            .v3(EntityIndexVersionConfiguration.builder().enabled(true).build())
+            .build();
+
+    BoolQueryBuilder query =
+        SearchRequestHandler.getFilterQuery(
+            operationContext,
+            List.of("dataset"),
+            null,
+            new HashMap<>(),
+            QueryFilterRewriteChain.EMPTY,
+            entityIndex,
+            cachedV3Resolver(entityIndex));
+
+    assertTrue(
+        query.filter().stream()
+            .filter(BoolQueryBuilder.class::isInstance)
+            .flatMap(bool -> ((BoolQueryBuilder) bool).should().stream())
+            .filter(TermQueryBuilder.class::isInstance)
+            .map(TermQueryBuilder.class::cast)
+            .anyMatch(
+                term -> term.fieldName().equals("_entityType") && term.value().equals("dataset")));
+  }
+
+  /** V3 resolves exact paths from the declared root rather than field-name heuristics. */
+  @Test
+  public void testV3FiltersAndValueCountsUseKeywordSubfields() {
+    EntityIndexConfiguration entityIndex =
+        EntityIndexConfiguration.builder()
+            .v2(EntityIndexVersionConfiguration.builder().enabled(false).build())
+            .v3(EntityIndexVersionConfiguration.builder().enabled(true).build())
+            .build();
+    Filter filter =
+        new Filter()
+            .setOr(
+                new ConjunctiveCriterionArray(
+                    new ConjunctiveCriterion()
+                        .setAnd(
+                            new CriterionArray(
+                                buildCriterion(
+                                    "platform", Condition.EQUAL, "urn:li:dataPlatform:hive")))));
+
+    String v3Filter =
+        SearchRequestHandler.getFilterQuery(
+                operationContext,
+                List.of("dataset"),
+                filter,
+                new HashMap<>(),
+                QueryFilterRewriteChain.EMPTY,
+                entityIndex,
+                cachedV3Resolver(entityIndex))
+            .toString();
+    String v2Filter =
+        SearchRequestHandler.getFilterQuery(
+                operationContext,
+                List.of("dataset"),
+                filter,
+                new HashMap<>(),
+                QueryFilterRewriteChain.EMPTY)
+            .toString();
+    assertTrue(v3Filter.contains("platform_urn"), v3Filter);
+    assertTrue(v2Filter.contains("platform.keyword"), v2Filter);
+
+    SearchRequestHandler v3Handler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            operationContext.getEntityRegistry().getEntitySpec("dataset"),
+            testQueryConfig.toBuilder().entityIndex(entityIndex).build(),
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            TEST_SEARCH_SERVICE_CONFIG);
+    String valueCounts =
+        v3Handler.getAggregationRequest(operationContext, "platform", null, 10).source().toString();
+    assertTrue(valueCounts.contains("\"field\":\"platform_urn\""), valueCounts);
+    String keywordValueCounts =
+        v3Handler
+            .getAggregationRequest(operationContext, "platform.keyword", null, 10)
+            .source()
+            .toString();
+    assertTrue(keywordValueCounts.contains("\"field\":\"platform_urn\""), keywordValueCounts);
+  }
+
+  /**
+   * V3 strips caller-supplied legacy subfields and resolves from the registry; entity type enum
+   * names, as the UI sends them, still match the V3 _entityType field.
+   */
+  @Test
+  public void testV3FilterNormalizesCallerFilters() {
+    EntityIndexConfiguration entityIndex =
+        EntityIndexConfiguration.builder()
+            .v2(EntityIndexVersionConfiguration.builder().enabled(false).build())
+            .v3(EntityIndexVersionConfiguration.builder().enabled(true).build())
+            .build();
+    Filter filter =
+        new Filter()
+            .setOr(
+                new ConjunctiveCriterionArray(
+                    new ConjunctiveCriterion()
+                        .setAnd(
+                            new CriterionArray(
+                                buildCriterion(
+                                    "platform.keyword",
+                                    Condition.EQUAL,
+                                    "urn:li:dataPlatform:hive"),
+                                buildCriterion("_entityType", Condition.EQUAL, "DATA_PRODUCT")))));
+
+    String v3Filter =
+        SearchRequestHandler.getFilterQuery(
+                operationContext,
+                List.of("dataset"),
+                filter,
+                new HashMap<>(),
+                QueryFilterRewriteChain.EMPTY,
+                entityIndex,
+                cachedV3Resolver(entityIndex))
+            .toString();
+    String v2Filter =
+        SearchRequestHandler.getFilterQuery(
+                operationContext,
+                List.of("dataset"),
+                filter,
+                new HashMap<>(),
+                QueryFilterRewriteChain.EMPTY)
+            .toString();
+    assertTrue(v3Filter.contains("platform_urn"), v3Filter);
+    assertTrue(v2Filter.contains("platform.keyword"), v2Filter);
+    // V3 stores the registry entity name in _entityType, a keyword field without a subfield
+    assertTrue(v3Filter.contains("\"_entityType\""), v3Filter);
+    assertFalse(v3Filter.contains("_entityType.keyword"), v3Filter);
+    assertTrue(v3Filter.contains("\"dataProduct\""), v3Filter);
+    assertFalse(v3Filter.contains("DATA_PRODUCT"), v3Filter);
+    // The caller's filter is left as given
+    assertEquals(filter.getOr().get(0).getAnd().get(0).getField(), "platform.keyword");
+  }
+
+  /**
+   * Keyword conditions on an unindexed label are left out. A group with nothing left matches
+   * nothing. Indexed siblings in the same AND stay.
+   */
+  @Test
+  public void testV3OmitsUnindexedLabelFiltersOtherThanContain() {
+    for (Criterion criterion :
+        List.of(
+            buildCriterion("description", Condition.EQUAL, "daily revenue"),
+            buildCriterion("description", Condition.START_WITH, "daily revenue"),
+            buildCriterion("description", Condition.END_WITH, "daily revenue"),
+            buildCriterion("editedDescription", Condition.EQUAL, "daily revenue"),
+            buildCriterion("fieldDescriptions", Condition.EQUAL, "daily revenue"),
+            buildCriterion("description", Condition.GREATER_THAN, "daily revenue"))) {
+      String query = v3Filter(criterion);
+      assertFalse(query.contains("daily revenue"), criterion + " " + query);
+      assertFalse(query.contains("description.text"), criterion + " " + query);
+      assertFalse(query.contains("description.keyword"), criterion + " " + query);
+      assertMatchNone(query);
+    }
+
+    String platformOnly =
+        v3Filter(buildCriterion("platform", Condition.EQUAL, "urn:li:dataPlatform:hive"));
+    assertEquals(
+        v3Filter(
+            buildCriterion("description", Condition.EQUAL, "daily revenue"),
+            buildCriterion("platform", Condition.EQUAL, "urn:li:dataPlatform:hive")),
+        platformOnly);
+    assertEquals(
+        v3Filter(
+            buildCriterion("description", Condition.EQUAL, true, "daily revenue"),
+            buildCriterion("platform", Condition.EQUAL, "urn:li:dataPlatform:hive")),
+        platformOnly);
+
+    String either =
+        v3Or(
+            buildCriterion("description", Condition.EQUAL, "daily revenue"),
+            buildCriterion("platform", Condition.EQUAL, "urn:li:dataPlatform:hive"));
+    assertTrue(either.contains("platform_urn"), either);
+    assertTrue(either.contains("urn:li:dataPlatform:hive"), either);
+    assertFalse(either.contains("daily revenue"), either);
+    assertMatchNone(either);
+  }
+
+  /** Existence of an unindexed description is the shared hasDescription boolean. */
+  @Test
+  public void testV3UnindexedLabelExistenceUsesHasValuesField() {
+    assertHasValuesExistence(
+        v3Filter(buildExistsCriterion("description")), "description", "hasDescription", false);
+    assertHasValuesExistence(
+        v3Filter(buildIsNullCriterion("description")), "description", "hasDescription", true);
+    assertHasValuesExistence(
+        v3Filter(buildExistsCriterion("editedDescription")),
+        "editedDescription",
+        "hasDescription",
+        false);
+    assertHasValuesExistence(
+        v3Filter(buildIsNullCriterion("editedDescription")),
+        "editedDescription",
+        "hasDescription",
+        true);
+    assertHasValuesExistence(
+        v3Filter(buildExistsCriterion("fieldDescriptions")),
+        "fieldDescriptions",
+        "hasDescription_1",
+        false);
+    assertHasValuesExistence(
+        v3Filter(buildIsNullCriterion("fieldDescriptions")),
+        "fieldDescriptions",
+        "hasDescription_1",
+        true);
+    String editedExists =
+        v3Filter(
+            List.of("dataset", "businessAttribute"),
+            buildExistsCriterion("editedFieldDescriptions"));
+    assertHasValuesExistence(editedExists, "editedFieldDescriptions", "hasDescription", false);
+    assertTrue(editedExists.contains("\"field\" : \"hasDescription_1\""), editedExists);
+    String editedMissing =
+        v3Filter(
+            List.of("dataset", "businessAttribute"),
+            buildIsNullCriterion("editedFieldDescriptions"));
+    assertHasValuesExistence(editedMissing, "editedFieldDescriptions", "hasDescription", true);
+    assertTrue(editedMissing.contains("\"field\" : \"hasDescription_1\""), editedMissing);
+  }
+
+  private static void assertHasValuesExistence(
+      String query, String sourceField, String booleanField, boolean missing) {
+    int fieldAt = query.indexOf("\"field\" : \"" + booleanField + "\"");
+    assertTrue(fieldAt > 0, sourceField + " " + query);
+    String around = query.substring(Math.max(0, fieldAt - (missing ? 500 : 120)), fieldAt);
+    assertTrue(around.contains("\"exists\""), sourceField + " " + around);
+    if (missing) {
+      assertTrue(around.contains("must_not"), sourceField + " " + around);
+    } else {
+      assertFalse(around.contains("must_not"), sourceField + " " + around);
+    }
+    assertTrue(query.contains("\"_name\" : \"" + sourceField + "\""), sourceField + " " + query);
+    assertFalse(query.contains("description.text"), query);
+    assertFalse(query.contains("description.keyword"), query);
+  }
+
+  /** {@code must_not}/{@code match_all} is the empty side of an omitted group. */
+  private static void assertMatchNone(String query) {
+    int matchAll = query.indexOf("\"match_all\"");
+    assertTrue(matchAll > 0, query);
+    int mustNot = query.lastIndexOf("must_not", matchAll);
+    int must = query.lastIndexOf("\"must\"", matchAll);
+    assertTrue(mustNot > must, query.substring(Math.max(0, matchAll - 200), matchAll));
+  }
+
+  private String v3Or(Criterion... branches) {
+    ConjunctiveCriterionArray or = new ConjunctiveCriterionArray();
+    for (Criterion branch : branches) {
+      or.add(new ConjunctiveCriterion().setAnd(new CriterionArray(branch)));
+    }
+    return SearchRequestHandler.getFilterQuery(
+            operationContext,
+            List.of("dataset"),
+            new Filter().setOr(or),
+            new HashMap<>(),
+            QueryFilterRewriteChain.EMPTY,
+            V3_READ_CONFIG.getEntityIndex(),
+            cachedV3Resolver(V3_READ_CONFIG.getEntityIndex()))
+        .toString();
+  }
+
+  @Test
+  public void testV3ContainOnTextOnlyLabelMatchesAnalyzedFields() {
+    String description =
+        v3Filter(buildCriterion("description", Condition.CONTAIN, "data warehouse"));
+    assertTrue(description.contains("\"description.text\""), description);
+    assertTrue(description.contains("\"description.stemmed\""), description);
+    assertTrue(description.contains("\"operator\" : \"AND\""), description);
+    assertFalse(description.contains("wildcard"), description);
+
+    String fieldDescriptions =
+        v3Filter(buildCriterion("fieldDescriptions", Condition.CONTAIN, "data warehouse"));
+    assertTrue(fieldDescriptions.contains("\"description_1.text\""), fieldDescriptions);
+    assertTrue(fieldDescriptions.contains("\"description_1.stemmed\""), fieldDescriptions);
+    assertTrue(fieldDescriptions.contains("\"fieldDescriptions\""), fieldDescriptions);
+    assertFalse(fieldDescriptions.contains("wildcard"), fieldDescriptions);
+
+    String editedFieldDescriptions =
+        v3Filter(
+            List.of("dataset", "businessAttribute"),
+            buildCriterion("editedFieldDescriptions", Condition.CONTAIN, "data warehouse"));
+    assertTrue(editedFieldDescriptions.contains("\"description.text\""), editedFieldDescriptions);
+    assertTrue(
+        editedFieldDescriptions.contains("\"description.stemmed\""), editedFieldDescriptions);
+    assertTrue(editedFieldDescriptions.contains("\"description_1.text\""), editedFieldDescriptions);
+    assertTrue(
+        editedFieldDescriptions.contains("\"description_1.stemmed\""), editedFieldDescriptions);
+    assertFalse(
+        editedFieldDescriptions.contains("\"editedFieldDescriptions.text\""),
+        editedFieldDescriptions);
+    assertFalse(editedFieldDescriptions.contains("wildcard"), editedFieldDescriptions);
+  }
+
+  @Test
+  public void testV3ContainOnKeywordLabelStaysOnKeyword() {
+    String query = v3Filter(buildCriterion("fieldPaths", Condition.CONTAIN, "user_id"));
+    assertTrue(query.contains("name_1.keyword"), query);
+    assertTrue(query.contains("wildcard"), query);
+    assertTrue(query.contains("*user_id*"), query);
+    assertFalse(query.contains("description.text"), query);
+  }
+
+  @Test
+  public void testV3DescriptionSupportsExistenceButRejectsFacetsAndSorts() {
+    Filter existenceFilter =
+        new Filter()
+            .setOr(
+                new ConjunctiveCriterionArray(
+                    new ConjunctiveCriterion()
+                        .setAnd(
+                            new CriterionArray(
+                                buildCriterion("hasDescription", Condition.EQUAL, "true")))));
+    String query =
+        SearchRequestHandler.getFilterQuery(
+                operationContext,
+                List.of("dataset"),
+                existenceFilter,
+                new HashMap<>(),
+                QueryFilterRewriteChain.EMPTY,
+                V3_READ_CONFIG.getEntityIndex(),
+                cachedV3Resolver(V3_READ_CONFIG.getEntityIndex()))
+            .toString();
+    assertTrue(query.contains("\"hasDescription\""), query);
+    assertFalse(query.contains("hasDescription.keyword"), query);
+
+    String missingDescription =
+        SearchRequestHandler.getFilterQuery(
+                operationContext,
+                List.of("dataset"),
+                new Filter()
+                    .setOr(
+                        new ConjunctiveCriterionArray(
+                            new ConjunctiveCriterion()
+                                .setAnd(
+                                    new CriterionArray(
+                                        buildCriterion(
+                                            "hasDescription", Condition.EQUAL, "false"))))),
+                new HashMap<>(),
+                QueryFilterRewriteChain.EMPTY,
+                V3_READ_CONFIG.getEntityIndex(),
+                cachedV3Resolver(V3_READ_CONFIG.getEntityIndex()))
+            .toString();
+    assertTrue(missingDescription.contains("must_not"), missingDescription);
+    assertTrue(missingDescription.contains("exists"), missingDescription);
+    // A term query names hasDescription as the field key. Other clauses can also carry
+    // a false value, so the check stays on this field.
+    assertFalse(missingDescription.contains("\"hasDescription\" :"), missingDescription);
+    assertFalse(missingDescription.contains("hasDescription.keyword"), missingDescription);
+
+    String unlabeledFalse =
+        SearchRequestHandler.getFilterQuery(
+                operationContext,
+                List.of("dataset"),
+                new Filter()
+                    .setOr(
+                        new ConjunctiveCriterionArray(
+                            new ConjunctiveCriterion()
+                                .setAnd(
+                                    new CriterionArray(
+                                        buildCriterion("hasRowCount", Condition.EQUAL, "false"))))),
+                new HashMap<>(),
+                QueryFilterRewriteChain.EMPTY,
+                V3_READ_CONFIG.getEntityIndex(),
+                cachedV3Resolver(V3_READ_CONFIG.getEntityIndex()))
+            .toString();
+    assertTrue(unlabeledFalse.contains("\"hasRowCount\""), unlabeledFalse);
+    assertTrue(unlabeledFalse.contains("\"false\""), unlabeledFalse);
+    assertFalse(unlabeledFalse.contains("\"field\" : \"hasRowCount\""), unlabeledFalse);
+
+    SearchRequestHandler handler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            operationContext.getEntityRegistry().getEntitySpec("dataset"),
+            V3_READ_CONFIG,
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            TEST_SEARCH_SERVICE_CONFIG);
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> handler.getAggregationRequest(operationContext, "description", null, 10));
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            handler.getSearchRequest(
+                operationContext.withSearchFlags(flags -> flags.setSkipAggregates(false)),
+                "*",
+                null,
+                null,
+                0,
+                10,
+                List.of("description")));
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            handler.getSearchRequest(
+                operationContext.withSearchFlags(flags -> flags.setSkipAggregates(true)),
+                "*",
+                null,
+                List.of(new SortCriterion().setField("description").setOrder(SortOrder.ASCENDING)),
+                0,
+                10,
+                List.of()));
+  }
+
+  private String v3Filter(Criterion... criteria) {
+    return v3Filter(
+        List.of("dataset"), cachedV3Resolver(V3_READ_CONFIG.getEntityIndex()), criteria);
+  }
+
+  private String v3Filter(List<String> entityTypes, Criterion... criteria) {
+    SearchFieldResolver resolver =
+        new SearchFieldResolver(
+            V3SearchFields.indexGroupSpecs(
+                operationContext.getEntityRegistry(),
+                entityTypes.stream()
+                    .map(operationContext.getEntityRegistry()::getEntitySpec)
+                    .toList()));
+    return v3Filter(entityTypes, resolver, criteria);
+  }
+
+  private String v3Filter(
+      List<String> entityTypes, SearchFieldResolver resolver, Criterion... criteria) {
+    Filter filter =
+        new Filter()
+            .setOr(
+                new ConjunctiveCriterionArray(
+                    new ConjunctiveCriterion().setAnd(new CriterionArray(List.of(criteria)))));
+    return SearchRequestHandler.getFilterQuery(
+            operationContext,
+            entityTypes,
+            filter,
+            new HashMap<>(),
+            QueryFilterRewriteChain.EMPTY,
+            V3_READ_CONFIG.getEntityIndex(),
+            resolver)
+        .toString();
+  }
+
+  private SearchFieldResolver cachedV3Resolver(EntityIndexConfiguration entityIndex) {
+    return SearchRequestHandler.getBuilder(
+            operationContext,
+            operationContext.getEntityRegistry().getEntitySpec("dataset"),
+            testQueryConfig.toBuilder().entityIndex(entityIndex).build(),
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            TEST_SEARCH_SERVICE_CONFIG)
+        .getV3SearchFieldResolver();
+  }
+
+  private static final ElasticSearchConfiguration V3_READ_CONFIG =
+      testQueryConfig.toBuilder()
+          .entityIndex(
+              EntityIndexConfiguration.builder()
+                  .v2(EntityIndexVersionConfiguration.builder().enabled(false).build())
+                  .v3(EntityIndexVersionConfiguration.builder().enabled(true).build())
+                  .build())
+          .build();
+
+  // Schema-field arrays. They are searched through their labels and never fetched: a fetch cannot
+  // cut them short, so a dataset with thousands of fields would send all of them with every hit.
+  private static final Set<String> COLUMN_ARRAYS =
+      Set.of(
+          "fieldPaths",
+          "fieldLabels",
+          "fieldDescriptions",
+          "editedFieldDescriptions",
+          "fieldTags",
+          "editedFieldTags",
+          "fieldGlossaryTerms",
+          "editedFieldGlossaryTerms");
+
+  /**
+   * V3 runs the Stage 1 query, with a dis_max root, where V2 runs the V2 query. V3 finds matched
+   * fields from the fetched values instead of highlighting.
+   */
+  @Test
+  public void testV3FullTextQueryUsesStage1() {
+    OperationContext fulltext = operationContext.withSearchFlags(flags -> flags.setFulltext(true));
+    for (String query :
+        List.of("test query", "\"test query\"", STRUCTURED_QUERY_PREFIX + "name:test")) {
+      SearchSourceBuilder v2 = getDatasetSearchSource(fulltext, testQueryConfig, query);
+      SearchSourceBuilder v3 = getDatasetSearchSource(fulltext, V3_READ_CONFIG, query);
+      assertTrue(relevancyQuery(v2) instanceof BoolQueryBuilder, query);
+      assertTrue(relevancyQuery(v3) instanceof DisMaxQueryBuilder, query);
+      assertNotNull(v2.highlighter(), query);
+      assertNull(v3.highlighter(), query);
+    }
+  }
+
+  /**
+   * Deliberate V3 change: the full-text query reads the shared fields, and matched fields come from
+   * the fetched root values that feed them, so V3 sets no highlighter. Column fields index as
+   * degree 1 and are not in an unqualified query, and their arrays are never fetched: a fetch
+   * cannot cut them short, so a dataset with thousands of fields would send all of them with every
+   * hit.
+   */
+  @Test
+  public void testV3FullTextQueryReadsSharedFieldsWithoutFetchingColumnArrays() {
+    OperationContext fulltext =
+        operationContext.withSearchFlags(
+            flags -> flags.setFulltext(true).setSkipHighlighting(false));
+    SearchSourceBuilder v3 = getDatasetSearchSource(fulltext, V3_READ_CONFIG, "test query");
+
+    String query = v3.query().toString();
+    assertTrue(query.contains("name.text"), query);
+    assertFalse(query.contains("name_1.text"), query);
+    assertFalse(query.contains("name_1.stemmed"), query);
+    assertFalse(query.contains("_search."), query);
+    assertFalse(query.contains(".delimited"), query);
+    assertNull(v3.highlighter());
+    Set<String> fetched = Set.of(v3.fetchSource().includes());
+    assertTrue(fetched.containsAll(Set.of("urn", "name", "description")), fetched.toString());
+    assertTrue(Collections.disjoint(fetched, COLUMN_ARRAYS), fetched.toString());
+    assertTrue(
+        fetched.stream().noneMatch(field -> field.startsWith("_search")), fetched.toString());
+    // Structured property values are searched, never fetched for matched fields
+    assertTrue(
+        fetched.stream().noneMatch(field -> field.startsWith("structuredProperties")),
+        fetched.toString());
+  }
+
+  /** V3 fetches no matched-field sources when highlighting is skipped or configured off. */
+  @Test
+  public void testV3MatchedFieldSourcesFollowHighlightSettings() {
+    OperationContext skipped =
+        operationContext.withSearchFlags(
+            flags -> flags.setFulltext(true).setSkipHighlighting(true));
+    assertEquals(
+        Set.of(getDatasetSearchSource(skipped, V3_READ_CONFIG, "test").fetchSource().includes()),
+        Set.of("urn"));
+
+    // Naming a column array does not fetch it. editedName is labeled name and stored on the
+    // aspect, so highlighting name fetches that path. copy_to does not put it in name's _source.
+    OperationContext custom =
+        operationContext.withSearchFlags(
+            flags ->
+                flags
+                    .setFulltext(true)
+                    .setSkipHighlighting(false)
+                    .setCustomHighlightingFields(
+                        new StringArray(
+                            List.of("name", "notSearched", "fieldPaths", "fieldDescriptions"))));
+    assertEquals(
+        Set.of(getDatasetSearchSource(custom, V3_READ_CONFIG, "test").fetchSource().includes()),
+        Set.of("urn", "name", "_aspects.editableDatasetProperties.editedName"));
+    // V2 highlight fields name subfields, which V3 reads from their root field
+    OperationContext v2Subfields =
+        operationContext.withSearchFlags(
+            flags ->
+                flags
+                    .setFulltext(true)
+                    .setSkipHighlighting(false)
+                    .setCustomHighlightingFields(
+                        new StringArray(
+                            List.of("name.delimited", "name.keyword", "description.*"))));
+    assertEquals(
+        Set.of(
+            getDatasetSearchSource(v2Subfields, V3_READ_CONFIG, "test").fetchSource().includes()),
+        Set.of(
+            "urn",
+            "name",
+            "description",
+            "_aspects.editableDatasetProperties.editedName",
+            "_aspects.editableDatasetProperties.editedDescription"));
+
+    CustomSearchConfiguration highlightConfig =
+        CustomSearchConfiguration.builder()
+            .fieldConfigurations(
+                Map.of(
+                    "names",
+                    FieldConfiguration.builder()
+                        .highlightFields(HighlightFields.builder().replace(List.of("name")).build())
+                        .build(),
+                    // V2 highlight fields name subfields, and a field the query does not read
+                    // cannot match
+                    "subfields",
+                    FieldConfiguration.builder()
+                        .highlightFields(
+                            HighlightFields.builder()
+                                .replace(List.of("name.delimited", "notSearched"))
+                                .build())
+                        .build(),
+                    "off",
+                    FieldConfiguration.builder()
+                        .highlightFields(HighlightFields.builder().enabled(false).build())
+                        .build(),
+                    // As the bundled excludeColumnHighlight configuration writes it, which
+                    // changes nothing on V3, where the columns' arrays are never fetched
+                    "noColumns",
+                    FieldConfiguration.builder()
+                        .highlightFields(
+                            HighlightFields.builder()
+                                .remove(List.of("fieldPaths", "fieldPaths.*"))
+                                .build())
+                        .build()))
+            .build();
+    for (Map.Entry<String, Set<String>> expected :
+        Map.of(
+                "names",
+                Set.of("urn", "name", "_aspects.editableDatasetProperties.editedName"),
+                "subfields",
+                Set.of("urn", "name", "_aspects.editableDatasetProperties.editedName"),
+                "off",
+                Set.of("urn"))
+            .entrySet()) {
+      OperationContext configured =
+          operationContext.withSearchFlags(
+              flags ->
+                  flags
+                      .setFulltext(true)
+                      .setSkipHighlighting(false)
+                      .setFieldConfiguration(expected.getKey()));
+      SearchSourceBuilder source =
+          getDatasetSearchSource(configured, V3_READ_CONFIG, highlightConfig, "test");
+      assertEquals(Set.of(source.fetchSource().includes()), expected.getValue(), expected.getKey());
+    }
+
+    OperationContext noColumns =
+        operationContext.withSearchFlags(
+            flags ->
+                flags
+                    .setFulltext(true)
+                    .setSkipHighlighting(false)
+                    .setFieldConfiguration("noColumns"));
+    Set<String> fetched =
+        Set.of(
+            getDatasetSearchSource(noColumns, V3_READ_CONFIG, highlightConfig, "test")
+                .fetchSource()
+                .includes());
+    assertTrue(Collections.disjoint(fetched, COLUMN_ARRAYS), fetched.toString());
+    assertTrue(fetched.containsAll(Set.of("urn", "name", "description")), fetched.toString());
+
+    // A query of only stop words can match no field, so nothing is fetched for it
+    OperationContext highlighting =
+        operationContext.withSearchFlags(
+            flags -> flags.setFulltext(true).setSkipHighlighting(false));
+    assertEquals(
+        Set.of(
+            getDatasetSearchSource(highlighting, V3_READ_CONFIG, "the").fetchSource().includes()),
+        Set.of("urn"));
+  }
+
+  /**
+   * Of other, V3 matched fields fetch only what names or tags an entity: a document's text,
+   * semantic text and custom properties are searched but never fetched, even when highlighting
+   * names them. Document title is labeled name, so the fetched value is the aspect field that
+   * stores it. copy_to does not put that value in the name field's _source.
+   */
+  @Test
+  public void testV3DocumentSearchFetchesNoFreeText() {
+    Set<String> freeText = Set.of("text", "semanticText", "customProperties");
+    SearchRequestHandler handler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            operationContext.getEntityRegistry().getEntitySpec("document"),
+            V3_READ_CONFIG,
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            TEST_SEARCH_SERVICE_CONFIG);
+    OperationContext fulltext =
+        operationContext.withSearchFlags(
+            flags -> flags.setFulltext(true).setSkipHighlighting(false));
+    SearchSourceBuilder source =
+        handler.getSearchRequest(fulltext, "runbook", null, null, 0, 10, List.of()).source();
+
+    String query = source.query().toString();
+    assertTrue(query.contains("other.text"), query);
+    Set<String> fetched = Set.of(source.fetchSource().includes());
+    assertTrue(fetched.contains("urn"), fetched.toString());
+    assertTrue(fetched.contains("_aspects.documentInfo.title"), fetched.toString());
+    assertFalse(fetched.contains("title"), fetched.toString());
+    assertFalse(fetched.contains("name"), fetched.toString());
+    assertTrue(Collections.disjoint(fetched, freeText), fetched.toString());
+
+    OperationContext naming =
+        operationContext.withSearchFlags(
+            flags ->
+                flags
+                    .setFulltext(true)
+                    .setSkipHighlighting(false)
+                    .setCustomHighlightingFields(
+                        new StringArray(List.of("name", "text", "customProperties"))));
+    assertEquals(
+        Set.of(
+            handler
+                .getSearchRequest(naming, "runbook", null, null, 0, 10, List.of())
+                .source()
+                .fetchSource()
+                .includes()),
+        Set.of("urn", "_aspects.documentInfo.title"));
+  }
+
+  /**
+   * On V3 the fields a hit matched on come from its fetched values and the search input; a
+   * structured query or a missing input reports none.
+   */
+  @Test
+  public void testV3ExtractResultFindsMatchedFieldsFromSource() {
+    SearchRequestHandler handler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            operationContext.getEntityRegistry().getEntitySpec(DATASET_ENTITY_NAME),
+            V3_READ_CONFIG,
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            TEST_SEARCH_SERVICE_CONFIG);
+    SearchResponse response = mock(SearchResponse.class);
+    SearchHits hits = mock(SearchHits.class);
+    when(response.getHits()).thenReturn(hits);
+    when(hits.getTotalHits()).thenReturn(new TotalHits(1L, TotalHits.Relation.EQUAL_TO));
+    SearchHit hit = mock(SearchHit.class);
+    // A wide schema's column array, which the engine may still return (as an extra field to
+    // fetch) but which matching never reads
+    List<Object> fieldPaths =
+        new AbstractList<>() {
+          @Override
+          public Object get(int index) {
+            throw new AssertionError("Matched fields read a column array");
+          }
+
+          @Override
+          public int size() {
+            return 5000;
+          }
+        };
+    when(hit.getSourceAsMap())
+        .thenReturn(
+            Map.of(
+                "urn",
+                "urn:li:dataset:(urn:li:dataPlatform:hive,db.revenue,PROD)",
+                "name",
+                "orders table",
+                "description",
+                "daily revenue",
+                "fieldPaths",
+                fieldPaths));
+    when(hits.getHits()).thenReturn(new SearchHit[] {hit});
+    OperationContext highlighting =
+        operationContext.withSearchFlags(
+            flags -> flags.setFulltext(true).setSkipHighlighting(false));
+
+    MatchedFieldArray matched =
+        handler
+            .extractResult(highlighting, response, null, 0, 10, "orders")
+            .getEntities()
+            .get(0)
+            .getMatchedFields();
+    assertEquals(matched.size(), 1, matched.toString());
+    assertEquals(matched.get(0).getName(), "name");
+    assertEquals(matched.get(0).getValue(), "orders table");
+    // Scrolling finds them the same way
+    when(hit.getSortValues()).thenReturn(new Object[] {"orders"});
+    assertEquals(
+        handler
+            .extractScrollResult(highlighting, response, null, "5m", 10, true, "orders")
+            .getEntities()
+            .get(0)
+            .getMatchedFields(),
+        matched);
+
+    // A search that is not full text runs a structured query too
+    assertTrue(
+        handler
+            .extractResult(
+                highlighting.withSearchFlags(flags -> flags.setFulltext(false)),
+                response,
+                null,
+                0,
+                10,
+                "orders")
+            .getEntities()
+            .get(0)
+            .getMatchedFields()
+            .isEmpty());
+    for (String input : Arrays.asList(STRUCTURED_QUERY_PREFIX + "name:orders", null)) {
+      assertTrue(
+          handler
+              .extractResult(highlighting, response, null, 0, 10, input)
+              .getEntities()
+              .get(0)
+              .getMatchedFields()
+              .isEmpty(),
+          String.valueOf(input));
+    }
+  }
+
+  private static QueryBuilder relevancyQuery(SearchSourceBuilder source) {
+    return ((FunctionScoreQueryBuilder) ((BoolQueryBuilder) source.query()).must().get(0)).query();
+  }
+
+  private SearchSourceBuilder getDatasetSearchSource(
+      OperationContext opContext, ElasticSearchConfiguration config, String query) {
+    return getDatasetSearchSource(opContext, config, null, query);
+  }
+
+  private SearchSourceBuilder getDatasetSearchSource(
+      OperationContext opContext,
+      ElasticSearchConfiguration config,
+      CustomSearchConfiguration customConfig,
+      String query) {
+    return SearchRequestHandler.getBuilder(
+            operationContext,
+            operationContext.getEntityRegistry().getEntitySpec(DATASET_ENTITY_NAME),
+            config,
+            customConfig,
+            QueryFilterRewriteChain.EMPTY,
+            TEST_SEARCH_SERVICE_CONFIG)
+        .getSearchRequest(opContext, query, null, null, 0, 10, List.of())
+        .source();
+  }
+
+  @Test(expectedExceptions = IllegalArgumentException.class)
+  public void testInvalidStructuredProperty() {
+    AspectRetriever aspectRetriever = mock(AspectRetriever.class);
+    Map<Urn, Map<String, Aspect>> aspectResponse = new HashMap<>();
+    DataMap statusData = new DataMap();
+    statusData.put("removed", true);
+    Aspect status = new Aspect(statusData);
+    Urn structPropUrn = StructuredPropertyUtils.toURNFromFQN("under.scores.and.dots.make_a_mess");
+    aspectResponse.put(structPropUrn, ImmutableMap.of(STATUS_ASPECT_NAME, status));
+    when(aspectRetriever.getLatestAspectObjects(
+            any(OperationFingerprint.class),
+            eq(Collections.singleton(structPropUrn)),
+            eq(ImmutableSet.of(STATUS_ASPECT_NAME))))
+        .thenReturn(aspectResponse);
+    OperationContext mockRetrieverContext =
+        TestOperationContexts.systemContextNoSearchAuthorization(
+            RetrieverContext.builder()
+                .aspectRetriever(aspectRetriever)
+                .cachingAspectRetriever(TestOperationContexts.emptyActiveUsersAspectRetriever(null))
+                .graphRetriever(mock(GraphRetriever.class))
+                .searchRetriever(mock(SearchRetriever.class))
+                .build());
+
+    Criterion structuredPropCriterion =
+        buildExistsCriterion("structuredProperties.under.scores.and.dots.make_a_mess");
+
+    CriterionArray criterionArray = new CriterionArray();
+    criterionArray.add(structuredPropCriterion);
+
+    ConjunctiveCriterion conjunctiveCriterion = new ConjunctiveCriterion();
+    conjunctiveCriterion.setAnd(criterionArray);
+
+    ConjunctiveCriterionArray conjunctiveCriterionArray = new ConjunctiveCriterionArray();
+    conjunctiveCriterionArray.add(conjunctiveCriterion);
+
+    Filter filter = new Filter();
+    filter.setOr(conjunctiveCriterionArray);
+
+    BoolQueryBuilder test =
+        SearchRequestHandler.getFilterQuery(
+            mockRetrieverContext.withSearchFlags(flags -> flags.setFulltext(false)),
+            Collections.emptyList(),
+            filter,
+            new HashMap<>(),
+            QueryFilterRewriteChain.EMPTY);
+  }
+
+  @Test
+  public void testQueryByDefault() {
+    final Set<String> COMMON =
+        Set.of(
+            "container",
+            "fieldDescriptions",
+            "description",
+            "platform",
+            "fieldPaths",
+            "editedFieldGlossaryTerms",
+            "editedFieldDescriptions",
+            "fieldTags",
+            "id",
+            "editedDescription",
+            "qualifiedName",
+            "domains",
+            "platformInstance",
+            "tags",
+            "urn",
+            "customProperties",
+            "fieldGlossaryTerms",
+            "editedName",
+            "name",
+            "fieldLabels",
+            "glossaryTerms",
+            "editedFieldTags",
+            "displayName",
+            "title",
+            "applications",
+            "dataProduct");
+
+    Map<EntityType, Set<String>> expectedQueryByDefault =
+        ImmutableMap.<EntityType, Set<String>>builder()
+            .put(
+                EntityType.DASHBOARD,
+                Stream.concat(COMMON.stream(), Stream.of("tool")).collect(Collectors.toSet()))
+            .put(
+                EntityType.CHART,
+                Stream.concat(COMMON.stream(), Stream.of("tool")).collect(Collectors.toSet()))
+            .put(
+                EntityType.MLMODEL,
+                Stream.concat(COMMON.stream(), Stream.of("type")).collect(Collectors.toSet()))
+            .put(
+                EntityType.MLFEATURE_TABLE,
+                Stream.concat(COMMON.stream(), Stream.of("features", "primaryKeys"))
+                    .collect(Collectors.toSet()))
+            .put(
+                EntityType.MLFEATURE,
+                Stream.concat(COMMON.stream(), Stream.of("featureNamespace"))
+                    .collect(Collectors.toSet()))
+            .put(
+                EntityType.MLPRIMARY_KEY,
+                Stream.concat(COMMON.stream(), Stream.of("featureNamespace"))
+                    .collect(Collectors.toSet()))
+            .put(
+                EntityType.DATA_FLOW,
+                Stream.concat(COMMON.stream(), Stream.of("cluster", "orchestrator", "flowId"))
+                    .collect(Collectors.toSet()))
+            .put(
+                EntityType.DATA_JOB,
+                Stream.concat(COMMON.stream(), Stream.of("jobId")).collect(Collectors.toSet()))
+            .put(
+                EntityType.GLOSSARY_TERM,
+                Stream.concat(
+                        COMMON.stream(),
+                        Stream.of("values", "parentNode", "relatedTerms", "definition"))
+                    .collect(Collectors.toSet()))
+            .put(
+                EntityType.GLOSSARY_NODE,
+                Stream.concat(COMMON.stream(), Stream.of("definition", "parentNode"))
+                    .collect(Collectors.toSet()))
+            .put(
+                EntityType.CORP_USER,
+                Stream.concat(
+                        COMMON.stream(),
+                        Stream.of(
+                            "skills", "teams", "ldap", "fullName", "email", "slackDisplayName"))
+                    .collect(Collectors.toSet()))
+            .put(
+                EntityType.DOMAIN,
+                Stream.concat(COMMON.stream(), Stream.of("parentDomain"))
+                    .collect(Collectors.toSet()))
+            .put(
+                EntityType.DATA_PRODUCT,
+                Stream.concat(COMMON.stream(), Stream.of("parentDataProduct"))
+                    .collect(Collectors.toSet()))
+            .put(
+                EntityType.SCHEMA_FIELD,
+                Stream.concat(COMMON.stream(), Stream.of("schemaFieldAliases", "parent"))
+                    .collect(Collectors.toSet()))
+            .put(
+                EntityType.DATA_PROCESS_INSTANCE,
+                Stream.concat(
+                        COMMON.stream(), Stream.of("parentInstance", "parentTemplate", "status"))
+                    .collect(Collectors.toSet()))
+            .put(
+                EntityType.DOCUMENT,
+                Stream.concat(
+                        COMMON.stream(),
+                        Stream.of(
+                            "parentDocument",
+                            "relatedAssets",
+                            "relatedDocuments",
+                            "text",
+                            "semanticText"))
+                    .collect(Collectors.toSet()))
+            .put(
+                EntityType.METRIC,
+                Stream.concat(COMMON.stream(), Stream.of("path", "semanticModel", "parentMetric"))
+                    .collect(Collectors.toSet()))
+            .put(
+                EntityType.SEMANTIC_MODEL,
+                Stream.concat(COMMON.stream(), Stream.of("path")).collect(Collectors.toSet()))
+            .build();
+
+    for (String entityName : parseCsv(DEFAULT_SEARCH_ENTITY_TYPES)) {
+      EntityType entityType = EntityTypeMapper.getType(entityName);
+      Set<String> expectedEntityQueryByDefault =
+          expectedQueryByDefault.getOrDefault(entityType, COMMON);
+      assertFalse(expectedEntityQueryByDefault.isEmpty());
+
+      EntitySpec entitySpec = operationContext.getEntityRegistry().getEntitySpec(entityName);
+      SearchRequestHandler handler =
+          SearchRequestHandler.getBuilder(
+              operationContext,
+              entitySpec,
+              testQueryConfig,
+              null,
+              QueryFilterRewriteChain.EMPTY,
+              TEST_SEARCH_SERVICE_CONFIG);
+
+      Set<String> unexpected = new HashSet<>(handler.getDefaultQueryFieldNames());
+      unexpected.removeAll(expectedEntityQueryByDefault);
+
+      assertTrue(
+          unexpected.isEmpty(),
+          String.format(
+              "Consider whether these field(s) for entity %s should be included for general search. Fields: %s If yes, please update the test expectations. If no, please annotate the PDL model with \"queryByDefault\": false",
+              entityType, unexpected));
+    }
+  }
+
+  @Test
+  public void testFilterLatestVersions() {
+    final Criterion filterCriterion =
+        buildCriterion("platform", Condition.EQUAL, "mysql", "bigquery");
+
+    final BoolQueryBuilder testQuery =
+        getQuery(
+            filterCriterion,
+            operationContext.getEntityRegistry().getEntitySpec(DATASET_ENTITY_NAME),
+            true);
+
+    List<QueryBuilder> isLatestQueries =
+        testQuery.filter().stream()
+            .filter(filter -> filter instanceof BoolQueryBuilder)
+            .flatMap(filter -> ((BoolQueryBuilder) filter).must().stream())
+            .filter(must -> must instanceof BoolQueryBuilder)
+            .flatMap(must -> ((BoolQueryBuilder) must).should().stream())
+            .filter(should -> should instanceof BoolQueryBuilder)
+            .flatMap(
+                should -> {
+                  BoolQueryBuilder boolShould = (BoolQueryBuilder) should;
+
+                  // Get isLatest: true term queries
+                  Stream<QueryBuilder> filterQueries =
+                      boolShould.filter().stream()
+                          .filter(
+                              f ->
+                                  f instanceof TermQueryBuilder
+                                      && ((TermQueryBuilder) f).fieldName().equals("isLatest"));
+
+                  // Get isLatest exists queries
+                  Stream<QueryBuilder> existsQueries =
+                      boolShould.mustNot().stream()
+                          .filter(mn -> mn instanceof BoolQueryBuilder)
+                          .flatMap(mn -> ((BoolQueryBuilder) mn).must().stream())
+                          .filter(
+                              mq ->
+                                  mq instanceof ExistsQueryBuilder
+                                      && ((ExistsQueryBuilder) mq).fieldName().equals("isLatest"));
+
+                  return Stream.concat(filterQueries, existsQueries);
+                })
+            .collect(Collectors.toList());
+
+    assertEquals(isLatestQueries.size(), 2, "Expected to find two queries");
+    final TermQueryBuilder termQueryBuilder = (TermQueryBuilder) isLatestQueries.get(0);
+    assertEquals(termQueryBuilder.fieldName(), "isLatest");
+    Set<Boolean> values = new HashSet<>();
+    values.add((Boolean) termQueryBuilder.value());
+
+    assertEquals(values.size(), 1, "Expected only true value.");
+    assertTrue(values.contains(true));
+    final ExistsQueryBuilder existsQueryBuilder = (ExistsQueryBuilder) isLatestQueries.get(1);
+    assertEquals(existsQueryBuilder.fieldName(), "isLatest");
+  }
+
+  @Test
+  public void testNoFilterLatestVersions() {
+    final Criterion filterCriterion =
+        buildCriterion("platform", Condition.EQUAL, "mysql", "bigquery");
+
+    final BoolQueryBuilder testQuery =
+        getQuery(
+            filterCriterion,
+            operationContext.getEntityRegistry().getEntitySpec(DATASET_ENTITY_NAME),
+            false);
+
+    List<QueryBuilder> isLatestQueries =
+        testQuery.filter().stream()
+            .filter(filter -> filter instanceof BoolQueryBuilder)
+            .flatMap(filter -> ((BoolQueryBuilder) filter).must().stream())
+            .filter(must -> must instanceof BoolQueryBuilder)
+            .flatMap(must -> ((BoolQueryBuilder) must).should().stream())
+            .filter(should -> should instanceof BoolQueryBuilder)
+            .flatMap(
+                should -> {
+                  BoolQueryBuilder boolShould = (BoolQueryBuilder) should;
+
+                  // Get isLatest: true term queries
+                  Stream<QueryBuilder> filterQueries =
+                      boolShould.filter().stream()
+                          .filter(
+                              f ->
+                                  f instanceof TermQueryBuilder
+                                      && ((TermQueryBuilder) f).fieldName().equals("isLatest"));
+
+                  // Get isLatest exists queries
+                  Stream<QueryBuilder> existsQueries =
+                      boolShould.mustNot().stream()
+                          .filter(mn -> mn instanceof BoolQueryBuilder)
+                          .flatMap(mn -> ((BoolQueryBuilder) mn).must().stream())
+                          .filter(
+                              mq ->
+                                  mq instanceof ExistsQueryBuilder
+                                      && ((ExistsQueryBuilder) mq).fieldName().equals("isLatest"));
+
+                  return Stream.concat(filterQueries, existsQueries);
+                })
+            .collect(Collectors.toList());
+
+    assertTrue(isLatestQueries.isEmpty(), "Expected to find no queries");
+  }
+
+  @Test
+  public void testAggregationFilterLatestVersions() {
+    final Criterion filterCriterion =
+        buildCriterion("platform", Condition.EQUAL, "mysql", "bigquery");
+
+    final BoolQueryBuilder testQuery =
+        getAggregationQuery(
+            filterCriterion,
+            operationContext.getEntityRegistry().getEntitySpec(DATASET_ENTITY_NAME),
+            true);
+
+    List<QueryBuilder> isLatestQueries =
+        testQuery.must().stream()
+            .filter(must -> must instanceof BoolQueryBuilder)
+            .flatMap(must -> ((BoolQueryBuilder) must).should().stream())
+            .filter(should -> should instanceof BoolQueryBuilder)
+            .flatMap(
+                should -> {
+                  BoolQueryBuilder boolShould = (BoolQueryBuilder) should;
+
+                  // Get isLatest: true term queries
+                  Stream<QueryBuilder> filterQueries =
+                      boolShould.filter().stream()
+                          .filter(
+                              f ->
+                                  f instanceof TermQueryBuilder
+                                      && ((TermQueryBuilder) f).fieldName().equals("isLatest"));
+
+                  // Get isLatest exists queries
+                  Stream<QueryBuilder> existsQueries =
+                      boolShould.mustNot().stream()
+                          .filter(mn -> mn instanceof BoolQueryBuilder)
+                          .flatMap(mn -> ((BoolQueryBuilder) mn).must().stream())
+                          .filter(
+                              mq ->
+                                  mq instanceof ExistsQueryBuilder
+                                      && ((ExistsQueryBuilder) mq).fieldName().equals("isLatest"));
+
+                  return Stream.concat(filterQueries, existsQueries);
+                })
+            .collect(Collectors.toList());
+
+    assertEquals(isLatestQueries.size(), 2, "Expected to find two queries");
+    final TermQueryBuilder termQueryBuilder = (TermQueryBuilder) isLatestQueries.get(0);
+    assertEquals(termQueryBuilder.fieldName(), "isLatest");
+    Set<Boolean> values = new HashSet<>();
+    values.add((Boolean) termQueryBuilder.value());
+
+    assertEquals(values.size(), 1, "Expected only true value.");
+    assertTrue(values.contains(true));
+    final ExistsQueryBuilder existsQueryBuilder = (ExistsQueryBuilder) isLatestQueries.get(1);
+    assertEquals(existsQueryBuilder.fieldName(), "isLatest");
+  }
+
+  @Test
+  public void testAggregationNoFilterLatestVersions() {
+    final Criterion filterCriterion =
+        buildCriterion("platform", Condition.EQUAL, "mysql", "bigquery");
+
+    final BoolQueryBuilder testQuery =
+        getAggregationQuery(
+            filterCriterion,
+            operationContext.getEntityRegistry().getEntitySpec(DATASET_ENTITY_NAME),
+            false);
+
+    List<QueryBuilder> isLatestQueries =
+        testQuery.must().stream()
+            .filter(must -> must instanceof BoolQueryBuilder)
+            .flatMap(must -> ((BoolQueryBuilder) must).should().stream())
+            .filter(should -> should instanceof BoolQueryBuilder)
+            .flatMap(
+                should -> {
+                  BoolQueryBuilder boolShould = (BoolQueryBuilder) should;
+
+                  // Get isLatest: true term queries
+                  Stream<QueryBuilder> filterQueries =
+                      boolShould.filter().stream()
+                          .filter(
+                              f ->
+                                  f instanceof TermQueryBuilder
+                                      && ((TermQueryBuilder) f).fieldName().equals("isLatest"));
+
+                  // Get isLatest exists queries
+                  Stream<QueryBuilder> existsQueries =
+                      boolShould.mustNot().stream()
+                          .filter(mn -> mn instanceof BoolQueryBuilder)
+                          .flatMap(mn -> ((BoolQueryBuilder) mn).must().stream())
+                          .filter(
+                              mq ->
+                                  mq instanceof ExistsQueryBuilder
+                                      && ((ExistsQueryBuilder) mq).fieldName().equals("isLatest"));
+
+                  return Stream.concat(filterQueries, existsQueries);
+                })
+            .collect(Collectors.toList());
+
+    assertTrue(isLatestQueries.isEmpty(), "Expected to find no queries");
+  }
+
+  @Test
+  public void testApplyResultLimitInSearchRequest() {
+    // Create a custom SearchConfiguration with specific limits
+    SearchServiceConfiguration limitConfig =
+        TEST_SEARCH_SERVICE_CONFIG.toBuilder()
+            .limit(
+                new LimitConfig()
+                    .setResults(
+                        new ResultsLimitConfig().setMax(40).setApiDefault(40).setStrict(false)))
+            .build();
+
+    // Create a handler with our test configuration
+    SearchRequestHandler limitHandler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            TestEntitySpecBuilder.getSpec(),
+            TEST_OS_SEARCH_CONFIG,
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            limitConfig);
+
+    // Test with count below limit
+    int requestedSize = 30;
+    SearchRequest searchRequest =
+        limitHandler.getSearchRequest(
+            operationContext.withSearchFlags(flags -> flags.setFulltext(false)),
+            "test query",
+            null,
+            null,
+            0,
+            requestedSize,
+            List.of());
+
+    SearchSourceBuilder sourceBuilder = searchRequest.source();
+
+    // Verify the requested size was used (not limited)
+    assertEquals(sourceBuilder.size(), requestedSize);
+
+    // Test with count above limit (non-strict)
+    requestedSize = 100;
+    searchRequest =
+        limitHandler.getSearchRequest(
+            operationContext.withSearchFlags(flags -> flags.setFulltext(false)),
+            "test query",
+            null,
+            null,
+            0,
+            requestedSize,
+            List.of());
+
+    sourceBuilder = searchRequest.source();
+
+    // Verify the max limit was applied
+    assertEquals(sourceBuilder.size(), 40);
+  }
+
+  @Test
+  public void testApplyResultLimitWithStrictConfiguration() {
+    // Create a SearchConfiguration with strict limits
+    SearchServiceConfiguration strictConfig =
+        TEST_SEARCH_SERVICE_CONFIG.toBuilder()
+            .limit(
+                LimitConfig.builder()
+                    .results(new ResultsLimitConfig().setMax(30).setApiDefault(30).setStrict(true))
+                    .build())
+            .build();
+
+    // Create a handler with our strict configuration
+    SearchRequestHandler strictHandler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            TestEntitySpecBuilder.getSpec(),
+            TEST_OS_SEARCH_CONFIG,
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            strictConfig);
+
+    // Test with count at the limit
+    int requestedSize = 30;
+    SearchRequest searchRequest =
+        strictHandler.getSearchRequest(
+            operationContext.withSearchFlags(flags -> flags.setFulltext(false)),
+            "test query",
+            null,
+            null,
+            0,
+            requestedSize,
+            List.of());
+
+    SearchSourceBuilder sourceBuilder = searchRequest.source();
+
+    // Verify exact limit was used
+    assertEquals(sourceBuilder.size(), 30);
+
+    // Test with count exceeding the limit in strict mode
+    // This should throw an IllegalArgumentException
+    try {
+      requestedSize = 50;
+      strictHandler.getSearchRequest(
+          operationContext.withSearchFlags(flags -> flags.setFulltext(false)),
+          "test query",
+          null,
+          null,
+          0,
+          requestedSize,
+          List.of());
+      Assert.fail(
+          "Should throw IllegalArgumentException when count exceeds limit with strict config");
+    } catch (IllegalArgumentException e) {
+      // Expected exception
+      assertTrue(e.getMessage().contains("Result count exceeds limit of 30"));
+    }
+  }
+
+  @Test
+  public void testApplyResultLimitInFilterRequest() {
+    // Create a SearchConfiguration with specific limits
+    SearchServiceConfiguration limitConfig =
+        TEST_SEARCH_SERVICE_CONFIG.toBuilder()
+            .limit(
+                new LimitConfig()
+                    .setResults(
+                        new ResultsLimitConfig().setMax(25).setApiDefault(25).setStrict(false)))
+            .build();
+
+    // Create a handler with our test configuration
+    SearchRequestHandler limitHandler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            TestEntitySpecBuilder.getSpec(),
+            TEST_OS_SEARCH_CONFIG,
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            limitConfig);
+
+    // Create a filter
+    Criterion filterCriterion = buildCriterion("platform", Condition.EQUAL, "mysql");
+    Filter filter =
+        new Filter()
+            .setOr(
+                new ConjunctiveCriterionArray(
+                    new ConjunctiveCriterion()
+                        .setAnd(new CriterionArray(ImmutableList.of(filterCriterion)))));
+
+    // Test with size below limit
+    int requestedSize = 20;
+    SearchRequest filterRequest =
+        limitHandler.getFilterRequest(operationContext, filter, null, 0, requestedSize);
+
+    SearchSourceBuilder sourceBuilder = filterRequest.source();
+
+    // Verify the requested size was used (not limited)
+    assertEquals(sourceBuilder.size(), requestedSize);
+
+    // Test with size above limit
+    requestedSize = 50;
+    filterRequest = limitHandler.getFilterRequest(operationContext, filter, null, 0, requestedSize);
+
+    sourceBuilder = filterRequest.source();
+
+    // Verify the max limit was applied
+    assertEquals(sourceBuilder.size(), 25);
+  }
+
+  @Test
+  public void testExtractResultWithNullSize() {
+    // Create a mock SearchResponse
+    SearchResponse mockResponse = mock(SearchResponse.class);
+    SearchHits mockHits = mock(SearchHits.class);
+
+    when(mockResponse.getHits()).thenReturn(mockHits);
+    when(mockHits.getTotalHits()).thenReturn(new TotalHits(100L, TotalHits.Relation.EQUAL_TO));
+    when(mockHits.getHits()).thenReturn(new SearchHit[0]);
+    when(mockResponse.getAggregations()).thenReturn(null);
+    when(mockResponse.getSuggest()).thenReturn(null);
+
+    SearchRequestHandler handler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            TestEntitySpecBuilder.getSpec(),
+            testQueryConfig,
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            TEST_SEARCH_SERVICE_CONFIG);
+
+    // Test with null size
+    SearchResult result = handler.extractResult(operationContext, mockResponse, null, 0, null);
+
+    // Should use the default from the service config
+    assertEquals(
+        result.getPageSize().intValue(),
+        TEST_SEARCH_SERVICE_CONFIG.getLimit().getResults().getApiDefault());
+    assertEquals(result.getFrom().intValue(), 0);
+    assertEquals(result.getNumEntities().intValue(), 100);
+  }
+
+  @Test
+  public void testExtractResultWithLimitConfiguration() {
+    // Create a custom SearchServiceConfiguration with specific limits
+    SearchServiceConfiguration limitConfig =
+        TEST_SEARCH_SERVICE_CONFIG.toBuilder()
+            .limit(
+                LimitConfig.builder()
+                    .results(
+                        ResultsLimitConfig.builder().max(50).apiDefault(30).strict(false).build())
+                    .build())
+            .build();
+
+    SearchRequestHandler limitHandler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            TestEntitySpecBuilder.getSpec(),
+            testQueryConfig,
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            limitConfig);
+
+    // Create a mock SearchResponse
+    SearchResponse mockResponse = mock(SearchResponse.class);
+    SearchHits mockHits = mock(SearchHits.class);
+
+    when(mockResponse.getHits()).thenReturn(mockHits);
+    when(mockHits.getTotalHits()).thenReturn(new TotalHits(200L, TotalHits.Relation.EQUAL_TO));
+    when(mockHits.getHits()).thenReturn(new SearchHit[0]);
+    when(mockResponse.getAggregations()).thenReturn(null);
+    when(mockResponse.getSuggest()).thenReturn(null);
+
+    // Test with size above limit
+    SearchResult result =
+        limitHandler.extractResult(
+            operationContext, mockResponse, null, 0, 100); // Requesting 100, but max is 50
+
+    // Should be limited to 30, applying default
+    assertEquals(result.getPageSize().intValue(), 30);
+
+    // Test with size below limit
+    result = limitHandler.extractResult(operationContext, mockResponse, null, 0, 25);
+
+    // Should use the requested size
+    assertEquals(result.getPageSize().intValue(), 25);
+
+    // Test with null size - should use API default
+    result = limitHandler.extractResult(operationContext, mockResponse, null, 0, null);
+
+    // Should use the API default (30)
+    assertEquals(result.getPageSize().intValue(), 30);
+  }
+
+  @Test
+  public void testExtractScrollResultWithNullSize() {
+    // Create a mock SearchResponse
+    SearchResponse mockResponse = mock(SearchResponse.class);
+    SearchHits mockHits = mock(SearchHits.class);
+
+    when(mockResponse.getHits()).thenReturn(mockHits);
+    when(mockHits.getTotalHits()).thenReturn(new TotalHits(100L, TotalHits.Relation.EQUAL_TO));
+    when(mockHits.getHits()).thenReturn(new SearchHit[0]);
+    when(mockResponse.getAggregations()).thenReturn(null);
+    when(mockResponse.getSuggest()).thenReturn(null);
+    when(mockResponse.pointInTimeId()).thenReturn("test-pit-id");
+
+    SearchRequestHandler handler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            TestEntitySpecBuilder.getSpec(),
+            testQueryConfig,
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            TEST_SEARCH_SERVICE_CONFIG);
+
+    // Test with null size
+    ScrollResult result =
+        handler.extractScrollResult(operationContext, mockResponse, null, "5m", null, true);
+
+    // Should use the default from the service config default, but limited by total results
+    assertEquals(result.getPageSize().intValue(), 100); // Math.min(1000, 100) = 100
+    assertEquals(result.getNumEntities().intValue(), 100);
+  }
+
+  @Test
+  public void testExtractScrollResultWithLimitConfiguration() {
+    // Create a custom SearchServiceConfiguration with specific limits
+    SearchServiceConfiguration limitConfig =
+        TEST_SEARCH_SERVICE_CONFIG.toBuilder()
+            .limit(
+                LimitConfig.builder()
+                    .results(
+                        ResultsLimitConfig.builder().max(40).apiDefault(40).strict(false).build())
+                    .build())
+            .build();
+
+    SearchRequestHandler limitHandler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            TestEntitySpecBuilder.getSpec(),
+            testQueryConfig,
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            limitConfig);
+
+    // Test with size above limit
+    ScrollResult result = verifyScrollResultSize(limitHandler, 40, 80, true);
+
+    // Should be limited to 40 as the default
+    assertEquals(result.getPageSize().intValue(), 40);
+    assertNotNull(result.getScrollId()); // Should have next scroll ID since we have full page
+
+    // Test with size below limit - partial page
+    result = verifyScrollResultSize(limitHandler, 15, 20, false);
+
+    // Should use the requested size
+    assertEquals(result.getPageSize().intValue(), 20);
+    assertFalse(result.hasScrollId()); // No next scroll ID since results < page size
+
+    // Test with null size - should use API default
+    result = verifyScrollResultSize(limitHandler, 40, null, true);
+
+    // Should use the API default (40)
+    assertEquals(result.getPageSize().intValue(), 40);
+    assertNotNull(result.getScrollId()); // Should have next scroll ID
+  }
+
+  @Test
+  public void testExtractScrollResultPaginationLogic() {
+    SearchRequestHandler handler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            TestEntitySpecBuilder.getSpec(),
+            testQueryConfig,
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            TEST_SEARCH_SERVICE_CONFIG);
+
+    // Test when results equal page size - should have scroll ID
+    ScrollResult result = verifyScrollResultSize(handler, 10, 10, true);
+
+    assertEquals(result.getPageSize().intValue(), 10);
+    assertNotNull(result.getScrollId());
+
+    // Test when results less than page size - should NOT have scroll ID
+    result = verifyScrollResultSize(handler, 5, 10, false);
+
+    assertEquals(result.getPageSize().intValue(), 10);
+    assertFalse(result.hasScrollId());
+  }
+
+  @Test
+  public void testExtractScrollResultWithZeroCount() {
+    // Test the edge case where count=0 is passed, which should not cause
+    // ArrayIndexOutOfBoundsException
+    SearchRequestHandler handler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            TestEntitySpecBuilder.getSpec(),
+            testQueryConfig,
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            TEST_SEARCH_SERVICE_CONFIG);
+
+    SearchResponse mockResponse = mock(SearchResponse.class);
+    SearchHits mockHits = mock(SearchHits.class);
+
+    // Create empty search hits array (simulating no results)
+    SearchHit[] hits = new SearchHit[0];
+
+    when(mockResponse.getHits()).thenReturn(mockHits);
+    when(mockHits.getTotalHits()).thenReturn(new TotalHits(0L, TotalHits.Relation.EQUAL_TO));
+    when(mockHits.getHits()).thenReturn(hits);
+    when(mockResponse.getAggregations()).thenReturn(null);
+    when(mockResponse.getSuggest()).thenReturn(null);
+    when(mockResponse.pointInTimeId()).thenReturn("test-pit-id");
+
+    // This should not throw ArrayIndexOutOfBoundsException
+    ScrollResult result =
+        handler.extractScrollResult(operationContext, mockResponse, null, "5m", 0, true);
+
+    // Verify the result
+    assertNotNull(result);
+    assertEquals(result.getPageSize().intValue(), 0);
+    assertEquals(result.getNumEntities().intValue(), 0);
+    assertFalse(result.hasScrollId()); // No scroll ID since no results
+  }
+
+  // Helper method to create scroll results with specific sizes
+  private ScrollResult verifyScrollResultSize(
+      SearchRequestHandler handler,
+      int actualResults,
+      Integer requestedSize,
+      boolean expectScrollId) {
+
+    SearchResponse mockResponse = mock(SearchResponse.class);
+    SearchHits mockHits = mock(SearchHits.class);
+
+    when(mockResponse.getHits()).thenReturn(mockHits);
+    when(mockHits.getTotalHits()).thenReturn(new TotalHits(100L, TotalHits.Relation.EQUAL_TO));
+    when(mockResponse.getAggregations()).thenReturn(null);
+    when(mockResponse.getSuggest()).thenReturn(null);
+    when(mockResponse.pointInTimeId()).thenReturn("test-pit-id");
+
+    // Create array of mock hits
+    SearchHit[] hits = new SearchHit[actualResults];
+    for (int i = 0; i < actualResults; i++) {
+      SearchHit mockHit = mock(SearchHit.class);
+      when(mockHit.getSourceAsMap())
+          .thenReturn(
+              ImmutableMap.of(
+                  "urn", "urn:li:dataset:(urn:li:dataPlatform:hdfs,test" + i + ",PROD)"));
+      when(mockHit.getScore()).thenReturn(1.0f);
+      when(mockHit.getHighlightFields()).thenReturn(ImmutableMap.of());
+      when(mockHit.getMatchedQueries()).thenReturn(new String[0]);
+      when(mockHit.getSortValues()).thenReturn(new Object[] {"sortValue" + i});
+      hits[i] = mockHit;
+    }
+    when(mockHits.getHits()).thenReturn(hits);
+
+    return handler.extractScrollResult(
+        operationContext, mockResponse, null, "5m", requestedSize, true);
+  }
+
+  @Test
+  public void testExtractResultSkipsHitsWithInvalidUrn() {
+    // Regression test for #13181: a hit whose document is missing/has an invalid URN must be
+    // skipped (not crash the whole search), and the remaining valid hits must still be returned.
+    SearchRequestHandler handler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            TestEntitySpecBuilder.getSpec(),
+            testQueryConfig,
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            TEST_SEARCH_SERVICE_CONFIG);
+
+    SearchResponse mockResponse = mock(SearchResponse.class);
+    SearchHits mockHits = mock(SearchHits.class);
+    when(mockResponse.getHits()).thenReturn(mockHits);
+    when(mockHits.getTotalHits()).thenReturn(new TotalHits(3L, TotalHits.Relation.EQUAL_TO));
+    when(mockResponse.getAggregations()).thenReturn(null);
+    when(mockResponse.getSuggest()).thenReturn(null);
+    // Build the hits as locals first — invoking the stubbing helpers inside the when(...) call
+    // above would nest Mockito stubbing and trigger UnfinishedStubbingException.
+    SearchHit validHit1 = mockHitWithUrn("urn:li:dataset:(urn:li:dataPlatform:hdfs,valid1,PROD)");
+    SearchHit invalidHit = mockHitWithMissingUrn();
+    SearchHit validHit2 = mockHitWithUrn("urn:li:dataset:(urn:li:dataPlatform:hdfs,valid2,PROD)");
+    when(mockHits.getHits()).thenReturn(new SearchHit[] {validHit1, invalidHit, validHit2});
+
+    SearchResult result = handler.extractResult(operationContext, mockResponse, null, 0, 10);
+
+    assertEquals(result.getEntities().size(), 2);
+    assertEquals(
+        result.getEntities().stream()
+            .map(e -> e.getEntity().toString())
+            .collect(Collectors.toList()),
+        List.of(
+            "urn:li:dataset:(urn:li:dataPlatform:hdfs,valid1,PROD)",
+            "urn:li:dataset:(urn:li:dataPlatform:hdfs,valid2,PROD)"));
+    // The reported total still reflects what the search engine matched.
+    assertEquals(result.getNumEntities().intValue(), 3);
+  }
+
+  @Test
+  public void testExtractScrollResultSkipsHitsWithInvalidUrn() {
+    // Same regression as above, exercised through the scroll/pagination code path.
+    SearchRequestHandler handler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            TestEntitySpecBuilder.getSpec(),
+            testQueryConfig,
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            TEST_SEARCH_SERVICE_CONFIG);
+
+    SearchResponse mockResponse = mock(SearchResponse.class);
+    SearchHits mockHits = mock(SearchHits.class);
+    when(mockResponse.getHits()).thenReturn(mockHits);
+    when(mockHits.getTotalHits()).thenReturn(new TotalHits(3L, TotalHits.Relation.EQUAL_TO));
+    when(mockResponse.getAggregations()).thenReturn(null);
+    when(mockResponse.getSuggest()).thenReturn(null);
+    when(mockResponse.pointInTimeId()).thenReturn("test-pit-id");
+    SearchHit validHit1 = mockHitWithUrn("urn:li:dataset:(urn:li:dataPlatform:hdfs,valid1,PROD)");
+    SearchHit invalidHit = mockHitWithMissingUrn();
+    SearchHit validHit2 = mockHitWithUrn("urn:li:dataset:(urn:li:dataPlatform:hdfs,valid2,PROD)");
+    when(mockHits.getHits()).thenReturn(new SearchHit[] {validHit1, invalidHit, validHit2});
+
+    ScrollResult result =
+        handler.extractScrollResult(operationContext, mockResponse, null, "5m", 10, true);
+
+    assertEquals(result.getEntities().size(), 2);
+    assertEquals(
+        result.getEntities().stream()
+            .map(e -> e.getEntity().toString())
+            .collect(Collectors.toList()),
+        List.of(
+            "urn:li:dataset:(urn:li:dataPlatform:hdfs,valid1,PROD)",
+            "urn:li:dataset:(urn:li:dataPlatform:hdfs,valid2,PROD)"));
+  }
+
+  @Test
+  public void testExtractResultAllHitsInvalidReturnsEmpty() {
+    // When every hit is invalid the search must not crash; it returns an empty result while the
+    // engine-reported total is preserved.
+    SearchRequestHandler handler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            TestEntitySpecBuilder.getSpec(),
+            testQueryConfig,
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            TEST_SEARCH_SERVICE_CONFIG);
+
+    SearchResponse mockResponse = mock(SearchResponse.class);
+    SearchHits mockHits = mock(SearchHits.class);
+    when(mockResponse.getHits()).thenReturn(mockHits);
+    when(mockHits.getTotalHits()).thenReturn(new TotalHits(2L, TotalHits.Relation.EQUAL_TO));
+    when(mockResponse.getAggregations()).thenReturn(null);
+    when(mockResponse.getSuggest()).thenReturn(null);
+    SearchHit invalidHit1 = mockHitWithMissingUrn();
+    SearchHit invalidHit2 = mockHitWithMissingUrn();
+    when(mockHits.getHits()).thenReturn(new SearchHit[] {invalidHit1, invalidHit2});
+
+    SearchResult result = handler.extractResult(operationContext, mockResponse, null, 0, 10);
+
+    assertTrue(result.getEntities().isEmpty());
+    assertEquals(result.getNumEntities().intValue(), 2);
+  }
+
+  @Test
+  public void testExtractResultHandlesNullHighlightsAndMatchedQueries() {
+    // A valid hit with no highlights and no named-query match (the search engine returns null for
+    // both) must still be returned — not crash the search now that getResultSafely only catches
+    // InvalidSearchHitException.
+    SearchRequestHandler handler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            TestEntitySpecBuilder.getSpec(),
+            testQueryConfig,
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            TEST_SEARCH_SERVICE_CONFIG);
+
+    SearchResponse mockResponse = mock(SearchResponse.class);
+    SearchHits mockHits = mock(SearchHits.class);
+    when(mockResponse.getHits()).thenReturn(mockHits);
+    when(mockHits.getTotalHits()).thenReturn(new TotalHits(1L, TotalHits.Relation.EQUAL_TO));
+    when(mockResponse.getAggregations()).thenReturn(null);
+    when(mockResponse.getSuggest()).thenReturn(null);
+    SearchHit hit = mock(SearchHit.class);
+    when(hit.getSourceAsMap())
+        .thenReturn(
+            ImmutableMap.of(
+                "urn", "urn:li:dataset:(urn:li:dataPlatform:hdfs,nullHighlights,PROD)"));
+    when(hit.getScore()).thenReturn(1.0f);
+    when(hit.getHighlightFields()).thenReturn(null);
+    when(hit.getMatchedQueries()).thenReturn(null);
+    when(mockHits.getHits()).thenReturn(new SearchHit[] {hit});
+
+    SearchResult result = handler.extractResult(operationContext, mockResponse, null, 0, 10);
+
+    assertEquals(result.getEntities().size(), 1);
+    assertEquals(
+        result.getEntities().get(0).getEntity().toString(),
+        "urn:li:dataset:(urn:li:dataPlatform:hdfs,nullHighlights,PROD)");
+  }
+
+  @Test
+  public void testFetchSourceDefaultsToUrnOnly() {
+    SearchRequestHandler requestHandler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            TestEntitySpecBuilder.getSpec(),
+            testQueryConfig,
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            TEST_SEARCH_SERVICE_CONFIG);
+    SearchRequest searchRequest =
+        requestHandler.getSearchRequest(
+            operationContext.withSearchFlags(flags -> flags.setFulltext(false)),
+            "testQuery",
+            null,
+            null,
+            0,
+            10,
+            List.of());
+    FetchSourceContext fetchSource = searchRequest.source().fetchSource();
+    assertNotNull(fetchSource);
+    assertEquals(Set.of(fetchSource.includes()), Set.of("urn"));
+  }
+
+  @Test
+  public void testFetchSourceIncludesRequestedExtraFields() {
+    SearchRequestHandler requestHandler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            TestEntitySpecBuilder.getSpec(),
+            testQueryConfig,
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            TEST_SEARCH_SERVICE_CONFIG);
+    SearchRequest searchRequest =
+        requestHandler.getSearchRequest(
+            operationContext.withSearchFlags(
+                flags ->
+                    flags
+                        .setFulltext(false)
+                        .setFetchExtraFields(new StringArray(List.of("parentDomain")))),
+            "testQuery",
+            null,
+            null,
+            0,
+            10,
+            List.of());
+    FetchSourceContext fetchSource = searchRequest.source().fetchSource();
+    assertNotNull(fetchSource);
+    assertEquals(Set.of(fetchSource.includes()), Set.of("urn", "parentDomain"));
+  }
+
+  @Test
+  public void testExtractResultCopiesOnlyRequestedExtraFields() {
+    SearchRequestHandler handler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            TestEntitySpecBuilder.getSpec(),
+            testQueryConfig,
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            TEST_SEARCH_SERVICE_CONFIG);
+
+    SearchResponse mockResponse = mock(SearchResponse.class);
+    SearchHits mockHits = mock(SearchHits.class);
+    when(mockResponse.getHits()).thenReturn(mockHits);
+    when(mockHits.getTotalHits()).thenReturn(new TotalHits(1L, TotalHits.Relation.EQUAL_TO));
+    when(mockResponse.getAggregations()).thenReturn(null);
+    when(mockResponse.getSuggest()).thenReturn(null);
+    SearchHit hit = mock(SearchHit.class);
+    when(hit.getSourceAsMap())
+        .thenReturn(
+            ImmutableMap.of(
+                "urn",
+                "urn:li:dataset:(urn:li:dataPlatform:hdfs,withParent,PROD)",
+                "parentDomain",
+                "urn:li:domain:root",
+                "name",
+                "should-not-appear"));
+    when(hit.getScore()).thenReturn(1.0f);
+    when(hit.getHighlightFields()).thenReturn(ImmutableMap.of());
+    when(hit.getMatchedQueries()).thenReturn(new String[0]);
+    when(mockHits.getHits()).thenReturn(new SearchHit[] {hit});
+
+    SearchResult withoutFlag = handler.extractResult(operationContext, mockResponse, null, 0, 10);
+    assertNull(withoutFlag.getEntities().get(0).getExtraFields());
+
+    SearchResult withFlag =
+        handler.extractResult(
+            operationContext.withSearchFlags(
+                flags -> flags.setFetchExtraFields(new StringArray(List.of("parentDomain")))),
+            mockResponse,
+            null,
+            0,
+            10);
+    assertEquals(withFlag.getEntities().get(0).getExtraFields().keySet(), Set.of("parentDomain"));
+    assertEquals(
+        withFlag.getEntities().get(0).getExtraFields().get("parentDomain"),
+        "\"urn:li:domain:root\"");
+  }
+
+  @Test
+  public void testSearchTypeFlag() {
+    SearchRequestHandler handler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            TestEntitySpecBuilder.getSpec(),
+            testQueryConfig,
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            TEST_SEARCH_SERVICE_CONFIG);
+    // DFS in either case; any other value is QUERY_THEN_FETCH
+    Map<String, SearchType> expected =
+        Map.of(
+            "DFS_QUERY_THEN_FETCH", SearchType.DFS_QUERY_THEN_FETCH,
+            "dfs_query_then_fetch", SearchType.DFS_QUERY_THEN_FETCH,
+            "QUERY_THEN_FETCH", SearchType.QUERY_THEN_FETCH,
+            "QUERY_AND_FETCH", SearchType.QUERY_THEN_FETCH);
+    for (Map.Entry<String, SearchType> entry : expected.entrySet()) {
+      SearchRequest request =
+          handler.getSearchRequest(
+              operationContext.withSearchFlags(
+                  flags -> flags.setFulltext(false).setSearchType(entry.getKey())),
+              "testQuery",
+              null,
+              null,
+              0,
+              10,
+              List.of());
+      assertEquals(request.searchType(), entry.getValue(), entry.getKey());
+    }
+
+    SearchRequest unset =
+        handler.getSearchRequest(
+            operationContext.withSearchFlags(flags -> flags.setFulltext(false)),
+            "testQuery",
+            null,
+            null,
+            0,
+            10,
+            List.of());
+    assertEquals(unset.searchType(), SearchType.QUERY_THEN_FETCH);
+  }
+
+  @Test
+  public void testExtractResultsAddExplanation() throws Exception {
+    SearchRequestHandler handler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            TestEntitySpecBuilder.getSpec(),
+            testQueryConfig,
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            TEST_SEARCH_SERVICE_CONFIG);
+    SearchResponse mockResponse = mock(SearchResponse.class);
+    SearchHits mockHits = mock(SearchHits.class);
+    when(mockResponse.getHits()).thenReturn(mockHits);
+    when(mockHits.getTotalHits()).thenReturn(new TotalHits(1L, TotalHits.Relation.EQUAL_TO));
+    SearchHit hit = mockHitWithUrn("urn:li:dataset:(urn:li:dataPlatform:hdfs,explained,PROD)");
+    when(hit.getExplanation())
+        .thenReturn(
+            Explanation.match(2.0f, "sum of:", Explanation.match(2.0f, "weight(name:explained)")));
+    when(mockHits.getHits()).thenReturn(new SearchHit[] {hit});
+
+    SearchEntity searched =
+        handler.extractResult(operationContext, mockResponse, null, 0, 10).getEntities().get(0);
+    JsonNode explain = new ObjectMapper().readTree(searched.getExtraFields().get("_explain"));
+    assertEquals(explain.get("value").floatValue(), 2.0f);
+    assertEquals(explain.get("description").asText(), "sum of:");
+    assertTrue(explain.get("match").asBoolean());
+    assertEquals(
+        explain.get("details").get(0).get("description").asText(), "weight(name:explained)");
+    assertFalse(explain.get("details").get(0).has("details"));
+
+    // Scroll adds its per-hit scrollId next to the explanation
+    SearchEntity scrolled =
+        handler
+            .extractScrollResult(operationContext, mockResponse, null, null, 10, false)
+            .getEntities()
+            .get(0);
+    assertTrue(scrolled.getExtraFields().keySet().containsAll(Set.of("_explain", "scrollId")));
+  }
+
+  private SearchHit mockHitWithUrn(String urn) {
+    SearchHit hit = mock(SearchHit.class);
+    when(hit.getSourceAsMap()).thenReturn(ImmutableMap.of("urn", urn));
+    when(hit.getScore()).thenReturn(1.0f);
+    when(hit.getHighlightFields()).thenReturn(ImmutableMap.of());
+    when(hit.getMatchedQueries()).thenReturn(new String[0]);
+    when(hit.getSortValues()).thenReturn(new Object[] {"sort-" + urn});
+    return hit;
+  }
+
+  private SearchHit mockHitWithMissingUrn() {
+    SearchHit hit = mock(SearchHit.class);
+    // Source map without a "urn" field — mirrors the legacy bootstrap document from #13181.
+    when(hit.getSourceAsMap()).thenReturn(ImmutableMap.of("someOtherField", "value"));
+    when(hit.getIndex()).thenReturn("test-index");
+    when(hit.getId()).thenReturn("bad-doc-id");
+    return hit;
+  }
+
+  private BoolQueryBuilder getQuery(final Criterion filterCriterion) {
+    return getQuery(filterCriterion, TestEntitySpecBuilder.getSpec(), true);
+  }
+
+  private BoolQueryBuilder getQuery(
+      final Criterion filterCriterion, final EntitySpec entitySpec, boolean filterNonLatest) {
+    final Filter filter =
+        new Filter()
+            .setOr(
+                new ConjunctiveCriterionArray(
+                    new ConjunctiveCriterion()
+                        .setAnd(new CriterionArray(ImmutableList.of(filterCriterion)))));
+
+    final SearchRequestHandler requestHandler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            entitySpec,
+            testQueryConfig,
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            TEST_SEARCH_SERVICE_CONFIG);
+
+    return (BoolQueryBuilder)
+        requestHandler
+            .getSearchRequest(
+                operationContext.withSearchFlags(
+                    flags -> flags.setFulltext(false).setFilterNonLatestVersions(filterNonLatest)),
+                "",
+                filter,
+                null,
+                0,
+                10,
+                List.of())
+            .source()
+            .query();
+  }
+
+  private BoolQueryBuilder getAggregationQuery(
+      final Criterion filterCriterion, final EntitySpec entitySpec, boolean filterNonLatest) {
+    final Filter filter =
+        new Filter()
+            .setOr(
+                new ConjunctiveCriterionArray(
+                    new ConjunctiveCriterion()
+                        .setAnd(new CriterionArray(ImmutableList.of(filterCriterion)))));
+
+    final SearchRequestHandler requestHandler =
+        SearchRequestHandler.getBuilder(
+            operationContext,
+            entitySpec,
+            testQueryConfig,
+            null,
+            QueryFilterRewriteChain.EMPTY,
+            TEST_SEARCH_SERVICE_CONFIG);
+
+    return (BoolQueryBuilder)
+        requestHandler
+            .getAggregationRequest(
+                operationContext.withSearchFlags(
+                    flags -> flags.setFulltext(false).setFilterNonLatestVersions(filterNonLatest)),
+                "platform",
+                filter,
+                10)
+            .source()
+            .query();
+  }
+
+  private SearchRequestHandler shardFailureTestHandler() {
+    return SearchRequestHandler.getBuilder(
+        operationContext,
+        TestEntitySpecBuilder.getSpec(),
+        testQueryConfig,
+        null,
+        QueryFilterRewriteChain.EMPTY,
+        TEST_SEARCH_SERVICE_CONFIG);
+  }
+
+  @Test
+  public void testExtractResultThrowsOnDeterministicShardFailure() {
+    // A terms aggregation on a dynamically-mapped text field fails per shard with
+    // illegal_argument_exception while the response is still HTTP 200 — the hits from failing
+    // shards were previously dropped silently.
+    SearchResponse mockResponse = mock(SearchResponse.class);
+    when(mockResponse.getShardFailures())
+        .thenReturn(
+            new ShardSearchFailure[] {
+              new ShardSearchFailure(
+                  new OpenSearchException(
+                      "OpenSearch exception [type=illegal_argument_exception, reason=Text fields"
+                          + " are not optimised for operations that require per-document field"
+                          + " data]"))
+            });
+    when(mockResponse.getTotalShards()).thenReturn(4);
+
+    expectThrows(
+        ESQueryException.class,
+        () -> shardFailureTestHandler().extractResult(operationContext, mockResponse, null, 0, 10));
+  }
+
+  @Test
+  public void testExtractScrollResultThrowsOnDeterministicShardFailureCause() {
+    // Same classification when the failure carries the raw cause instead of a parsed reason.
+    SearchResponse mockResponse = mock(SearchResponse.class);
+    when(mockResponse.getShardFailures())
+        .thenReturn(
+            new ShardSearchFailure[] {
+              new ShardSearchFailure(
+                  new IllegalArgumentException(
+                      "Text fields are not optimised for operations that require per-document"
+                          + " field data"))
+            });
+    when(mockResponse.getTotalShards()).thenReturn(2);
+
+    expectThrows(
+        ESQueryException.class,
+        () ->
+            shardFailureTestHandler()
+                .extractScrollResult(operationContext, mockResponse, null, "5m", 10, true));
+  }
+
+  @Test
+  public void testExtractResultThrowsOnFielddataFailureWithoutTypeToken() {
+    // The ES8 client shim rebuilds shard failures from the reason message only, dropping the
+    // exception type. The text-fielddata symptom — the structured-property poisoning case — must
+    // still classify as deterministic on the reason substring alone, with no illegal_argument type
+    // token or IllegalArgumentException cause present.
+    SearchResponse mockResponse = mock(SearchResponse.class);
+    when(mockResponse.getShardFailures())
+        .thenReturn(
+            new ShardSearchFailure[] {
+              new ShardSearchFailure(
+                  new OpenSearchException(
+                      "Text fields are not optimised for operations that require per-document field"
+                          + " data like aggregations and sorting"))
+            });
+    when(mockResponse.getTotalShards()).thenReturn(3);
+
+    expectThrows(
+        ESQueryException.class,
+        () -> shardFailureTestHandler().extractResult(operationContext, mockResponse, null, 0, 10));
+  }
+
+  @Test
+  public void testExtractResultToleratesTransientShardFailure() {
+    // Transient failures on a busy cluster (circuit breaker, timeout, rejected execution) must not
+    // fail the request — partial results are returned and the failure is only logged/counted.
+    SearchResponse mockResponse = mock(SearchResponse.class);
+    SearchHits mockHits = mock(SearchHits.class);
+    when(mockResponse.getHits()).thenReturn(mockHits);
+    when(mockHits.getTotalHits()).thenReturn(new TotalHits(5L, TotalHits.Relation.EQUAL_TO));
+    when(mockHits.getHits()).thenReturn(new SearchHit[0]);
+    when(mockResponse.getAggregations()).thenReturn(null);
+    when(mockResponse.getSuggest()).thenReturn(null);
+    when(mockResponse.getShardFailures())
+        .thenReturn(
+            new ShardSearchFailure[] {
+              new ShardSearchFailure(
+                  new OpenSearchException(
+                      "OpenSearch exception [type=circuit_breaking_exception, reason=[parent] Data"
+                          + " too large]"))
+            });
+    when(mockResponse.getTotalShards()).thenReturn(4);
+
+    SearchResult result =
+        shardFailureTestHandler().extractResult(operationContext, mockResponse, null, 0, 10);
+
+    assertEquals(result.getNumEntities().intValue(), 5);
+    assertEquals(result.getEntities().size(), 0);
+  }
+
+  @Test
+  public void testExtractScrollResultToleratesTransientShardFailure() {
+    SearchResponse mockResponse = mock(SearchResponse.class);
+    SearchHits mockHits = mock(SearchHits.class);
+    when(mockResponse.getHits()).thenReturn(mockHits);
+    when(mockHits.getTotalHits()).thenReturn(new TotalHits(5L, TotalHits.Relation.EQUAL_TO));
+    when(mockHits.getHits()).thenReturn(new SearchHit[0]);
+    when(mockResponse.getAggregations()).thenReturn(null);
+    when(mockResponse.getSuggest()).thenReturn(null);
+    when(mockResponse.getShardFailures())
+        .thenReturn(
+            new ShardSearchFailure[] {
+              new ShardSearchFailure(
+                  new OpenSearchException(
+                      "OpenSearch exception [type=search_phase_execution_exception,"
+                          + " reason=Partial shards failure (timed out)]"))
+            });
+    when(mockResponse.getTotalShards()).thenReturn(4);
+
+    ScrollResult result =
+        shardFailureTestHandler()
+            .extractScrollResult(operationContext, mockResponse, null, "5m", 10, true);
+
+    assertEquals(result.getNumEntities().intValue(), 5);
+    assertEquals(result.getEntities().size(), 0);
+  }
+}

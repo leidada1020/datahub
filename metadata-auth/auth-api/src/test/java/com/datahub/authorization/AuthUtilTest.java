@@ -1,0 +1,954 @@
+package com.datahub.authorization;
+
+import static com.linkedin.metadata.authorization.ApiGroup.ENTITY;
+import static com.linkedin.metadata.authorization.ApiOperation.CREATE;
+import static com.linkedin.metadata.authorization.ApiOperation.DELETE;
+import static com.linkedin.metadata.authorization.ApiOperation.MANAGE;
+import static com.linkedin.metadata.authorization.ApiOperation.READ;
+import static com.linkedin.metadata.authorization.ApiOperation.UPDATE;
+import static com.linkedin.metadata.authorization.PoliciesConfig.API_ENTITY_PRIVILEGE_MAP;
+import static com.linkedin.metadata.authorization.PoliciesConfig.API_PRIVILEGE_MAP;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertFalse;
+import static org.testng.Assert.assertTrue;
+
+import com.datahub.authentication.Actor;
+import com.datahub.authentication.ActorType;
+import com.datahub.authentication.Authentication;
+import com.datahub.plugins.auth.authorization.Authorizer;
+import com.linkedin.common.urn.Urn;
+import com.linkedin.common.urn.UrnUtils;
+import com.linkedin.events.metadata.ChangeType;
+import com.linkedin.metadata.Constants;
+import com.linkedin.metadata.authorization.ApiGroup;
+import com.linkedin.metadata.authorization.ApiOperation;
+import com.linkedin.metadata.authorization.Conjunctive;
+import com.linkedin.metadata.authorization.PoliciesConfig;
+import com.linkedin.util.Pair;
+import io.datahubproject.test.metadata.context.TestAuthSession;
+import java.lang.reflect.Field;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.test.context.TestPropertySource;
+import org.testng.annotations.BeforeClass;
+import org.testng.annotations.Test;
+
+@SpringBootTest
+@TestPropertySource(properties = {"authorization.restApiAuthorization=true"})
+public class AuthUtilTest {
+
+  // The AuthUtil @PostConstruct is not getting called from the unit tests, so calling
+  // it explicitly.
+  @BeforeClass
+  public void beforeAll() {
+    authUtil = new AuthUtil();
+    authUtil.restApiAuthorizationEnabled = true;
+    authUtil.init();
+  }
+
+  @Autowired private AuthUtil authUtil;
+
+  private static final Authentication TEST_AUTH_A =
+      new Authentication(new Actor(ActorType.USER, "testA"), "");
+  private static final Authentication TEST_AUTH_B =
+      new Authentication(new Actor(ActorType.USER, "testB"), "");
+  private static final Urn TEST_ENTITY_1 =
+      UrnUtils.getUrn("urn:li:dataset:(urn:li:dataPlatform:s3,1,PROD)");
+  private static final Urn TEST_ENTITY_2 =
+      UrnUtils.getUrn("urn:li:dataset:(urn:li:dataPlatform:hive,2,PROD)");
+  private static final Urn TEST_ENTITY_3 =
+      UrnUtils.getUrn("urn:li:dataset:(urn:li:dataPlatform:snowflake,3,PROD)");
+  private static final Urn TEST_GLOBAL_SETTINGS_URN = UrnUtils.getUrn("urn:li:globalSettings:0");
+  private static final Urn TEST_DOCUMENT_URN = UrnUtils.getUrn("urn:li:document:new-document");
+  private static final Urn TEST_INVITE_TOKEN_URN = UrnUtils.getUrn("urn:li:inviteToken:test-token");
+
+  @Test
+  public void testSimplePrivilegeGroupBuilder() {
+    assertEquals(
+        AuthUtil.buildDisjunctivePrivilegeGroup(
+            AuthUtil.lookupAPIPrivilege(ENTITY, READ, "dataset")),
+        new DisjunctivePrivilegeGroup(
+            List.of(
+                new ConjunctivePrivilegeGroup(List.of("VIEW_ENTITY_PAGE")),
+                new ConjunctivePrivilegeGroup(List.of("GET_ENTITY_PRIVILEGE")),
+                new ConjunctivePrivilegeGroup(List.of("EDIT_ENTITY")),
+                new ConjunctivePrivilegeGroup(List.of("DELETE_ENTITY")))));
+  }
+
+  @Test
+  public void testManageEntityPrivilegeGroupBuilder() {
+    assertEquals(
+        AuthUtil.buildDisjunctivePrivilegeGroup(
+            AuthUtil.lookupEntityAPIPrivilege(MANAGE, Constants.POLICY_ENTITY_NAME)),
+        new DisjunctivePrivilegeGroup(
+            List.of(new ConjunctivePrivilegeGroup(List.of("MANAGE_POLICIES")))));
+  }
+
+  @Test
+  public void testIsAPIAuthorizedUrns() {
+    Authorizer mockAuthorizer =
+        mockAuthorizer(
+            Map.of(
+                TEST_AUTH_A.getActor().toUrnStr(),
+                    Map.of(
+                        "EDIT_ENTITY", Set.of(TEST_ENTITY_1, TEST_ENTITY_2),
+                        "VIEW_ENTITY_PAGE", Set.of(TEST_ENTITY_3)),
+                TEST_AUTH_B.getActor().toUrnStr(),
+                    Map.of("VIEW_ENTITY_PAGE", Set.of(TEST_ENTITY_1, TEST_ENTITY_3))));
+
+    // User A (Entity 1 & 2 Edit, View only Entity 3)
+    assertTrue(
+        AuthUtil.isAPIAuthorizedEntityUrns(
+            TestAuthSession.from(TEST_AUTH_A, mockAuthorizer),
+            READ,
+            List.of(TEST_ENTITY_1, TEST_ENTITY_2, TEST_ENTITY_3)),
+        "Expected read allowed for all entities");
+
+    assertEquals(
+        AuthUtil.isAPIAuthorizedUrns(
+            TestAuthSession.from(TEST_AUTH_A, mockAuthorizer),
+            ENTITY,
+            List.of(
+                Pair.of(ChangeType.UPSERT, TEST_ENTITY_1),
+                Pair.of(ChangeType.UPSERT, TEST_ENTITY_2),
+                Pair.of(ChangeType.UPSERT, TEST_ENTITY_3))),
+        Map.of(
+            Pair.of(ChangeType.UPSERT, TEST_ENTITY_1), 200,
+            Pair.of(ChangeType.UPSERT, TEST_ENTITY_2), 200,
+            Pair.of(ChangeType.UPSERT, TEST_ENTITY_3), 403),
+        "Expected edit on entities 1 and 2 and denied on 3");
+
+    assertEquals(
+        AuthUtil.isAPIAuthorizedUrns(
+            TestAuthSession.from(TEST_AUTH_A, mockAuthorizer),
+            ENTITY,
+            List.of(
+                Pair.of(ChangeType.DELETE, TEST_ENTITY_1),
+                Pair.of(ChangeType.DELETE, TEST_ENTITY_2),
+                Pair.of(ChangeType.DELETE, TEST_ENTITY_3))),
+        Map.of(
+            Pair.of(ChangeType.DELETE, TEST_ENTITY_1), 403,
+            Pair.of(ChangeType.DELETE, TEST_ENTITY_2), 403,
+            Pair.of(ChangeType.DELETE, TEST_ENTITY_3), 403),
+        "Expected deny on delete for all entities");
+
+    // User B Entity 2 Denied, Read access 1 & 3
+    assertFalse(
+        AuthUtil.isAPIAuthorizedEntityUrns(
+            TestAuthSession.from(TEST_AUTH_B, mockAuthorizer),
+            READ,
+            List.of(TEST_ENTITY_1, TEST_ENTITY_2, TEST_ENTITY_3)),
+        "Expected read denied for based on entity 2");
+    assertTrue(
+        AuthUtil.isAPIAuthorizedEntityUrns(
+            TestAuthSession.from(TEST_AUTH_B, mockAuthorizer),
+            READ,
+            List.of(TEST_ENTITY_1, TEST_ENTITY_3)),
+        "Expected read allowed due to exclusion of entity 2");
+
+    assertEquals(
+        AuthUtil.isAPIAuthorizedUrns(
+            TestAuthSession.from(TEST_AUTH_B, mockAuthorizer),
+            ENTITY,
+            List.of(
+                Pair.of(ChangeType.UPSERT, TEST_ENTITY_1),
+                Pair.of(ChangeType.UPSERT, TEST_ENTITY_2),
+                Pair.of(ChangeType.UPSERT, TEST_ENTITY_3))),
+        Map.of(
+            Pair.of(ChangeType.UPSERT, TEST_ENTITY_1), 403,
+            Pair.of(ChangeType.UPSERT, TEST_ENTITY_2), 403,
+            Pair.of(ChangeType.UPSERT, TEST_ENTITY_3), 403),
+        "Expected edit on entities 1-3 to be denied");
+
+    assertEquals(
+        AuthUtil.isAPIAuthorizedUrns(
+            TestAuthSession.from(TEST_AUTH_B, mockAuthorizer),
+            ENTITY,
+            List.of(
+                Pair.of(ChangeType.DELETE, TEST_ENTITY_1),
+                Pair.of(ChangeType.DELETE, TEST_ENTITY_2),
+                Pair.of(ChangeType.DELETE, TEST_ENTITY_3))),
+        Map.of(
+            Pair.of(ChangeType.DELETE, TEST_ENTITY_1), 403,
+            Pair.of(ChangeType.DELETE, TEST_ENTITY_2), 403,
+            Pair.of(ChangeType.DELETE, TEST_ENTITY_3), 403),
+        "Expected deny on delete for all entities");
+  }
+
+  @Test
+  public void testReadInheritance() {
+    assertTrue(
+        AuthUtil.lookupAPIPrivilege(ApiGroup.ENTITY, ApiOperation.READ, "dataset")
+            .containsAll(API_PRIVILEGE_MAP.get(ENTITY).get(READ)),
+        "Expected most privileges to imply VIEW");
+  }
+
+  @Test
+  public void testManageConjoin() {
+    assertTrue(
+        AuthUtil.lookupAPIPrivilege(ApiGroup.ENTITY, ApiOperation.MANAGE, "dataset")
+            .contains(
+                Conjunctive.of(
+                    API_PRIVILEGE_MAP.get(ENTITY).get(UPDATE).get(0).get(0),
+                    API_PRIVILEGE_MAP.get(ENTITY).get(ApiOperation.DELETE).get(0).get(0))),
+        "Expected MANAGE to require both EDIT and DELETE");
+  }
+
+  @Test
+  public void testEntityType() {
+    assertTrue(
+        AuthUtil.lookupEntityAPIPrivilege(ApiOperation.MANAGE, "dataset")
+            .contains(
+                Conjunctive.of(
+                    API_PRIVILEGE_MAP.get(ENTITY).get(UPDATE).get(0).get(0),
+                    API_PRIVILEGE_MAP.get(ENTITY).get(ApiOperation.DELETE).get(0).get(0))),
+        "Expected MANAGE on dataset to require both EDIT and DELETE");
+
+    assertTrue(
+        AuthUtil.lookupEntityAPIPrivilege(ApiOperation.MANAGE, "dataHubPolicy")
+            .contains(
+                Conjunctive.of(
+                    API_ENTITY_PRIVILEGE_MAP.get("dataHubPolicy").get(UPDATE).get(0).get(0))),
+        "Expected MANAGE permission directly on dataHubPolicy entity");
+
+    assertEquals(
+        AuthUtil.buildDisjunctivePrivilegeGroup(
+            AuthUtil.lookupEntityAPIPrivilege(UPDATE, "globalSettings")),
+        new DisjunctivePrivilegeGroup(
+            List.of(
+                new ConjunctivePrivilegeGroup(
+                    List.of(PoliciesConfig.MANAGE_GLOBAL_SETTINGS.getType())))),
+        "Expected UPDATE on globalSettings to require MANAGE_GLOBAL_SETTINGS");
+
+    assertTrue(
+        AuthUtil.lookupEntityAPIPrivilege(READ, "globalSettings")
+            .contains(Conjunctive.of(PoliciesConfig.MANAGE_GLOBAL_SETTINGS)),
+        "Expected READ on globalSettings to allow MANAGE_GLOBAL_SETTINGS as an alternative");
+    assertTrue(
+        AuthUtil.lookupEntityAPIPrivilege(ApiOperation.EXISTS, "globalSettings")
+            .contains(Conjunctive.of(PoliciesConfig.MANAGE_GLOBAL_SETTINGS)),
+        "Expected EXISTS on globalSettings to allow MANAGE_GLOBAL_SETTINGS as an alternative");
+
+    assertEquals(
+        AuthUtil.buildDisjunctivePrivilegeGroup(
+            AuthUtil.lookupEntityAPIPrivilege(CREATE, "globalSettings")),
+        new DisjunctivePrivilegeGroup(
+            List.of(
+                new ConjunctivePrivilegeGroup(
+                    List.of(PoliciesConfig.MANAGE_GLOBAL_SETTINGS.getType())))),
+        "Expected CREATE on globalSettings to require MANAGE_GLOBAL_SETTINGS");
+
+    assertEquals(
+        AuthUtil.buildDisjunctivePrivilegeGroup(
+            AuthUtil.lookupEntityAPIPrivilege(DELETE, "globalSettings")),
+        new DisjunctivePrivilegeGroup(
+            List.of(
+                new ConjunctivePrivilegeGroup(
+                    List.of(PoliciesConfig.MANAGE_GLOBAL_SETTINGS.getType())))),
+        "Expected DELETE on globalSettings to require MANAGE_GLOBAL_SETTINGS");
+
+    assertEquals(
+        AuthUtil.buildDisjunctivePrivilegeGroup(
+            AuthUtil.lookupEntityAPIPrivilege(MANAGE, "globalSettings")),
+        new DisjunctivePrivilegeGroup(
+            List.of(
+                new ConjunctivePrivilegeGroup(
+                    List.of(PoliciesConfig.MANAGE_GLOBAL_SETTINGS.getType())))),
+        "Expected MANAGE on globalSettings to require MANAGE_GLOBAL_SETTINGS for update and delete");
+
+    assertTrue(
+        AuthUtil.lookupEntityAPIPrivilege(READ, "globalSettings")
+            .contains(Conjunctive.of(PoliciesConfig.VIEW_ENTITY_PAGE_PRIVILEGE)),
+        "Expected READ on globalSettings to retain standard entity read privileges");
+    assertTrue(
+        AuthUtil.lookupEntityAPIPrivilege(ApiOperation.EXISTS, "globalSettings")
+            .contains(
+                Conjunctive.of(
+                    API_PRIVILEGE_MAP.get(ENTITY).get(ApiOperation.EXISTS).get(0).get(0))),
+        "Expected EXISTS on globalSettings to retain standard entity exists privileges");
+  }
+
+  @Test
+  public void testGlobalSettingsRestApiAuthorization() {
+    final String actorEditOnly = "urn:li:corpuser:globalSettingsEdit";
+    final String actorManage = "urn:li:corpuser:globalSettingsManage";
+    final String actorView = "urn:li:corpuser:globalSettingsView";
+
+    Authorizer mockAuthorizer =
+        mockAuthorizer(
+            Map.of(
+                actorEditOnly, Map.of("EDIT_ENTITY", Set.of(TEST_GLOBAL_SETTINGS_URN)),
+                actorManage,
+                    Map.of(
+                        PoliciesConfig.MANAGE_GLOBAL_SETTINGS.getType(),
+                        Set.of(TEST_GLOBAL_SETTINGS_URN)),
+                actorView, Map.of("VIEW_ENTITY_PAGE", Set.of(TEST_GLOBAL_SETTINGS_URN))));
+
+    Authentication authEditOnly =
+        new Authentication(new Actor(ActorType.USER, "globalSettingsEdit"), "");
+    Authentication authManage =
+        new Authentication(new Actor(ActorType.USER, "globalSettingsManage"), "");
+    Authentication authView =
+        new Authentication(new Actor(ActorType.USER, "globalSettingsView"), "");
+
+    assertEquals(
+        AuthUtil.isAPIAuthorizedUrns(
+            TestAuthSession.from(authEditOnly, mockAuthorizer),
+            ENTITY,
+            List.of(Pair.of(ChangeType.UPSERT, TEST_GLOBAL_SETTINGS_URN))),
+        Map.of(Pair.of(ChangeType.UPSERT, TEST_GLOBAL_SETTINGS_URN), 403),
+        "EDIT_ENTITY alone must not authorize globalSettings mutation");
+
+    assertEquals(
+        AuthUtil.isAPIAuthorizedUrns(
+            TestAuthSession.from(authEditOnly, mockAuthorizer),
+            ENTITY,
+            List.of(Pair.of(ChangeType.CREATE_ENTITY, TEST_GLOBAL_SETTINGS_URN))),
+        Map.of(Pair.of(ChangeType.CREATE_ENTITY, TEST_GLOBAL_SETTINGS_URN), 403),
+        "EDIT_ENTITY alone must not authorize globalSettings create");
+
+    assertEquals(
+        AuthUtil.isAPIAuthorizedUrns(
+            TestAuthSession.from(authManage, mockAuthorizer),
+            ENTITY,
+            List.of(
+                Pair.of(ChangeType.UPSERT, TEST_GLOBAL_SETTINGS_URN),
+                Pair.of(ChangeType.DELETE, TEST_GLOBAL_SETTINGS_URN),
+                Pair.of(ChangeType.CREATE_ENTITY, TEST_GLOBAL_SETTINGS_URN))),
+        Map.of(
+            Pair.of(ChangeType.UPSERT, TEST_GLOBAL_SETTINGS_URN), 200,
+            Pair.of(ChangeType.DELETE, TEST_GLOBAL_SETTINGS_URN), 200,
+            Pair.of(ChangeType.CREATE_ENTITY, TEST_GLOBAL_SETTINGS_URN), 200),
+        "MANAGE_GLOBAL_SETTINGS should authorize globalSettings mutations");
+
+    assertTrue(
+        AuthUtil.isAPIAuthorizedEntityUrns(
+            TestAuthSession.from(authView, mockAuthorizer),
+            READ,
+            List.of(TEST_GLOBAL_SETTINGS_URN)),
+        "VIEW_ENTITY_PAGE should authorize globalSettings read");
+
+    assertTrue(
+        AuthUtil.isAPIAuthorizedEntityUrns(
+            TestAuthSession.from(authManage, mockAuthorizer),
+            READ,
+            List.of(TEST_GLOBAL_SETTINGS_URN)),
+        "MANAGE_GLOBAL_SETTINGS should authorize globalSettings read as an alternative");
+  }
+
+  @Test
+  public void testInviteTokenRestApiAuthorization() {
+    final String actorEditOnly = "urn:li:corpuser:inviteTokenEdit";
+    final String actorManage = "urn:li:corpuser:inviteTokenManage";
+    final String actorView = "urn:li:corpuser:inviteTokenView";
+
+    Authorizer mockAuthorizer =
+        mockAuthorizer(
+            Map.of(
+                actorEditOnly,
+                Map.of(
+                    "EDIT_ENTITY", Set.of(TEST_INVITE_TOKEN_URN),
+                    "CREATE_ENTITY", Set.of(TEST_INVITE_TOKEN_URN)),
+                actorManage,
+                Map.of(
+                    PoliciesConfig.MANAGE_USER_CREDENTIALS_PRIVILEGE.getType(),
+                    Set.of(TEST_INVITE_TOKEN_URN)),
+                actorView,
+                Map.of(
+                    "VIEW_ENTITY_PAGE", Set.of(TEST_INVITE_TOKEN_URN),
+                    "GET_ENTITY_PRIVILEGE", Set.of(TEST_INVITE_TOKEN_URN))));
+
+    Authentication authEditOnly =
+        new Authentication(new Actor(ActorType.USER, "inviteTokenEdit"), "");
+    Authentication authManage =
+        new Authentication(new Actor(ActorType.USER, "inviteTokenManage"), "");
+    Authentication authView = new Authentication(new Actor(ActorType.USER, "inviteTokenView"), "");
+
+    assertFalse(
+        AuthUtil.isAPIAuthorizedEntityUrns(
+            TestAuthSession.from(authView, mockAuthorizer), READ, List.of(TEST_INVITE_TOKEN_URN)),
+        "Standard entity read privileges must not authorize inviteToken read");
+
+    assertFalse(
+        AuthUtil.isAPIAuthorizedEntityUrns(
+            TestAuthSession.from(authEditOnly, mockAuthorizer),
+            READ,
+            List.of(TEST_INVITE_TOKEN_URN)),
+        "EDIT_ENTITY must not authorize inviteToken read");
+
+    assertTrue(
+        AuthUtil.isAPIAuthorizedEntityUrns(
+            TestAuthSession.from(authManage, mockAuthorizer), READ, List.of(TEST_INVITE_TOKEN_URN)),
+        "MANAGE_USER_CREDENTIALS should authorize inviteToken read");
+
+    assertEquals(
+        AuthUtil.isAPIAuthorizedUrns(
+            TestAuthSession.from(authEditOnly, mockAuthorizer),
+            ENTITY,
+            List.of(
+                Pair.of(ChangeType.UPSERT, TEST_INVITE_TOKEN_URN),
+                Pair.of(ChangeType.CREATE_ENTITY, TEST_INVITE_TOKEN_URN))),
+        Map.of(
+            Pair.of(ChangeType.UPSERT, TEST_INVITE_TOKEN_URN), 403,
+            Pair.of(ChangeType.CREATE_ENTITY, TEST_INVITE_TOKEN_URN), 403),
+        "EDIT_ENTITY and CREATE_ENTITY must not authorize inviteToken mutation");
+
+    assertEquals(
+        AuthUtil.isAPIAuthorizedUrns(
+            TestAuthSession.from(authManage, mockAuthorizer),
+            ENTITY,
+            List.of(
+                Pair.of(ChangeType.UPSERT, TEST_INVITE_TOKEN_URN),
+                Pair.of(ChangeType.DELETE, TEST_INVITE_TOKEN_URN),
+                Pair.of(ChangeType.CREATE_ENTITY, TEST_INVITE_TOKEN_URN))),
+        Map.of(
+            Pair.of(ChangeType.UPSERT, TEST_INVITE_TOKEN_URN), 200,
+            Pair.of(ChangeType.DELETE, TEST_INVITE_TOKEN_URN), 200,
+            Pair.of(ChangeType.CREATE_ENTITY, TEST_INVITE_TOKEN_URN), 200),
+        "MANAGE_USER_CREDENTIALS should authorize inviteToken mutations");
+  }
+
+  @Test
+  public void testDocumentCreateAllowsEntityCreateEditOrManageDocuments() {
+    Authentication createOnly =
+        new Authentication(new Actor(ActorType.USER, "documentCreateOnly"), "");
+    Authentication editOnly = new Authentication(new Actor(ActorType.USER, "documentEditOnly"), "");
+    Authentication manageDocuments =
+        new Authentication(new Actor(ActorType.USER, "documentManager"), "");
+    Authentication viewOnly = new Authentication(new Actor(ActorType.USER, "documentViewOnly"), "");
+    Authorizer mockAuthorizer =
+        mockAuthorizer(
+            Map.of(
+                createOnly.getActor().toUrnStr(),
+                    Map.of("CREATE_ENTITY", Set.of(TEST_DOCUMENT_URN)),
+                editOnly.getActor().toUrnStr(), Map.of("EDIT_ENTITY", Set.of(TEST_DOCUMENT_URN)),
+                manageDocuments.getActor().toUrnStr(),
+                    Map.of(
+                        PoliciesConfig.MANAGE_DOCUMENTS_PRIVILEGE.getType(),
+                        Set.of(TEST_DOCUMENT_URN)),
+                viewOnly.getActor().toUrnStr(),
+                    Map.of("VIEW_ENTITY_PAGE", Set.of(TEST_DOCUMENT_URN))));
+    Pair<ChangeType, Urn> create = Pair.of(ChangeType.CREATE_ENTITY, TEST_DOCUMENT_URN);
+
+    assertEquals(
+        AuthUtil.isAPIAuthorizedUrns(
+            TestAuthSession.from(createOnly, mockAuthorizer), ENTITY, List.of(create)),
+        Map.of(create, 200));
+    assertEquals(
+        AuthUtil.isAPIAuthorizedUrns(
+            TestAuthSession.from(editOnly, mockAuthorizer), ENTITY, List.of(create)),
+        Map.of(create, 200));
+    assertEquals(
+        AuthUtil.isAPIAuthorizedUrns(
+            TestAuthSession.from(manageDocuments, mockAuthorizer), ENTITY, List.of(create)),
+        Map.of(create, 200));
+    assertEquals(
+        AuthUtil.isAPIAuthorizedUrns(
+            TestAuthSession.from(viewOnly, mockAuthorizer), ENTITY, List.of(create)),
+        Map.of(create, 403));
+  }
+
+  @Test
+  public void testExistenceAwareCreateEntityRequiresEditWhenEntityExists() {
+    Authentication createOnly =
+        new Authentication(new Actor(ActorType.USER, "createOnlyNoEdit"), "");
+    Authentication editOnly = new Authentication(new Actor(ActorType.USER, "editOnlyNoCreate"), "");
+    Authorizer mockAuthorizer =
+        mockAuthorizer(
+            Map.of(
+                createOnly.getActor().toUrnStr(), Map.of("CREATE_ENTITY", Set.of(TEST_ENTITY_1)),
+                editOnly.getActor().toUrnStr(), Map.of("EDIT_ENTITY", Set.of(TEST_ENTITY_1))));
+    Pair<ChangeType, Urn> createEntity = Pair.of(ChangeType.CREATE_ENTITY, TEST_ENTITY_1);
+    Pair<ChangeType, Urn> upsert = Pair.of(ChangeType.UPSERT, TEST_ENTITY_1);
+    Map<Urn, Boolean> exists = Map.of(TEST_ENTITY_1, true);
+    Map<Urn, Boolean> missing = Map.of(TEST_ENTITY_1, false);
+
+    assertEquals(
+        AuthUtil.isAPIAuthorizedUrns(
+            TestAuthSession.from(createOnly, mockAuthorizer),
+            ENTITY,
+            List.of(createEntity),
+            exists),
+        Map.of(createEntity, 403),
+        "CREATE_ENTITY-only must not overwrite an existing entity");
+    assertEquals(
+        AuthUtil.isAPIAuthorizedUrns(
+            TestAuthSession.from(editOnly, mockAuthorizer), ENTITY, List.of(createEntity), exists),
+        Map.of(createEntity, 200),
+        "EDIT_ENTITY authorizes CREATE_ENTITY change type when entity already exists");
+    assertEquals(
+        AuthUtil.isAPIAuthorizedUrns(
+            TestAuthSession.from(createOnly, mockAuthorizer),
+            ENTITY,
+            List.of(createEntity),
+            missing),
+        Map.of(createEntity, 200),
+        "CREATE_ENTITY-only may create a missing entity");
+    assertEquals(
+        AuthUtil.isAPIAuthorizedUrns(
+            TestAuthSession.from(createOnly, mockAuthorizer), ENTITY, List.of(upsert), missing),
+        Map.of(upsert, 200),
+        "UPSERT on missing entity uses CREATE privilege path");
+    assertEquals(
+        AuthUtil.isAPIAuthorizedUrns(
+            TestAuthSession.from(createOnly, mockAuthorizer), ENTITY, List.of(upsert), exists),
+        Map.of(upsert, 403),
+        "UPSERT on existing entity requires EDIT, not CREATE_ENTITY alone");
+  }
+
+  @Test
+  public void testPatchAlwaysRequiresEditEntity() {
+    Authentication createOnly =
+        new Authentication(new Actor(ActorType.USER, "createOnlyPatch"), "");
+    Authentication editOnly = new Authentication(new Actor(ActorType.USER, "editOnlyPatch"), "");
+    Authorizer mockAuthorizer =
+        mockAuthorizer(
+            Map.of(
+                createOnly.getActor().toUrnStr(), Map.of("CREATE_ENTITY", Set.of(TEST_ENTITY_1)),
+                editOnly.getActor().toUrnStr(), Map.of("EDIT_ENTITY", Set.of(TEST_ENTITY_1))));
+    Pair<ChangeType, Urn> patch = Pair.of(ChangeType.PATCH, TEST_ENTITY_1);
+    Map<Urn, Boolean> missing = Map.of(TEST_ENTITY_1, false);
+    Map<Urn, Boolean> exists = Map.of(TEST_ENTITY_1, true);
+
+    assertEquals(
+        AuthUtil.isAPIAuthorizedUrns(
+            TestAuthSession.from(createOnly, mockAuthorizer), ENTITY, List.of(patch), missing),
+        Map.of(patch, 403),
+        "PATCH never uses CREATE_ENTITY even when entity is missing");
+    assertEquals(
+        AuthUtil.isAPIAuthorizedUrns(
+            TestAuthSession.from(editOnly, mockAuthorizer), ENTITY, List.of(patch), missing),
+        Map.of(patch, 200),
+        "PATCH on missing entity still requires EDIT_ENTITY");
+    assertEquals(
+        AuthUtil.isAPIAuthorizedUrns(
+            TestAuthSession.from(editOnly, mockAuthorizer), ENTITY, List.of(patch), exists),
+        Map.of(patch, 200),
+        "PATCH on existing entity requires EDIT_ENTITY");
+  }
+
+  @Test
+  public void testExistenceAwareMissingMapKeyFallsBackToHistoricalMapping() {
+    Authentication createOnly =
+        new Authentication(new Actor(ActorType.USER, "createOnlyMissingKey"), "");
+    Authentication editOnly =
+        new Authentication(new Actor(ActorType.USER, "editOnlyMissingKey"), "");
+    Authorizer mockAuthorizer =
+        mockAuthorizer(
+            Map.of(
+                createOnly.getActor().toUrnStr(), Map.of("CREATE_ENTITY", Set.of(TEST_ENTITY_1)),
+                editOnly.getActor().toUrnStr(), Map.of("EDIT_ENTITY", Set.of(TEST_ENTITY_1))));
+    Pair<ChangeType, Urn> upsert = Pair.of(ChangeType.UPSERT, TEST_ENTITY_1);
+    // Non-null map without this URN must not be treated as "does not exist".
+    Map<Urn, Boolean> incomplete = Map.of(TEST_ENTITY_2, false);
+
+    assertEquals(
+        AuthUtil.isAPIAuthorizedUrns(
+            TestAuthSession.from(createOnly, mockAuthorizer), ENTITY, List.of(upsert), incomplete),
+        Map.of(upsert, 403),
+        "missing entityExists key keeps historical UPSERT→UPDATE mapping");
+    assertEquals(
+        AuthUtil.isAPIAuthorizedUrns(
+            TestAuthSession.from(editOnly, mockAuthorizer), ENTITY, List.of(upsert), incomplete),
+        Map.of(upsert, 200),
+        "EDIT_ENTITY still authorizes UPSERT when existence for URN is unknown");
+    assertEquals(
+        AuthUtil.isAPIAuthorizedUrns(
+            TestAuthSession.from(createOnly, mockAuthorizer),
+            ENTITY,
+            List.of(upsert),
+            Map.of(TEST_ENTITY_1, false)),
+        Map.of(upsert, 200),
+        "explicit false still remaps UPSERT to CREATE");
+  }
+
+  @Test
+  public void testChangeTypeCreateAlwaysRequiresEditEntity() {
+    Authentication createOnly =
+        new Authentication(new Actor(ActorType.USER, "createOnlyAspectCreate"), "");
+    Authentication editOnly =
+        new Authentication(new Actor(ActorType.USER, "editOnlyAspectCreate"), "");
+    Authorizer mockAuthorizer =
+        mockAuthorizer(
+            Map.of(
+                createOnly.getActor().toUrnStr(), Map.of("CREATE_ENTITY", Set.of(TEST_ENTITY_1)),
+                editOnly.getActor().toUrnStr(), Map.of("EDIT_ENTITY", Set.of(TEST_ENTITY_1))));
+    Pair<ChangeType, Urn> aspectCreate = Pair.of(ChangeType.CREATE, TEST_ENTITY_1);
+    Map<Urn, Boolean> missing = Map.of(TEST_ENTITY_1, false);
+
+    assertEquals(
+        AuthUtil.isAPIAuthorizedUrns(
+            TestAuthSession.from(createOnly, mockAuthorizer),
+            ENTITY,
+            List.of(aspectCreate),
+            missing),
+        Map.of(aspectCreate, 403),
+        "ChangeType.CREATE (aspect create-if-not-exists) requires EDIT_ENTITY");
+    assertEquals(
+        AuthUtil.isAPIAuthorizedUrns(
+            TestAuthSession.from(editOnly, mockAuthorizer), ENTITY, List.of(aspectCreate), missing),
+        Map.of(aspectCreate, 200),
+        "EDIT_ENTITY authorizes ChangeType.CREATE for createAspect defaults");
+  }
+
+  @Test
+  public void testIsAPIAuthorizedEntityUrnsWithSubResources() {
+    // Create some tag entities for subresources
+    final Urn TEST_SUB_ENTITY_1 = UrnUtils.getUrn("urn:li:tag:tag1");
+    final Urn TEST_SUB_ENTITY_2 = UrnUtils.getUrn("urn:li:tag:tag2");
+    final Urn TEST_SUB_ENTITY_3 = UrnUtils.getUrn("urn:li:tag:tag3");
+
+    Authorizer mockAuthorizer =
+        mockAuthorizer(
+            Map.of(
+                TEST_AUTH_A.getActor().toUrnStr(),
+                Map.of(
+                    "EDIT_ENTITY",
+                        Set.of(TEST_ENTITY_1, TEST_ENTITY_2, TEST_SUB_ENTITY_1, TEST_SUB_ENTITY_2),
+                    "VIEW_ENTITY_PAGE", Set.of(TEST_ENTITY_3, TEST_SUB_ENTITY_3),
+                    "VIEW_ENTITY",
+                        Set.of(
+                            TEST_ENTITY_1,
+                            TEST_ENTITY_2,
+                            TEST_ENTITY_3,
+                            TEST_SUB_ENTITY_1,
+                            TEST_SUB_ENTITY_2,
+                            TEST_SUB_ENTITY_3)),
+                TEST_AUTH_B.getActor().toUrnStr(),
+                Map.of(
+                    "VIEW_ENTITY_PAGE", Set.of(TEST_ENTITY_1, TEST_ENTITY_3, TEST_SUB_ENTITY_1),
+                    "VIEW_ENTITY", Set.of(TEST_ENTITY_1, TEST_ENTITY_3, TEST_SUB_ENTITY_1))));
+
+    // Test User A - should have read access to all main entities and subresources
+    assertTrue(
+        AuthUtil.isAPIAuthorizedEntityUrnsWithSubResources(
+            TestAuthSession.from(TEST_AUTH_A, mockAuthorizer),
+            READ,
+            List.of(TEST_ENTITY_1, TEST_ENTITY_2, TEST_ENTITY_3),
+            List.of(TEST_SUB_ENTITY_1, TEST_SUB_ENTITY_2, TEST_SUB_ENTITY_3)),
+        "Expected User A to have read access to all entities and subresources");
+
+    // Test User A - should have update access to entities 1 & 2 and subresources 1 & 2, but not
+    // entity 3 or subresource 3
+    assertFalse(
+        AuthUtil.isAPIAuthorizedEntityUrnsWithSubResources(
+            TestAuthSession.from(TEST_AUTH_A, mockAuthorizer),
+            UPDATE,
+            List.of(TEST_ENTITY_1, TEST_ENTITY_2, TEST_ENTITY_3),
+            List.of(TEST_SUB_ENTITY_1, TEST_SUB_ENTITY_2, TEST_SUB_ENTITY_3)),
+        "Expected User A to be denied update access due to entity 3 and subresource 3 restrictions");
+
+    // Test User A - should have update access when excluding restricted entities/subresources
+    assertTrue(
+        AuthUtil.isAPIAuthorizedEntityUrnsWithSubResources(
+            TestAuthSession.from(TEST_AUTH_A, mockAuthorizer),
+            UPDATE,
+            List.of(TEST_ENTITY_1, TEST_ENTITY_2),
+            List.of(TEST_SUB_ENTITY_1, TEST_SUB_ENTITY_2)),
+        "Expected User A to have update access to entities 1 & 2 and subresources 1 & 2");
+
+    // Test User B - should have limited read access
+    assertFalse(
+        AuthUtil.isAPIAuthorizedEntityUrnsWithSubResources(
+            TestAuthSession.from(TEST_AUTH_B, mockAuthorizer),
+            READ,
+            List.of(TEST_ENTITY_1, TEST_ENTITY_2, TEST_ENTITY_3),
+            List.of(TEST_SUB_ENTITY_1, TEST_SUB_ENTITY_2, TEST_SUB_ENTITY_3)),
+        "Expected User B to be denied read access due to entity 2 and subresource 2 & 3 restrictions");
+
+    // Test User B - should have read access to allowed entities and subresources only
+    assertTrue(
+        AuthUtil.isAPIAuthorizedEntityUrnsWithSubResources(
+            TestAuthSession.from(TEST_AUTH_B, mockAuthorizer),
+            READ,
+            List.of(TEST_ENTITY_1, TEST_ENTITY_3),
+            List.of(TEST_SUB_ENTITY_1)),
+        "Expected User B to have read access to allowed entities and subresources");
+
+    // Test User B - should be denied update access to all entities and subresources
+    assertFalse(
+        AuthUtil.isAPIAuthorizedEntityUrnsWithSubResources(
+            TestAuthSession.from(TEST_AUTH_B, mockAuthorizer),
+            UPDATE,
+            List.of(TEST_ENTITY_1),
+            List.of(TEST_SUB_ENTITY_1)),
+        "Expected User B to be denied update access to all entities and subresources");
+
+    // Test with empty subresources - should work like the regular method
+    assertTrue(
+        AuthUtil.isAPIAuthorizedEntityUrnsWithSubResources(
+            TestAuthSession.from(TEST_AUTH_A, mockAuthorizer),
+            READ,
+            List.of(TEST_ENTITY_1, TEST_ENTITY_2, TEST_ENTITY_3),
+            List.of()),
+        "Expected method to work with empty subresources list for User A");
+
+    assertFalse(
+        AuthUtil.isAPIAuthorizedEntityUrnsWithSubResources(
+            TestAuthSession.from(TEST_AUTH_B, mockAuthorizer),
+            READ,
+            List.of(TEST_ENTITY_1, TEST_ENTITY_2, TEST_ENTITY_3),
+            List.of()),
+        "Expected method to work with empty subresources list for User B (denied due to entity 2)");
+
+    // Test with empty main resources but with subresources
+    assertTrue(
+        AuthUtil.isAPIAuthorizedEntityUrnsWithSubResources(
+            TestAuthSession.from(TEST_AUTH_A, mockAuthorizer),
+            READ,
+            List.of(),
+            List.of(TEST_SUB_ENTITY_1, TEST_SUB_ENTITY_2, TEST_SUB_ENTITY_3)),
+        "Expected User A to have read access to subresources only");
+
+    assertTrue(
+        AuthUtil.isAPIAuthorizedEntityUrnsWithSubResources(
+            TestAuthSession.from(TEST_AUTH_B, mockAuthorizer),
+            READ,
+            List.of(),
+            List.of(TEST_SUB_ENTITY_1, TEST_SUB_ENTITY_2, TEST_SUB_ENTITY_3)),
+        "Expected User B to be allowed access to subresources 2 & 3");
+  }
+
+  @Test
+  public void testIsAPIAuthorizedForTagModification() {
+    final Urn TEST_TAG = UrnUtils.getUrn("urn:li:tag:Legacy");
+
+    Authorizer mockAuthorizer =
+        mockAuthorizer(
+            Map.of(
+                TEST_AUTH_A.getActor().toUrnStr(),
+                Map.of("EDIT_ENTITY_TAGS", Set.of(TEST_ENTITY_1))));
+
+    assertTrue(
+        AuthUtil.isAPIAuthorizedForTagModification(
+            TestAuthSession.from(TEST_AUTH_A, mockAuthorizer),
+            TEST_ENTITY_1,
+            List.of(TEST_TAG),
+            PoliciesConfig.EDIT_ENTITY_TAGS_PRIVILEGE),
+        "Expected EDIT_ENTITY_TAGS to authorize tag modifications without EDIT_ENTITY");
+
+    assertFalse(
+        AuthUtil.isAPIAuthorizedForTagModification(
+            TestAuthSession.from(TEST_AUTH_B, mockAuthorizer),
+            TEST_ENTITY_1,
+            List.of(TEST_TAG),
+            PoliciesConfig.EDIT_ENTITY_TAGS_PRIVILEGE),
+        "Expected user without EDIT_ENTITY_TAGS to be denied");
+
+    assertTrue(
+        AuthUtil.isAPIAuthorizedForTagModification(
+            TestAuthSession.from(TEST_AUTH_B, mockAuthorizer),
+            TEST_ENTITY_1,
+            Collections.emptyList(),
+            PoliciesConfig.EDIT_ENTITY_TAGS_PRIVILEGE),
+        "Expected empty tag list to skip authorization");
+
+    Authorizer datasetColTagsAuthorizer =
+        mockAuthorizer(
+            Map.of(
+                TEST_AUTH_A.getActor().toUrnStr(),
+                Map.of("EDIT_DATASET_COL_TAGS", Set.of(TEST_ENTITY_1))));
+
+    assertTrue(
+        AuthUtil.isAPIAuthorizedForTagModification(
+            TestAuthSession.from(TEST_AUTH_A, datasetColTagsAuthorizer),
+            TEST_ENTITY_1,
+            List.of(TEST_TAG),
+            PoliciesConfig.EDIT_DATASET_COL_TAGS_PRIVILEGE),
+        "Expected EDIT_DATASET_COL_TAGS to authorize dataset column tag modifications");
+  }
+
+  @Test
+  public void testIsAuthorizedForTagModification() {
+    final Urn TEST_TAG = UrnUtils.getUrn("urn:li:tag:Legacy");
+
+    Authorizer editEntityAuthorizer =
+        mockAuthorizer(
+            Map.of(
+                TEST_AUTH_A.getActor().toUrnStr(), Map.of("EDIT_ENTITY", Set.of(TEST_ENTITY_1))));
+
+    assertTrue(
+        AuthUtil.isAuthorizedForTagModification(
+            TestAuthSession.from(TEST_AUTH_A, editEntityAuthorizer),
+            TEST_ENTITY_1,
+            List.of(TEST_TAG),
+            PoliciesConfig.EDIT_ENTITY_TAGS_PRIVILEGE),
+        "Expected EDIT_ENTITY to authorize tag modifications");
+
+    assertTrue(
+        AuthUtil.isAuthorizedForTagModification(
+            TestAuthSession.from(TEST_AUTH_B, editEntityAuthorizer),
+            TEST_ENTITY_1,
+            Collections.emptyList(),
+            PoliciesConfig.EDIT_ENTITY_TAGS_PRIVILEGE),
+        "Expected empty tag list to skip authorization");
+
+    Authorizer editEntityTagsAuthorizer =
+        mockAuthorizer(
+            Map.of(
+                TEST_AUTH_A.getActor().toUrnStr(),
+                Map.of("EDIT_ENTITY_TAGS", Set.of(TEST_ENTITY_1))));
+
+    assertTrue(
+        AuthUtil.isAuthorizedForTagModification(
+            TestAuthSession.from(TEST_AUTH_A, editEntityTagsAuthorizer),
+            TEST_ENTITY_1,
+            List.of(TEST_TAG),
+            PoliciesConfig.EDIT_ENTITY_TAGS_PRIVILEGE),
+        "Expected EDIT_ENTITY_TAGS to authorize tag modifications without EDIT_ENTITY");
+
+    assertFalse(
+        AuthUtil.isAuthorizedForTagModification(
+            TestAuthSession.from(TEST_AUTH_B, editEntityTagsAuthorizer),
+            TEST_ENTITY_1,
+            List.of(TEST_TAG),
+            PoliciesConfig.EDIT_ENTITY_TAGS_PRIVILEGE),
+        "Expected user without tag privileges to be denied");
+  }
+
+  @Test
+  public void testTagModificationPrivilege() {
+    Urn datasetUrn = UrnUtils.getUrn("urn:li:dataset:(urn:li:dataPlatform:test,test,PROD)");
+    Urn dataFlowUrn = UrnUtils.getUrn("urn:li:dataFlow:(urn:li:dataPlatform:airflow,flow,PROD)");
+
+    assertEquals(
+        PoliciesConfig.EDIT_DATASET_COL_TAGS_PRIVILEGE,
+        AuthUtil.tagModificationPrivilege(datasetUrn, true));
+    assertEquals(
+        PoliciesConfig.EDIT_ENTITY_TAGS_PRIVILEGE,
+        AuthUtil.tagModificationPrivilege(datasetUrn, false));
+    assertEquals(
+        PoliciesConfig.EDIT_ENTITY_TAGS_PRIVILEGE,
+        AuthUtil.tagModificationPrivilege(dataFlowUrn, true));
+  }
+
+  @Test
+  public void testTagModificationPrivilegeGroup() {
+    assertEquals(
+        AuthUtil.tagModificationPrivilegeGroup(PoliciesConfig.EDIT_ENTITY_TAGS_PRIVILEGE),
+        new DisjunctivePrivilegeGroup(
+            List.of(
+                new ConjunctivePrivilegeGroup(List.of("EDIT_ENTITY")),
+                new ConjunctivePrivilegeGroup(List.of("EDIT_ENTITY_TAGS")))));
+
+    assertEquals(
+        AuthUtil.tagModificationPrivilegeGroup(PoliciesConfig.EDIT_DATASET_COL_TAGS_PRIVILEGE),
+        new DisjunctivePrivilegeGroup(
+            List.of(
+                new ConjunctivePrivilegeGroup(List.of("EDIT_ENTITY")),
+                new ConjunctivePrivilegeGroup(List.of("EDIT_DATASET_COL_TAGS")))));
+  }
+
+  @Test
+  public void testIsAPIAuthorizedForStructuredPropertyModification() {
+    final Urn TEST_PROPERTY = UrnUtils.getUrn("urn:li:structuredProperty:test1");
+
+    Authorizer mockAuthorizer =
+        mockAuthorizer(
+            Map.of(
+                TEST_AUTH_A.getActor().toUrnStr(),
+                Map.of("EDIT_ENTITY_PROPERTIES", Set.of(TEST_ENTITY_1))));
+
+    assertTrue(
+        AuthUtil.isAPIAuthorizedForStructuredPropertyModification(
+            TestAuthSession.from(TEST_AUTH_A, mockAuthorizer),
+            TEST_ENTITY_1,
+            List.of(TEST_PROPERTY)),
+        "Expected EDIT_ENTITY_PROPERTIES to authorize structured property modifications without EDIT_ENTITY");
+
+    assertFalse(
+        AuthUtil.isAPIAuthorizedForStructuredPropertyModification(
+            TestAuthSession.from(TEST_AUTH_B, mockAuthorizer),
+            TEST_ENTITY_1,
+            List.of(TEST_PROPERTY)),
+        "Expected user without EDIT_ENTITY_PROPERTIES to be denied");
+
+    assertTrue(
+        AuthUtil.isAPIAuthorizedForStructuredPropertyModification(
+            TestAuthSession.from(TEST_AUTH_B, mockAuthorizer),
+            TEST_ENTITY_1,
+            Collections.emptyList()),
+        "Expected empty property list to skip authorization");
+  }
+
+  @Test
+  public void testStructuredPropertyModificationPrivilegeGroup() {
+    assertEquals(
+        AuthUtil.structuredPropertyModificationPrivilegeGroup(),
+        new DisjunctivePrivilegeGroup(
+            List.of(
+                new ConjunctivePrivilegeGroup(List.of("EDIT_ENTITY")),
+                new ConjunctivePrivilegeGroup(List.of("EDIT_ENTITY_PROPERTIES")))));
+  }
+
+  @Test
+  public void testIsAPIAuthorizedSkipsWhenRestApiAuthorizationDisabled() throws Exception {
+    final Urn TEST_TAG = UrnUtils.getUrn("urn:li:tag:Legacy");
+    boolean previous = getRestApiAuthorizationEnabled();
+    setRestApiAuthorizationEnabled(false);
+    try {
+      assertTrue(
+          AuthUtil.isAPIAuthorizedForTagModification(
+              TestAuthSession.from(TEST_AUTH_B, mock(Authorizer.class)),
+              TEST_ENTITY_1,
+              List.of(TEST_TAG),
+              PoliciesConfig.EDIT_ENTITY_TAGS_PRIVILEGE),
+          "Expected REST API authorization disabled to bypass tag checks");
+    } finally {
+      setRestApiAuthorizationEnabled(previous);
+    }
+  }
+
+  private static boolean getRestApiAuthorizationEnabled() {
+    return AuthUtil.isRestApiAuthorizationEnabled();
+  }
+
+  private static void setRestApiAuthorizationEnabled(boolean enabled) throws Exception {
+    Field field = AuthUtil.class.getDeclaredField("isRestApiAuthorizationEnabled");
+    field.setAccessible(true);
+    field.setBoolean(null, enabled);
+  }
+
+  private Authorizer mockAuthorizer(Map<String, Map<String, Set<Urn>>> allowActorPrivUrn) {
+    Authorizer authorizer = mock(Authorizer.class);
+    when(authorizer.authorize(any()))
+        .thenAnswer(
+            args -> {
+              AuthorizationRequest req = args.getArgument(0);
+              String actorUrn = req.getActorUrn();
+              String priv = req.getPrivilege();
+
+              if (!allowActorPrivUrn.containsKey(actorUrn)) {
+                return new AuthorizationResult(
+                    req, AuthorizationResult.Type.DENY, String.format("Actor %s denied", actorUrn));
+              }
+
+              Map<String, Set<Urn>> privMap = allowActorPrivUrn.get(actorUrn);
+              if (!privMap.containsKey(priv)) {
+                return new AuthorizationResult(
+                    req, AuthorizationResult.Type.DENY, String.format("Privilege %s denied", priv));
+              }
+
+              if (req.getResourceSpec().isPresent()) {
+                Urn entityUrn = UrnUtils.getUrn(req.getResourceSpec().get().getEntity());
+                Set<Urn> resources = privMap.get(priv);
+                if (!resources.contains(entityUrn)) {
+                  return new AuthorizationResult(
+                      req,
+                      AuthorizationResult.Type.DENY,
+                      String.format("Entity %s denied", entityUrn));
+                }
+              }
+
+              return new AuthorizationResult(req, AuthorizationResult.Type.ALLOW, "Allowed");
+            });
+    return authorizer;
+  }
+}

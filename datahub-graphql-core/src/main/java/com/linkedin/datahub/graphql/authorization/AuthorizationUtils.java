@@ -1,0 +1,633 @@
+package com.linkedin.datahub.graphql.authorization;
+
+import static com.datahub.authorization.AuthUtil.isViewRestrictedEntityType;
+import static com.linkedin.metadata.Constants.*;
+import static com.linkedin.metadata.authorization.ApiOperation.CREATE;
+import static com.linkedin.metadata.authorization.ApiOperation.DELETE;
+import static com.linkedin.metadata.authorization.ApiOperation.MANAGE;
+import static com.linkedin.metadata.authorization.ApiOperation.UPDATE;
+import static com.linkedin.metadata.authorization.PoliciesConfig.MANAGE_ACCESS_TOKENS;
+
+import com.datahub.authorization.AuthUtil;
+import com.datahub.authorization.ConjunctivePrivilegeGroup;
+import com.datahub.authorization.DisjunctivePrivilegeGroup;
+import com.datahub.authorization.EntitySpec;
+import com.google.common.collect.ImmutableList;
+import com.linkedin.common.SubTypes;
+import com.linkedin.common.urn.Urn;
+import com.linkedin.common.urn.UrnUtils;
+import com.linkedin.datahub.graphql.QueryContext;
+import com.linkedin.datahub.graphql.generated.PatchEntityInput;
+import com.linkedin.knowledge.DocumentInfo;
+import com.linkedin.metadata.authorization.ApiGroup;
+import com.linkedin.metadata.authorization.ApiOperation;
+import com.linkedin.metadata.authorization.EntityAuthorizationUtils;
+import com.linkedin.metadata.authorization.PoliciesConfig;
+import com.linkedin.metadata.authorization.TimeseriesAuthUtil;
+import com.linkedin.metadata.service.DocumentAuthorizationUtils;
+import io.datahubproject.metadata.context.OperationContext;
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.reflect.ConstructorUtils;
+import org.apache.commons.lang3.reflect.FieldUtils;
+import org.apache.commons.lang3.reflect.MethodUtils;
+import org.codehaus.plexus.util.StringUtils;
+
+@Slf4j
+public class AuthorizationUtils {
+
+  private static final String GRAPHQL_GENERATED_PACKAGE = "com.linkedin.datahub.graphql.generated";
+
+  public static final ConjunctivePrivilegeGroup ALL_PRIVILEGES_GROUP =
+      new ConjunctivePrivilegeGroup(
+          ImmutableList.of(PoliciesConfig.EDIT_ENTITY_PRIVILEGE.getType()));
+
+  public static boolean canManageUsersAndGroups(@Nonnull QueryContext context) {
+    return AuthUtil.isAuthorizedEntityType(
+        context.getOperationContext(),
+        MANAGE,
+        List.of(CORP_USER_ENTITY_NAME, CORP_GROUP_ENTITY_NAME));
+  }
+
+  public static boolean canManagePolicies(@Nonnull QueryContext context) {
+    return AuthUtil.isAuthorizedEntityType(
+        context.getOperationContext(), MANAGE, List.of(POLICY_ENTITY_NAME));
+  }
+
+  public static boolean canGeneratePersonalAccessToken(@Nonnull QueryContext context) {
+    return AuthUtil.isAuthorized(
+            context.getOperationContext(), PoliciesConfig.GENERATE_PERSONAL_ACCESS_TOKENS_PRIVILEGE)
+        || AuthUtil.isAuthorized(context.getOperationContext(), MANAGE_ACCESS_TOKENS);
+  }
+
+  public static boolean canManageTokens(@Nonnull QueryContext context) {
+    return AuthUtil.isAuthorizedEntityType(
+        context.getOperationContext(), MANAGE, List.of(ACCESS_TOKEN_ENTITY_NAME));
+  }
+
+  public static boolean canManageServiceAccounts(@Nonnull QueryContext context) {
+    return AuthUtil.isAuthorized(
+        context.getOperationContext(), PoliciesConfig.MANAGE_SERVICE_ACCOUNTS_PRIVILEGE);
+  }
+
+  /**
+   * Returns true if the current used is able to create Domains. This is true if the user has the
+   * 'Manage Domains' or 'Create Domains' platform privilege.
+   */
+  public static boolean canCreateDomains(@Nonnull QueryContext context) {
+    final DisjunctivePrivilegeGroup orPrivilegeGroups =
+        new DisjunctivePrivilegeGroup(
+            ImmutableList.of(
+                new ConjunctivePrivilegeGroup(
+                    ImmutableList.of(PoliciesConfig.CREATE_DOMAINS_PRIVILEGE.getType())),
+                new ConjunctivePrivilegeGroup(
+                    ImmutableList.of(PoliciesConfig.MANAGE_DOMAINS_PRIVILEGE.getType()))));
+
+    return AuthUtil.isAuthorized(context.getOperationContext(), orPrivilegeGroups, null);
+  }
+
+  public static boolean canCreateLogicalModels(@Nonnull QueryContext context) {
+    return AuthUtil.isAuthorized(
+        context.getOperationContext(), PoliciesConfig.CREATE_LOGICAL_MODELS_PRIVILEGE);
+  }
+
+  public static boolean canManageDomains(@Nonnull QueryContext context) {
+    return AuthUtil.isAuthorized(
+        context.getOperationContext(), PoliciesConfig.MANAGE_DOMAINS_PRIVILEGE);
+  }
+
+  /**
+   * Returns true if the current used is able to create Tags. This is true if the user has the
+   * 'Manage Tags' or 'Create Tags' platform privilege.
+   */
+  public static boolean canCreateTags(@Nonnull QueryContext context) {
+    final DisjunctivePrivilegeGroup orPrivilegeGroups =
+        new DisjunctivePrivilegeGroup(
+            ImmutableList.of(
+                new ConjunctivePrivilegeGroup(
+                    ImmutableList.of(PoliciesConfig.CREATE_TAGS_PRIVILEGE.getType())),
+                new ConjunctivePrivilegeGroup(
+                    ImmutableList.of(PoliciesConfig.MANAGE_TAGS_PRIVILEGE.getType()))));
+
+    return AuthUtil.isAuthorized(context.getOperationContext(), orPrivilegeGroups, null);
+  }
+
+  public static boolean canManageTags(@Nonnull QueryContext context) {
+    return AuthUtil.isAuthorized(
+        context.getOperationContext(), PoliciesConfig.MANAGE_TAGS_PRIVILEGE);
+  }
+
+  public static boolean canViewManageTags(@Nonnull QueryContext context) {
+    return AuthUtil.isAuthorized(
+        context.getOperationContext(), PoliciesConfig.VIEW_MANAGE_TAGS_PRIVILEGE);
+  }
+
+  public static boolean canDeleteEntity(@Nonnull Urn entityUrn, @Nonnull QueryContext context) {
+    return AuthUtil.isAuthorizedEntityUrns(
+        context.getOperationContext(), DELETE, List.of(entityUrn));
+  }
+
+  public static boolean canManageUserCredentials(@Nonnull QueryContext context) {
+    return AuthUtil.isAuthorized(
+        context.getOperationContext(), PoliciesConfig.MANAGE_USER_CREDENTIALS_PRIVILEGE);
+  }
+
+  public static boolean canEditGroupMembers(
+      @Nonnull String groupUrnStr, @Nonnull QueryContext context) {
+    final DisjunctivePrivilegeGroup orPrivilegeGroups =
+        new DisjunctivePrivilegeGroup(
+            ImmutableList.of(
+                ALL_PRIVILEGES_GROUP,
+                new ConjunctivePrivilegeGroup(
+                    ImmutableList.of(PoliciesConfig.EDIT_GROUP_MEMBERS_PRIVILEGE.getType()))));
+
+    return isAuthorized(context, CORP_GROUP_ENTITY_NAME, groupUrnStr, orPrivilegeGroups);
+  }
+
+  public static boolean canCreateGlobalAnnouncements(@Nonnull QueryContext context) {
+    final DisjunctivePrivilegeGroup orPrivilegeGroups =
+        new DisjunctivePrivilegeGroup(
+            ImmutableList.of(
+                new ConjunctivePrivilegeGroup(
+                    ImmutableList.of(
+                        PoliciesConfig.CREATE_GLOBAL_ANNOUNCEMENTS_PRIVILEGE.getType())),
+                new ConjunctivePrivilegeGroup(
+                    ImmutableList.of(
+                        PoliciesConfig.MANAGE_GLOBAL_ANNOUNCEMENTS_PRIVILEGE.getType()))));
+
+    return AuthUtil.isAuthorized(context.getOperationContext(), orPrivilegeGroups, null);
+  }
+
+  public static boolean canManageGlobalAnnouncements(@Nonnull QueryContext context) {
+    return AuthUtil.isAuthorized(
+        context.getOperationContext(), PoliciesConfig.MANAGE_GLOBAL_ANNOUNCEMENTS_PRIVILEGE);
+  }
+
+  public static boolean canManageGlobalViews(@Nonnull QueryContext context) {
+    return AuthUtil.isAuthorized(context.getOperationContext(), PoliciesConfig.MANAGE_GLOBAL_VIEWS);
+  }
+
+  public static boolean canManageGlobalSettings(@Nonnull QueryContext context) {
+    return AuthUtil.isAuthorized(
+        context.getOperationContext(), PoliciesConfig.MANAGE_GLOBAL_SETTINGS);
+  }
+
+  public static boolean canManageOwnershipTypes(@Nonnull QueryContext context) {
+    return AuthUtil.isAuthorized(
+        context.getOperationContext(), PoliciesConfig.MANAGE_GLOBAL_OWNERSHIP_TYPES);
+  }
+
+  /**
+   * Checks EDIT_ENTITY_PROPERTIES on the target, scoped to the structured properties being modified
+   * so per-property privilege constraints are enforced. Callers that are not modifying structured
+   * properties must pass an empty collection explicitly.
+   */
+  public static boolean canEditProperties(
+      @Nonnull Urn targetUrn,
+      @Nonnull QueryContext context,
+      @Nonnull Collection<Urn> structuredPropertyUrns) {
+    // If you either have all entity privileges, or have the specific privileges required, you are
+    // authorized.
+    final DisjunctivePrivilegeGroup orPrivilegeGroups =
+        new DisjunctivePrivilegeGroup(
+            ImmutableList.of(
+                ALL_PRIVILEGES_GROUP,
+                new ConjunctivePrivilegeGroup(
+                    ImmutableList.of(PoliciesConfig.EDIT_ENTITY_PROPERTIES_PRIVILEGE.getType()))));
+
+    return isAuthorizedForStructuredProperties(
+        context,
+        targetUrn.getEntityType(),
+        targetUrn.toString(),
+        orPrivilegeGroups,
+        structuredPropertyUrns);
+  }
+
+  private static boolean isAuthorizedForStructuredProperties(
+      @Nonnull QueryContext context,
+      @Nonnull String resourceType,
+      @Nonnull String resource,
+      @Nonnull DisjunctivePrivilegeGroup privilegeGroup,
+      @Nonnull Collection<Urn> structuredPropertyUrns) {
+    final EntitySpec resourceSpec = new EntitySpec(resourceType, resource);
+    final Set<EntitySpec> subResources =
+        structuredPropertyUrns.stream()
+            .map(propUrn -> new EntitySpec(STRUCTURED_PROPERTY_ENTITY_NAME, propUrn.toString()))
+            .collect(Collectors.toSet());
+    return AuthUtil.isAuthorized(
+        context.getOperationContext(), privilegeGroup, resourceSpec, subResources);
+  }
+
+  public static boolean canEditEntityQueries(
+      @Nonnull List<Urn> entityUrns, @Nonnull QueryContext context) {
+    final DisjunctivePrivilegeGroup orPrivilegeGroups =
+        new DisjunctivePrivilegeGroup(
+            ImmutableList.of(
+                ALL_PRIVILEGES_GROUP,
+                new ConjunctivePrivilegeGroup(
+                    ImmutableList.of(PoliciesConfig.EDIT_QUERIES_PRIVILEGE.getType()))));
+    return entityUrns.stream()
+        .allMatch(
+            entityUrn ->
+                isAuthorized(
+                    context, entityUrn.getEntityType(), entityUrn.toString(), orPrivilegeGroups));
+  }
+
+  public static boolean canCreateQuery(
+      @Nonnull List<Urn> subjectUrns, @Nonnull QueryContext context) {
+    // Currently - you only need permission to edit an entity's queries to create a query.
+    return canEditEntityQueries(subjectUrns, context);
+  }
+
+  public static boolean canUpdateQuery(
+      @Nonnull List<Urn> subjectUrns, @Nonnull QueryContext context) {
+    // Currently - you only need permission to edit an entity's queries to update any query.
+    return canEditEntityQueries(subjectUrns, context);
+  }
+
+  public static boolean canDeleteQuery(
+      @Nonnull Urn entityUrn, @Nonnull List<Urn> subjectUrns, @Nonnull QueryContext context) {
+    // Currently - you only need permission to edit an entity's queries to remove any query.
+    return canEditEntityQueries(subjectUrns, context);
+  }
+
+  /**
+   * Can view relationship logic goes here. Should be considered directionless for now. Or direction
+   * added to the interface.
+   *
+   * @param opContext
+   * @param a
+   * @param b
+   * @return
+   */
+  public static boolean canViewRelationship(
+      @Nonnull OperationContext opContext, @Nonnull Urn a, @Nonnull Urn b) {
+    // TODO  relationships filter
+    return true;
+  }
+
+  /**
+   * View Authorization gate for GraphQL mapper redaction and search-result visibility.
+   *
+   * <p>Activation is controlled only by View Authorization ({@code
+   * viewAuthorizationConfiguration.enabled}) plus the restricted-type set. When the gate is
+   * inactive this returns {@code true} without consulting privileges. Privilege evaluation uses the
+   * shared {@link EntityAuthorizationUtils#canViewEntity} evaluator (bridge-aware for documents).
+   *
+   * <p>This is intentionally separate from REST API authorization ({@code
+   * authorization.restApiAuthorization}) and from explicit GraphQL document operations such as
+   * {@link #canGetDocument}, which always evaluate privileges.
+   *
+   * @see com.datahub.authorization.AuthUtil#isViewRestrictedEntityType
+   * @see <a href="https://docs.datahub.com/docs/features/feature-guides/search-access-controls">
+   *     Search Access Controls</a>
+   */
+  public static boolean canView(@Nonnull OperationContext opContext, @Nonnull Urn urn) {
+    if (opContext.getOperationContextConfig().getViewAuthorizationConfiguration().isEnabled()
+        && !opContext.isSystemAuth()
+        && isViewRestrictedEntityType(
+            opContext.getOperationContextConfig().getViewAuthorizationConfiguration(),
+            urn.getEntityType())) {
+      return EntityAuthorizationUtils.canViewEntity(opContext, urn);
+    }
+    return true;
+  }
+
+  /**
+   * View Authorization gate for documents when {@code documentInfo}/{@code subTypes} are already
+   * loaded (e.g. GraphQL DocumentMapper). Same activation short-circuits as {@link #canView}, then
+   * evaluates bridge-aware VIEW without re-fetching aspects.
+   *
+   * <p>For privilege checks that must run regardless of View Authorization (timeline, change
+   * history, mutations), use {@link #canGetDocument} instead.
+   */
+  public static boolean canViewDocument(
+      @Nonnull OperationContext opContext,
+      @Nonnull Urn documentUrn,
+      @Nullable DocumentInfo documentInfo,
+      @Nullable SubTypes subTypes) {
+    if (opContext.getOperationContextConfig().getViewAuthorizationConfiguration().isEnabled()
+        && !opContext.isSystemAuth()
+        && isViewRestrictedEntityType(
+            opContext.getOperationContextConfig().getViewAuthorizationConfiguration(),
+            documentUrn.getEntityType())) {
+      return DocumentAuthorizationUtils.canViewDocumentEntity(
+          opContext, opContext.getAspectRetriever(), documentUrn, documentInfo, subTypes);
+    }
+    return true;
+  }
+
+  public static <T> T restrictEntity(@Nonnull Object entity, Class<T> clazz) {
+    List<Field> allFields = FieldUtils.getAllFieldsList(entity.getClass());
+    try {
+      Object[] args =
+          allFields.stream()
+              // New versions of graphql.codegen generate serialVersionUID
+              // We need to filter serialVersionUID out because serialVersionUID is
+              // never part of the entity type constructor
+              .filter(field -> !field.getName().contains("serialVersionUID"))
+              .map(
+                  field -> {
+                    // properties are often not required but only because
+                    // they are a `one of` non-null.
+                    // i.e. ChartProperties or ChartEditableProperties are required.
+                    if (field.getAnnotation(javax.annotation.Nonnull.class) != null
+                        || field.getName().toLowerCase().contains("properties")
+                        || field.getType().isPrimitive()) {
+                      try {
+                        switch (field.getName()) {
+                          // pass through to the restricted entity
+                          case "name":
+                          case "type":
+                          case "urn":
+                          case "chartId":
+                          case "id":
+                          case "jobId":
+                          case "flowId":
+                            Method fieldGetter =
+                                MethodUtils.getMatchingMethod(
+                                    entity.getClass(),
+                                    "get" + StringUtils.capitalise(field.getName()));
+                            return fieldGetter.invoke(entity, (Object[]) null);
+                          default:
+                            switch (field.getType().getSimpleName()) {
+                              case "boolean":
+                              case "Boolean":
+                                Method boolGetter =
+                                    MethodUtils.getMatchingMethod(
+                                        entity.getClass(),
+                                        "get" + StringUtils.capitalise(field.getName()));
+                                return Boolean.TRUE.equals(
+                                    boolGetter.invoke(entity, (Object[]) null));
+                              // mask these fields in the restricted entity
+                              case "char":
+                              case "String":
+                                return "";
+                              case "short":
+                              case "Short":
+                              case "int":
+                              case "Integer":
+                                return 0;
+                              case "long":
+                              case "Long":
+                                return 0L;
+                              case "float":
+                              case "Float":
+                                return 0F;
+                              case "double":
+                              case "Double":
+                                return 0D;
+                              case "List":
+                                return List.of();
+                              default:
+                                if (Enum.class.isAssignableFrom(field.getType())) {
+                                  // pass through enum
+                                  Method enumGetter =
+                                      MethodUtils.getMatchingMethod(
+                                          entity.getClass(),
+                                          "get" + StringUtils.capitalise(field.getName()));
+                                  return enumGetter.invoke(entity, (Object[]) null);
+                                } else if (entity
+                                    .getClass()
+                                    .getPackage()
+                                    .getName()
+                                    .contains(GRAPHQL_GENERATED_PACKAGE)) {
+                                  // handle nested fields recursively
+                                  Method getter =
+                                      MethodUtils.getMatchingMethod(
+                                          entity.getClass(),
+                                          "get" + StringUtils.capitalise(field.getName()));
+                                  Object nestedEntity = getter.invoke(entity, (Object[]) null);
+                                  if (nestedEntity == null) {
+                                    return null;
+                                  } else {
+                                    return restrictEntity(nestedEntity, getter.getReturnType());
+                                  }
+                                }
+                                log.error(
+                                    String.format(
+                                        "Failed to resolve non-null field: Object:%s Field:%s FieldType: %s",
+                                        entity.getClass().getName(),
+                                        field.getName(),
+                                        field.getType().getName()));
+                            }
+                        }
+                      } catch (IllegalAccessException | InvocationTargetException e) {
+                        throw new RuntimeException(e);
+                      }
+                    }
+                    return (Object) null;
+                  })
+              .toArray();
+      return ConstructorUtils.invokeConstructor(clazz, args);
+    } catch (NoSuchMethodException
+        | IllegalAccessException
+        | InvocationTargetException
+        | InstantiationException e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  public static boolean canManageStructuredProperties(@Nonnull QueryContext context) {
+    return AuthUtil.isAuthorizedEntityType(
+        context.getOperationContext(), MANAGE, List.of(STRUCTURED_PROPERTY_ENTITY_NAME));
+  }
+
+  public static boolean canViewStructuredPropertiesPage(@Nonnull QueryContext context) {
+    return AuthUtil.isAuthorized(
+        context.getOperationContext(), PoliciesConfig.VIEW_STRUCTURED_PROPERTIES_PAGE_PRIVILEGE);
+  }
+
+  public static boolean canManageForms(@Nonnull QueryContext context) {
+    return AuthUtil.isAuthorized(
+        context.getOperationContext(), PoliciesConfig.MANAGE_DOCUMENTATION_FORMS_PRIVILEGE);
+  }
+
+  public static boolean canManageFeatures(@Nonnull QueryContext context) {
+    return AuthUtil.isAuthorized(
+        context.getOperationContext(), PoliciesConfig.MANAGE_FEATURES_PRIVILEGE);
+  }
+
+  public static boolean canManageHomePageTemplates(@Nonnull QueryContext context) {
+    return AuthUtil.isAuthorized(
+        context.getOperationContext(), PoliciesConfig.MANAGE_HOME_PAGE_TEMPLATES_PRIVILEGE);
+  }
+
+  /**
+   * Returns true if the current user can create Documents. This is true with the standard ENTITY
+   * create privileges ({@code CREATE_ENTITY} or {@code EDIT_ENTITY}) for documents, or the platform
+   * {@code MANAGE_DOCUMENTS} privilege.
+   */
+  public static boolean canCreateDocument(@Nonnull QueryContext context) {
+    return AuthUtil.isAuthorizedEntityType(
+        context.getOperationContext(), CREATE, List.of(DOCUMENT_ENTITY_NAME));
+  }
+
+  /**
+   * Returns true if the current user is able to edit a specific Document. Uses the shared document
+   * privilege map ({@code EDIT_ENTITY} or {@code MANAGE_DOCUMENTS}).
+   */
+  public static boolean canEditDocument(@Nonnull Urn documentUrn, @Nonnull QueryContext context) {
+    return DocumentAuthorizationUtils.isAuthorizedDocumentOperation(
+        context.getOperationContext(), UPDATE, documentUrn);
+  }
+
+  /**
+   * Explicit GraphQL document/entity READ privilege check. Always evaluates the shared document
+   * VIEW evaluator (ENTITY READ / platform MANAGE_DOCUMENTS, with bridge source inheritance) and is
+   * not gated by View Authorization. Non-document URNs fall through to standard ENTITY READ.
+   *
+   * <p>Use this for direct operations such as timeline and change history. Mapper redaction should
+   * use {@link #canView} / {@link #canViewDocument} instead.
+   */
+  public static boolean canGetDocument(@Nonnull Urn documentUrn, @Nonnull QueryContext context) {
+    return DocumentAuthorizationUtils.canViewDocumentEntity(
+        context.getOperationContext(), documentUrn);
+  }
+
+  /**
+   * Returns true if the current user is able to delete a specific Document. Uses the shared
+   * document privilege map ({@code DELETE_ENTITY} or {@code MANAGE_DOCUMENTS}).
+   */
+  public static boolean canDeleteDocument(@Nonnull Urn documentUrn, @Nonnull QueryContext context) {
+    return DocumentAuthorizationUtils.isAuthorizedDocumentOperation(
+        context.getOperationContext(), DELETE, documentUrn);
+  }
+
+  /** Returns true if the current user has the platform-level 'Manage Documents' privilege. */
+  public static boolean canManageDocuments(@Nonnull QueryContext context) {
+    return AuthUtil.isAuthorized(
+        context.getOperationContext(), PoliciesConfig.MANAGE_DOCUMENTS_PRIVILEGE);
+  }
+
+  public static boolean isAuthorized(
+      @Nonnull QueryContext context,
+      @Nonnull String resourceType,
+      @Nonnull String resource,
+      @Nonnull DisjunctivePrivilegeGroup privilegeGroup) {
+    final EntitySpec resourceSpec = new EntitySpec(resourceType, resource);
+    return AuthUtil.isAuthorized(context.getOperationContext(), privilegeGroup, resourceSpec);
+  }
+
+  /**
+   * Checks authorization for patch operations.
+   *
+   * <p>A patch of an entity that does not yet exist is a create: it is authorized with the entity
+   * type's API CREATE privileges. A patch of an existing entity, including a soft-deleted one, is
+   * an update. Edit Entity on the target is always sufficient. In addition, the entity type's own
+   * API privilege for that operation is accepted (for example Manage Policies for {@code
+   * dataHubPolicy}), so an actor granted a type-specific management privilege can patch that type
+   * without Edit Entity, the same way the dedicated GraphQL mutations for those types already
+   * allow.
+   *
+   * <p>The resource type used for policy matching is always taken from the URN, which is what the
+   * patch is applied to, never from the client-supplied {@code entityType}. Otherwise a grant
+   * scoped to one entity type could be matched against a URN of a different type by claiming the
+   * wrong type. A URN that cannot be parsed, or a client type that disagrees with the URN, is
+   * rejected.
+   *
+   * @param input Patch entity input
+   * @param context Query context
+   * @param entityExists whether the URN already exists, including soft-deleted entities
+   * @return true if authorized, false otherwise
+   */
+  public static boolean isAuthorizedForPatch(
+      @Nonnull PatchEntityInput input, @Nonnull QueryContext context, boolean entityExists) {
+
+    String entityType = null;
+    if (input.getUrn() != null) {
+      try {
+        entityType = UrnUtils.getUrn(input.getUrn()).getEntityType();
+      } catch (Exception e) {
+        log.warn("Failed to extract entity type from URN: {}", input.getUrn(), e);
+      }
+    }
+    if (entityType == null) {
+      return false;
+    }
+    if (input.getEntityType() != null && !entityType.equals(input.getEntityType())) {
+      log.warn(
+          "Rejecting patch: entityType {} does not match URN entity type {} for {}",
+          input.getEntityType(),
+          entityType,
+          input.getUrn());
+      return false;
+    }
+
+    final ApiOperation operation = entityExists ? ApiOperation.UPDATE : ApiOperation.CREATE;
+    final List<ConjunctivePrivilegeGroup> groups =
+        new ArrayList<>(
+            AuthUtil.buildDisjunctivePrivilegeGroup(ApiGroup.ENTITY, operation, entityType)
+                .getAuthorizedPrivilegeGroups());
+    groups.add(ALL_PRIVILEGES_GROUP);
+    final DisjunctivePrivilegeGroup orPrivilegeGroups = new DisjunctivePrivilegeGroup(groups);
+
+    return isAuthorized(context, entityType, input.getUrn(), orPrivilegeGroups);
+  }
+
+  public static boolean isAuthorizedForTags(
+      @Nonnull QueryContext context,
+      @Nonnull String resourceType,
+      @Nonnull String resource,
+      @Nonnull DisjunctivePrivilegeGroup privilegeGroup,
+      @Nonnull Collection<Urn> tagUrns) {
+    final EntitySpec resourceSpec = new EntitySpec(resourceType, resource);
+    final Set<EntitySpec> subResources =
+        tagUrns.stream()
+            .map(tagUrn -> new EntitySpec(TAG_ENTITY_NAME, tagUrn.toString()))
+            .collect(Collectors.toSet());
+    return AuthUtil.isAuthorized(
+        context.getOperationContext(), privilegeGroup, resourceSpec, subResources);
+  }
+
+  public static boolean isViewDatasetUsageAuthorized(
+      final QueryContext context, final Urn resourceUrn) {
+    String aspectName =
+        DASHBOARD_ENTITY_NAME.equals(resourceUrn.getEntityType())
+            ? DASHBOARD_USAGE_STATISTICS_ASPECT_NAME
+            : DATASET_USAGE_STATISTICS_ASPECT_NAME;
+    return TimeseriesAuthUtil.canViewAspect(
+        context.getOperationContext(), resourceUrn, resourceUrn.getEntityType(), aspectName);
+  }
+
+  public static boolean isViewDatasetProfileAuthorized(
+      final QueryContext context, final Urn resourceUrn) {
+    return TimeseriesAuthUtil.canViewAspect(
+        context.getOperationContext(),
+        resourceUrn,
+        resourceUrn.getEntityType(),
+        DATASET_PROFILE_ASPECT_NAME);
+  }
+
+  public static boolean isViewDatasetOperationsAuthorized(
+      final QueryContext context, final Urn resourceUrn) {
+    return TimeseriesAuthUtil.canViewAspect(
+        context.getOperationContext(),
+        resourceUrn,
+        resourceUrn.getEntityType(),
+        DATASET_OPERATION_ASPECT_NAME);
+  }
+
+  public static boolean canManageAssetSummary(@Nonnull QueryContext context, @Nonnull Urn urn) {
+    final DisjunctivePrivilegeGroup orPrivilegeGroups =
+        new DisjunctivePrivilegeGroup(
+            ImmutableList.of(
+                ALL_PRIVILEGES_GROUP,
+                new ConjunctivePrivilegeGroup(
+                    ImmutableList.of(PoliciesConfig.MANAGE_ASSET_SUMMARY_PRIVILEGE.getType()))));
+
+    return AuthorizationUtils.isAuthorized(
+        context, urn.getEntityType(), urn.toString(), orPrivilegeGroups);
+  }
+
+  private AuthorizationUtils() {}
+}

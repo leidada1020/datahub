@@ -1,0 +1,448 @@
+package com.linkedin.metadata.structuredproperties.validation;
+
+import static com.linkedin.metadata.Constants.*;
+import static com.linkedin.structured.PropertyCardinality.*;
+
+import com.datahub.context.OperationFingerprint;
+import com.google.common.collect.ImmutableSet;
+import com.linkedin.common.Status;
+import com.linkedin.common.urn.Urn;
+import com.linkedin.common.urn.UrnUtils;
+import com.linkedin.data.template.GetMode;
+import com.linkedin.data.template.StringArrayMap;
+import com.linkedin.entity.Aspect;
+import com.linkedin.metadata.Constants;
+import com.linkedin.metadata.aspect.AspectRetriever;
+import com.linkedin.metadata.aspect.RetrieverContext;
+import com.linkedin.metadata.aspect.batch.BatchItem;
+import com.linkedin.metadata.aspect.batch.ChangeMCP;
+import com.linkedin.metadata.aspect.batch.MCPItem;
+import com.linkedin.metadata.aspect.plugins.config.AspectPluginConfig;
+import com.linkedin.metadata.aspect.plugins.validation.AspectPayloadValidator;
+import com.linkedin.metadata.aspect.plugins.validation.AspectValidationException;
+import com.linkedin.metadata.aspect.plugins.validation.ValidationExceptionCollection;
+import com.linkedin.metadata.models.StructuredPropertyUtils;
+import com.linkedin.structured.PrimitivePropertyValue;
+import com.linkedin.structured.PropertyValue;
+import com.linkedin.structured.StructuredPropertyDefinition;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+import lombok.Getter;
+import lombok.Setter;
+import lombok.experimental.Accessors;
+import lombok.extern.slf4j.Slf4j;
+
+@Getter
+@Setter
+@Accessors(chain = true)
+@Slf4j
+public class PropertyDefinitionValidator extends AspectPayloadValidator {
+  private AspectPluginConfig config;
+  private StructuredPropertyMappingLookup structuredPropertyMappingLookup;
+
+  private static final String ALLOWED_TYPES = "allowedTypes";
+
+  /**
+   * Request-level validation. All Elasticsearch-backed checks run here (outside the write
+   * transaction) so mapping requests are never issued from within the primary-store commit.
+   */
+  @Override
+  protected Stream<AspectValidationException> validateProposedAspects(
+      OperationFingerprint operationContext,
+      @Nonnull Collection<? extends BatchItem> mcpItems,
+      @Nonnull RetrieverContext retrieverContext) {
+    return validateDefinitionUpsertsProposed(
+        operationContext,
+        mcpItems.stream()
+            .filter(i -> STRUCTURED_PROPERTY_DEFINITION_ASPECT_NAME.equals(i.getAspectName()))
+            .collect(Collectors.toList()),
+        retrieverContext,
+        structuredPropertyMappingLookup);
+  }
+
+  @Override
+  protected Stream<AspectValidationException> validatePreCommitAspects(
+      @Nonnull OperationFingerprint operationContext,
+      @Nonnull Collection<ChangeMCP> changeMCPs,
+      @Nonnull RetrieverContext retrieverContext) {
+    return validateDefinitionUpserts(
+        operationContext,
+        changeMCPs.stream()
+            .filter(i -> STRUCTURED_PROPERTY_DEFINITION_ASPECT_NAME.equals(i.getAspectName()))
+            .collect(Collectors.toList()),
+        retrieverContext);
+  }
+
+  /**
+   * Request-level (pre-transaction) checks for intra-batch and existing index-mapping field-name
+   * collisions. Kept separate from {@link #validateDefinitionUpserts} (pre-commit) so that search
+   * backend I/O does not execute inside the write transaction.
+   */
+  public static Stream<AspectValidationException> validateDefinitionUpsertsProposed(
+      OperationFingerprint operationContext,
+      @Nonnull Collection<? extends BatchItem> mcpItems,
+      @Nonnull RetrieverContext retrieverContext,
+      @Nullable StructuredPropertyMappingLookup structuredPropertyMappingLookup) {
+
+    ValidationExceptionCollection exceptions = ValidationExceptionCollection.newCollection();
+
+    // Intra-batch ES field name collision check (in-memory)
+    checkInBatchElasticsearchFieldCollisions(mcpItems, exceptions);
+
+    for (BatchItem item : mcpItems) {
+      StructuredPropertyDefinition newDefinition =
+          item.getAspect(StructuredPropertyDefinition.class);
+      if (newDefinition == null) {
+        continue;
+      }
+      // Existing ES field-name collision check (mapping-backed)
+      checkCrossEntityElasticsearchFieldCollision(
+              operationContext,
+              item,
+              newDefinition,
+              retrieverContext,
+              structuredPropertyMappingLookup)
+          .ifPresent(exceptions::addException);
+    }
+
+    return exceptions.streamAllExceptions();
+  }
+
+  public static Stream<AspectValidationException> validateDefinitionUpserts(
+      OperationFingerprint operationContext,
+      @Nonnull Collection<ChangeMCP> changeMCPs,
+      @Nonnull RetrieverContext retrieverContext) {
+
+    ValidationExceptionCollection exceptions = ValidationExceptionCollection.newCollection();
+
+    Set<Urn> propertyUrns = changeMCPs.stream().map(ChangeMCP::getUrn).collect(Collectors.toSet());
+
+    // Batch fetch status aspects
+    Map<Urn, Map<String, Aspect>> structuredPropertyAspects =
+        fetchPropertyStatusAspects(
+            operationContext, propertyUrns, retrieverContext.getAspectRetriever());
+
+    for (ChangeMCP item : changeMCPs) {
+      // Prevent updates to the definition, if soft deleted property
+      softDeleteCheck(
+              item,
+              structuredPropertyAspects.getOrDefault(item.getUrn(), Collections.emptyMap()),
+              "Cannot mutate a soft deleted Structured Property Definition")
+          .ifPresent(exceptions::addException);
+
+      final StructuredPropertyDefinition newDefinition =
+          item.getAspect(StructuredPropertyDefinition.class);
+
+      versionFormatCheck(item, newDefinition.getVersion()).ifPresent(exceptions::addException);
+      urnIdCheck(item).ifPresent(exceptions::addException);
+      qualifiedNameCheck(item, newDefinition.getQualifiedName())
+          .ifPresent(exceptions::addException);
+      allowedTypesCheck(
+              item,
+              newDefinition.getTypeQualifier(),
+              operationContext,
+              retrieverContext.getAspectRetriever())
+          .ifPresent(exceptions::addException);
+
+      if (item.getPreviousSystemAspect() != null) {
+
+        StructuredPropertyDefinition previousDefinition =
+            item.getPreviousSystemAspect().getAspect(StructuredPropertyDefinition.class);
+
+        if (!newDefinition.getValueType().equals(previousDefinition.getValueType())
+            && !allowBreakingWithVersion(previousDefinition, newDefinition, item, exceptions)) {
+          exceptions.addException(
+              item, "Value type cannot be changed as this is a backwards incompatible change");
+        }
+        if (newDefinition.getCardinality().equals(SINGLE)
+            && previousDefinition.getCardinality().equals(MULTIPLE)
+            && !allowBreakingWithVersion(previousDefinition, newDefinition, item, exceptions)) {
+          exceptions.addException(
+              item, "Property definition cardinality cannot be changed from MULTI to SINGLE");
+        }
+        if (!newDefinition.getQualifiedName().equals(previousDefinition.getQualifiedName())) {
+          exceptions.addException(
+              item, "Cannot change the fully qualified name of a Structured Property");
+        }
+        // Assure new definition has only added allowed values, not removed them
+        if (newDefinition.getAllowedValues() != null) {
+          if ((!previousDefinition.hasAllowedValues()
+                  || previousDefinition.getAllowedValues() == null)
+              && !allowBreakingWithVersion(previousDefinition, newDefinition, item, exceptions)) {
+            exceptions.addException(item, "Cannot restrict values that were previously allowed");
+          } else if (!allowBreakingWithVersion(
+              previousDefinition, newDefinition, item, exceptions)) {
+            Set<PrimitivePropertyValue> newAllowedValues =
+                newDefinition.getAllowedValues().stream()
+                    .map(PropertyValue::getValue)
+                    .collect(Collectors.toSet());
+            for (PropertyValue value : previousDefinition.getAllowedValues()) {
+              if (!newAllowedValues.contains(value.getValue())) {
+                exceptions.addException(
+                    item, "Cannot restrict values that were previously allowed");
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return exceptions.streamAllExceptions();
+  }
+
+  private static void checkInBatchElasticsearchFieldCollisions(
+      @Nonnull Collection<? extends BatchItem> mcpItems,
+      @Nonnull ValidationExceptionCollection exceptions) {
+    Map<String, List<BatchItem>> byEsField = new HashMap<>();
+    for (BatchItem item : mcpItems) {
+      StructuredPropertyDefinition definition = item.getAspect(StructuredPropertyDefinition.class);
+      if (definition == null || definition.getQualifiedName().contains(" ")) {
+        // Space validation is handled separately; toElasticsearchFieldName would throw
+        continue;
+      }
+      String esField = StructuredPropertyUtils.toElasticsearchFieldName(item.getUrn(), definition);
+      byEsField.computeIfAbsent(esField, k -> new ArrayList<>()).add(item);
+    }
+    for (Map.Entry<String, List<BatchItem>> entry : byEsField.entrySet()) {
+      List<BatchItem> colliding = entry.getValue();
+      if (colliding.size() > 1) {
+        Set<Urn> urns = colliding.stream().map(BatchItem::getUrn).collect(Collectors.toSet());
+        for (BatchItem item : colliding) {
+          exceptions.addException(
+              item,
+              String.format(
+                  "Structured property Elasticsearch field '%s' collides within the same batch"
+                      + " across URNs %s. Qualified names that differ only by '.' vs '_'"
+                      + " normalize to the same field name.",
+                  entry.getKey(), urns));
+        }
+      }
+    }
+  }
+
+  /**
+   * Reject a create whose Elasticsearch field name already exists in an active entity-index
+   * mapping.
+   *
+   * <p>Known limitations (TOCTOU / visibility lag): this check inspects live index mappings, not
+   * the primary-store definition catalog. Creates can both pass when:
+   *
+   * <ul>
+   *   <li>two concurrent creates race before either mapping update is visible; or
+   *   <li>a definition already exists in the primary store but its field is not yet on the index
+   *       (MAE / UpdateIndices lag), or structured-property mapping updates are disabled ({@code
+   *       ENABLE_STRUCTURED_PROPERTIES_HOOK=false}).
+   * </ul>
+   *
+   * There is no storage-layer uniqueness constraint to close this window. If colliding definitions
+   * both land, the mapping builders' deterministic collision resolution ({@link
+   * StructuredPropertyUtils#resolveStructuredPropertyMappingCollisions}) keeps index mapping
+   * generation working, so the consequence is a degraded property rather than an outage. A future
+   * hybrid (mapping ∪ definition) check could narrow the lag window if needed.
+   */
+  private static Optional<AspectValidationException> checkCrossEntityElasticsearchFieldCollision(
+      OperationFingerprint operationContext,
+      @Nonnull BatchItem item,
+      @Nonnull StructuredPropertyDefinition newDefinition,
+      @Nonnull RetrieverContext retrieverContext,
+      @Nullable StructuredPropertyMappingLookup structuredPropertyMappingLookup) {
+    if (newDefinition.getQualifiedName().contains(" ")) {
+      return Optional.empty();
+    }
+
+    // Qualified name is immutable, so only a create can introduce a new ES field name. If a
+    // definition already exists for this URN the write is an update; skip the mapping lookup. This
+    // is a direct by-URN aspect read, not a search query.
+    Aspect existingDefinition =
+        retrieverContext
+            .getAspectRetriever()
+            .getLatestAspectObjects(
+                operationContext,
+                Collections.singleton(item.getUrn()),
+                ImmutableSet.of(STRUCTURED_PROPERTY_DEFINITION_ASPECT_NAME))
+            .getOrDefault(item.getUrn(), Collections.emptyMap())
+            .get(STRUCTURED_PROPERTY_DEFINITION_ASPECT_NAME);
+    if (existingDefinition != null) {
+      return Optional.empty();
+    }
+
+    String esField = StructuredPropertyUtils.toElasticsearchFieldName(item.getUrn(), newDefinition);
+    if (structuredPropertyMappingLookup == null) {
+      log.warn(
+          "Skipping structured property ES field collision check for {}: no mapping lookup"
+              + " implementation is configured. If this is a production context, collision"
+              + " validation is not running.",
+          item.getUrn());
+      return Optional.empty();
+    }
+
+    final boolean fieldExists;
+    try {
+      fieldExists = structuredPropertyMappingLookup.fieldExists(operationContext, esField);
+    } catch (IOException e) {
+      log.error(
+          "Failed to inspect entity-index mappings for structured property field {}", esField, e);
+      return Optional.of(
+          AspectValidationException.forItem(
+              item,
+              String.format(
+                  "Unable to verify Elasticsearch field '%s' uniqueness for qualifiedName='%s':"
+                      + " the entity-index mapping lookup failed. Retry the request.",
+                  esField, newDefinition.getQualifiedName())));
+    }
+
+    if (!fieldExists) {
+      return Optional.empty();
+    }
+
+    return Optional.of(
+        AspectValidationException.forItem(
+            item,
+            String.format(
+                "Structured property Elasticsearch field '%s' (from qualifiedName='%s') already"
+                    + " exists in the entity-index mapping. This is either a live collision with"
+                    + " another property whose qualified name normalizes to the same field ('.' and"
+                    + " '_' both normalize to '_'), or a residual mapping left by a hard-deleted"
+                    + " property with this field name (Elasticsearch cannot drop a field from a"
+                    + " mapping, so the field survives the delete). To resolve: choose a qualified"
+                    + " name that stays distinct after '.'->'_', or, when recreating a deleted"
+                    + " property, complete its assignment cleanup and reindex the entity indices"
+                    + " (via the SystemUpdate job) before recreating it.",
+                esField, newDefinition.getQualifiedName())));
+  }
+
+  private static Map<Urn, Map<String, Aspect>> fetchPropertyStatusAspects(
+      OperationFingerprint operationContext,
+      Set<Urn> structuredPropertyUrns,
+      AspectRetriever aspectRetriever) {
+    return aspectRetriever.getLatestAspectObjects(
+        operationContext, structuredPropertyUrns, ImmutableSet.of(Constants.STATUS_ASPECT_NAME));
+  }
+
+  static <T extends BatchItem> Optional<AspectValidationException> softDeleteCheck(
+      T item, @Nonnull Map<String, Aspect> structuredPropertyAspects, String message) {
+    Aspect aspect = structuredPropertyAspects.get(STATUS_ASPECT_NAME);
+    if (aspect != null && new Status(aspect.data()).isRemoved()) {
+      return Optional.of(AspectValidationException.forItem(item, message));
+    }
+    return Optional.empty();
+  }
+
+  /**
+   * Allow new version if monotonically increasing
+   *
+   * @param oldDefinition previous version
+   * @param newDefinition next version
+   * @return whether version increase should allow breaking change
+   */
+  private static boolean allowBreakingWithVersion(
+      @Nonnull StructuredPropertyDefinition oldDefinition,
+      @Nonnull StructuredPropertyDefinition newDefinition,
+      @Nonnull ChangeMCP item,
+      @Nonnull ValidationExceptionCollection exceptions) {
+    final String oldVersion = oldDefinition.getVersion(GetMode.NULL);
+    final String newVersion = newDefinition.getVersion(GetMode.NULL);
+
+    if (newVersion != null && newVersion.contains(".")) {
+      exceptions.addException(
+          item,
+          String.format("Invalid version `%s` cannot contain the `.` character.", newVersion));
+    }
+
+    if (oldVersion == null && newVersion != null) {
+      return true;
+    } else if (newVersion != null) {
+      return newVersion.compareToIgnoreCase(oldVersion) > 0;
+    }
+    return false;
+  }
+
+  private static Pattern VERSION_REGEX = Pattern.compile("[0-9]{14}");
+
+  private static Optional<AspectValidationException> versionFormatCheck(
+      MCPItem item, @Nullable String version) {
+    if (version != null && !VERSION_REGEX.matcher(version).matches()) {
+      return Optional.of(
+          AspectValidationException.forItem(
+              item,
+              String.format("Invalid version specified. Must match %s", VERSION_REGEX.toString())));
+    }
+    return Optional.empty();
+  }
+
+  private static Optional<AspectValidationException> urnIdCheck(MCPItem item) {
+    if (item.getUrn().getId().contains(" ")) {
+      return Optional.of(AspectValidationException.forItem(item, "Urn ID cannot have spaces"));
+    }
+    return Optional.empty();
+  }
+
+  private static Optional<AspectValidationException> qualifiedNameCheck(
+      MCPItem item, @Nonnull String qualifiedName) {
+    if (qualifiedName.contains(" ")) {
+      return Optional.of(
+          AspectValidationException.forItem(item, "Qualified names cannot have spaces"));
+    }
+    return Optional.empty();
+  }
+
+  private static Optional<AspectValidationException> allowedTypesCheck(
+      MCPItem item,
+      @Nullable StringArrayMap typeQualifier,
+      OperationFingerprint operationContext,
+      AspectRetriever aspectRetriever) {
+    if (typeQualifier == null || typeQualifier.get(ALLOWED_TYPES) == null) {
+      return Optional.empty();
+    }
+    List<String> allowedTypes = typeQualifier.get(ALLOWED_TYPES);
+    try {
+      List<Urn> allowedTypesUrns =
+          allowedTypes.stream().map(UrnUtils::getUrn).collect(Collectors.toList());
+
+      // ensure all types are entityTypes
+      if (allowedTypesUrns.stream()
+          .anyMatch(t -> !t.getEntityType().equals(ENTITY_TYPE_ENTITY_NAME))) {
+        return Optional.of(
+            AspectValidationException.forItem(
+                item,
+                String.format(
+                    "Provided allowedType that is not an entityType entity. List of allowedTypes: %s",
+                    allowedTypes)));
+      }
+
+      // ensure all types exist as entities
+      Map<Urn, Boolean> existsMap =
+          aspectRetriever.entityExists(operationContext, new HashSet<>(allowedTypesUrns));
+      if (existsMap.containsValue(false)) {
+        return Optional.of(
+            AspectValidationException.forItem(
+                item,
+                String.format(
+                    "Provided allowedType that does not exist. List of allowedTypes: %s",
+                    allowedTypes)));
+      }
+    } catch (Exception e) {
+      return Optional.of(
+          AspectValidationException.forItem(
+              item,
+              String.format(
+                  "Issue resolving allowedTypes inside of typeQualifier. These must be entity type urns. List of allowedTypes: %s",
+                  allowedTypes)));
+    }
+
+    return Optional.empty();
+  }
+}

@@ -1,0 +1,132 @@
+import { Icon } from '@components';
+import { CaretDown } from '@phosphor-icons/react/dist/csr/CaretDown';
+import { CaretRight } from '@phosphor-icons/react/dist/csr/CaretRight';
+import React, { useState } from 'react';
+import styled from 'styled-components';
+
+import { CountStyle } from '@app/entityV2/shared/SidebarStyledComponents';
+import InfoPopover from '@app/sharedV2/icons/InfoPopover';
+
+// eslint-disable-next-line i18next/no-literal-string -- numeric overflow indicator, not translatable UI text
+const OVERFLOW_COUNT_DISPLAY = '10+';
+
+const Wrapper = styled.div`
+    border: none;
+    background: transparent;
+`;
+
+const Header = styled.div<{ $collapsible?: boolean }>`
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 20px;
+    cursor: ${(props) => (props.$collapsible ? 'pointer' : 'default')};
+    user-select: none;
+`;
+
+const HeaderLeft = styled.div`
+    display: flex;
+    align-items: center;
+    min-width: 0;
+    gap: 4px;
+`;
+
+const HeaderRight = styled.div`
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+    gap: 4px;
+`;
+
+const CaretIcon = styled.div`
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+    color: ${(props) => props.theme.colors.icon};
+`;
+
+const Title = styled.span`
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: ${(props) => props.theme.colors.text};
+    font-weight: 700;
+    font-size: 14px;
+    display: flex;
+    align-items: center;
+`;
+
+const Extra = styled.div`
+    cursor: pointer;
+`;
+
+const ContentBody = styled.div`
+    padding: 4px 20px 0 20px;
+`;
+
+const StyledInfoPopover = styled(InfoPopover)`
+    display: flex;
+    align-items: center;
+`;
+
+const InfoPopoverContent = styled.div`
+    max-width: 300px;
+`;
+
+type Props = {
+    title: string;
+    content: React.ReactNode;
+    extra?: React.ReactNode;
+    count?: number;
+    collapsedContent?: React.ReactNode;
+    collapsible?: boolean;
+    expandedByDefault?: boolean;
+    showFullCount?: boolean;
+    infoPopover?: string;
+};
+
+export const SidebarSection = ({
+    title,
+    content,
+    extra,
+    count = 0,
+    collapsedContent,
+    collapsible = true,
+    expandedByDefault = true,
+    showFullCount,
+    infoPopover,
+}: Props) => {
+    const [isExpanded, setIsExpanded] = useState(expandedByDefault);
+
+    const toggle = () => {
+        if (collapsible) setIsExpanded((prev) => !prev);
+    };
+
+    return (
+        <Wrapper>
+            <Header $collapsible={collapsible} onClick={toggle}>
+                <HeaderLeft>
+                    <Title>{title}</Title>
+                    {infoPopover && (
+                        <StyledInfoPopover content={<InfoPopoverContent>{infoPopover}</InfoPopoverContent>} />
+                    )}
+                    {count > 0 && (
+                        <CountStyle>
+                            {showFullCount ? <>{count}</> : <>{count > 10 ? OVERFLOW_COUNT_DISPLAY : count}</>}
+                        </CountStyle>
+                    )}
+                    {collapsedContent}
+                </HeaderLeft>
+                <HeaderRight>
+                    {extra && <Extra onClick={(e) => e.stopPropagation()}>{extra}</Extra>}
+                    {collapsible && (
+                        <CaretIcon>
+                            <Icon icon={isExpanded ? CaretDown : CaretRight} size="md" color="inherit" />
+                        </CaretIcon>
+                    )}
+                </HeaderRight>
+            </Header>
+            {isExpanded && <ContentBody data-testid={`sidebar-section-content-${title}`}>{content}</ContentBody>}
+        </Wrapper>
+    );
+};

@@ -1,0 +1,52 @@
+namespace com.linkedin.structured
+import com.linkedin.common.Urn
+import com.linkedin.common.AuditStamp
+import com.linkedin.common.MetadataAttribution
+
+record StructuredPropertyValueAssignment {
+
+  /**
+   * The property that is being assigned a value.
+   */
+  propertyUrn: Urn
+
+  /**
+   * The value assigned to the property.
+   */
+   values: array[PrimitivePropertyValue]
+
+  /**
+   * Audit stamp containing who created this relationship edge and when
+   */
+  created: optional AuditStamp
+
+  /**
+   * Audit stamp containing who last modified this relationship edge and when
+   */
+  lastModified: optional AuditStamp
+
+  
+  /**
+   * Information about who, why, and how this metadata was applied
+   */
+  @Searchable = {
+    "/time": {
+        "fieldName": "structuredPropertyAttributionDates",
+        "fieldType": "DATETIME",
+        "queryByDefault": false,
+      },
+    "/actor": {
+        "fieldName": "structuredPropertyAttributionActors",
+        "fieldType": "URN",
+        "queryByDefault": false,
+      },
+    "/source": {
+        "fieldName": "structuredPropertyAttributionSources",
+        "fieldType": "URN",
+        "queryByDefault": false,
+      },
+  }
+  attribution: optional MetadataAttribution
+}
+
+

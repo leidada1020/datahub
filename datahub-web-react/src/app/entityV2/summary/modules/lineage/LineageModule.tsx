@@ -1,0 +1,35 @@
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import { useHistory } from 'react-router';
+
+import { useEntityData } from '@app/entity/shared/EntityContext';
+import { EntityTabPath } from '@app/entityV2/shared/constants';
+import { getEntityPath } from '@app/entityV2/shared/containers/profile/entityData';
+import LargeModule from '@app/homeV3/module/components/LargeModule';
+import { ModuleProps } from '@app/homeV3/module/types';
+import LineageExplorer from '@app/lineageV3/LineageExplorer';
+import LineageGraphContext from '@app/lineageV3/LineageGraphContext';
+import { useEntityRegistry } from '@app/useEntityRegistry';
+
+export default function LineageModule(props: ModuleProps) {
+    const { t } = useTranslation('modules');
+    const { urn, entityType } = useEntityData();
+    const history = useHistory();
+    const entityRegistry = useEntityRegistry();
+
+    const navigateToLineageTab = () => {
+        history.push(getEntityPath(entityType, urn, entityRegistry, false, false, EntityTabPath.LINEAGE));
+    };
+    return (
+        <LargeModule
+            {...props}
+            onClickViewAll={navigateToLineageTab}
+            viewAllText={t('lineage.viewAll')}
+            dataTestId="lineage-module"
+        >
+            <LineageGraphContext.Provider value={{ isDAGView: false, isModuleView: true }}>
+                <LineageExplorer urn={urn} type={entityType} />
+            </LineageGraphContext.Provider>
+        </LargeModule>
+    );
+}

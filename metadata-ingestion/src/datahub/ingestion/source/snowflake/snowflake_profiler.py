@@ -1,0 +1,154 @@
+import logging
+from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional
+
+from snowflake.sqlalchemy import snowdialect
+
+if TYPE_CHECKING:
+    from datahub.ingestion.source.sqlalchemy_profiler.sqlalchemy_profiler import (
+        SQLAlchemyProfiler,
+    )
+from sqlalchemy import create_engine, inspect
+from sqlalchemy.sql import sqltypes
+
+from datahub.ingestion.api.workunit import MetadataWorkUnit
+from datahub.ingestion.source.snowflake.snowflake_config import SnowflakeV2Config
+from datahub.ingestion.source.snowflake.snowflake_query import SnowflakeQuery
+from datahub.ingestion.source.snowflake.snowflake_report import SnowflakeV2Report
+from datahub.ingestion.source.snowflake.snowflake_schema import (
+    SnowflakeDatabase,
+    SnowflakeTable,
+)
+from datahub.ingestion.source.snowflake.snowflake_utils import SnowflakeCommonMixin
+from datahub.ingestion.source.sql.sql_generic import BaseTable
+from datahub.ingestion.source.sql.sql_generic_profiler import GenericProfiler
+from datahub.ingestion.source.state.profiling_state_handler import ProfilingHandler
+
+snowdialect.ischema_names["GEOGRAPHY"] = sqltypes.NullType
+snowdialect.ischema_names["GEOMETRY"] = sqltypes.NullType
+
+logger = logging.getLogger(__name__)
+
+PUBLIC_SCHEMA = "PUBLIC"
+
+
+class SnowflakeProfiler(GenericProfiler, SnowflakeCommonMixin):
+    def __init__(
+        self,
+        config: SnowflakeV2Config,
+        report: SnowflakeV2Report,
+        state_handler: Optional[ProfilingHandler] = None,
+    ) -> None:
+        super().__init__(config, report, self.platform, state_handler)
+        self.config: SnowflakeV2Config = config
+        self.report: SnowflakeV2Report = report
+        self.database_default_schema: Dict[str, str] = dict()
+
+    def get_workunits(
+        self, database: SnowflakeDatabase, db_tables: Dict[str, List[SnowflakeTable]]
+    ) -> Iterable[MetadataWorkUnit]:
+        # Extra default SQLAlchemy option for better connection pooling and threading.
+        # https://docs.sqlalchemy.org/en/20/core/pooling.html#sqlalchemy.pool.QueuePool.params.max_overflow
+        if self.config.is_profiling_enabled():
+            self.config.options.setdefault(
+                "max_overflow", self.config.profiling.max_workers
+            )
+
+        if PUBLIC_SCHEMA not in db_tables:
+            # If PUBLIC schema is absent, we use any one of schemas as default schema
+            self.database_default_schema[database.name] = list(db_tables.keys())[0]
+
+        profile_requests = []
+        for schema in database.schemas:
+            for table in db_tables[schema.name]:
+                if (
+                    not self.config.profiling.profile_external_tables
+                    and table.type == "EXTERNAL TABLE"
+                ):
+                    logger.info(
+                        f"Skipping profiling of external table {database.name}.{schema.name}.{table.name}"
+                    )
+                    self.report.profiling_skipped_other[schema.name] += 1
+                    continue
+
+                profile_request = self.get_profile_request(
+                    table, schema.name, database.name
+                )
+                if profile_request is not None:
+                    self.report.report_entity_profiled(profile_request.pretty_name)
+                    profile_requests.append(profile_request)
+
+        if len(profile_requests) == 0:
+            return
+
+        yield from self.generate_profile_workunits(
+            profile_requests,
+            max_workers=self.config.profiling.max_workers,
+            db_name=database.name,
+            platform=self.platform,
+            profiler_args=self.get_profile_args(),
+        )
+
+    def get_dataset_name(self, table_name: str, schema_name: str, db_name: str) -> str:
+        return self.identifiers.get_dataset_identifier(table_name, schema_name, db_name)
+
+    def get_batch_kwargs(
+        self, table: BaseTable, schema_name: str, db_name: str
+    ) -> dict:
+        return {
+            **super().get_batch_kwargs(table, schema_name, db_name),
+            "custom_sql": None,
+            "row_count": table.rows_count,
+        }
+
+    def get_profiler_instance(
+        self, db_name: Optional[str] = None
+    ) -> "SQLAlchemyProfiler":
+        from datahub.ingestion.source.sqlalchemy_profiler.sqlalchemy_profiler import (
+            SQLAlchemyProfiler,
+        )
+
+        assert db_name
+
+        url = self.config.get_sql_alchemy_url(database=db_name)
+
+        logger.debug(f"sql_alchemy_url={url}")
+
+        engine = create_engine(
+            url,
+            creator=self.callable_for_db_connection(db_name),
+            **self.config.get_options(),
+        )
+        conn = engine.connect()
+        inspector = inspect(conn)
+
+        logger.info(
+            f"Using SQLAlchemyProfiler for profiling (platform: {self.platform})"
+        )
+        return SQLAlchemyProfiler(
+            conn=inspector.bind,
+            report=self.report,
+            config=self.config.profiling,
+            platform=self.platform,
+            env=self.config.env,
+            # Snowflake's schema comes from INFORMATION_SCHEMA, not from
+            # reflection, so its field paths follow source config rather than the
+            # dialect's normalize_name. Columns fold separately from datasets --
+            # preserve_column_case keeps a quoted "col"/"COL" pair distinct -- so
+            # this is the column rule, not snowflake_identifier.
+            field_path_transform=self.identifiers.snowflake_column_identifier,
+        )
+
+    def callable_for_db_connection(self, db_name: str) -> Callable:
+        schema_name = self.database_default_schema.get(db_name)
+
+        def get_db_connection():
+            conn = self.config.get_native_connection()
+            conn.cursor().execute(SnowflakeQuery.use_database(db_name))
+
+            # As mentioned here - https://docs.snowflake.com/en/sql-reference/sql/use-database#usage-notes
+            # no schema is selected if PUBLIC schema is absent. We need to explicitly call `USE SCHEMA <schema>`
+            if schema_name:
+                conn.cursor().execute(SnowflakeQuery.use_schema(schema_name))
+            return conn
+
+        return get_db_connection

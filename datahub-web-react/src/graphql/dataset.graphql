@@ -1,0 +1,627 @@
+query getDataProfiles($urn: String!, $limit: Int, $startTime: Long, $endTime: Long, $filters: FilterInput) {
+    dataset(urn: $urn) {
+        urn
+        type
+        datasetProfiles(limit: $limit, startTimeMillis: $startTime, endTimeMillis: $endTime, filter: $filters) {
+            rowCount
+            columnCount
+            sizeInBytes
+            timestampMillis
+            partitionSpec {
+                type
+                partition
+                timePartition {
+                    startTimeMillis
+                    durationMillis
+                }
+            }
+            fieldProfiles {
+                fieldPath
+                uniqueCount
+                uniqueProportion
+                nullCount
+                nullProportion
+                min
+                max
+                mean
+                median
+                stdev
+                sampleValues
+                quantiles {
+                    quantile
+                    value
+                }
+                distinctValueFrequencies {
+                    value
+                    frequency
+                }
+            }
+        }
+    }
+}
+
+query getDataset($urn: String!) {
+    dataset(urn: $urn) {
+        urn
+        type
+        ...nonSiblingDatasetFields
+        siblings {
+            isPrimary
+        }
+        siblingsSearch(input: { query: "*", count: 5 }) {
+            count
+            total
+            searchResults {
+                entity {
+                    urn
+                    type
+                    ...nonSiblingDatasetFields
+                }
+            }
+        }
+    }
+}
+
+fragment nonSiblingDatasetFields on Dataset {
+    ...nonRecursiveDatasetFields
+    exists
+    deprecation {
+        ...deprecationFields
+    }
+    globalTags {
+        ...globalTagsFields
+    }
+    glossaryTerms {
+        ...glossaryTerms
+    }
+    subTypes {
+        typeNames
+    }
+    domain {
+        ...entityDomainWithoutCounts
+    }
+    ...entityDataProduct
+    parentContainers {
+        ...parentContainersFields
+    }
+    usageStats(range: MONTH) {
+        buckets {
+            bucket
+            metrics {
+                totalSqlQueries
+            }
+        }
+        aggregations {
+            uniqueUserCount
+            totalSqlQueries
+            fields {
+                fieldName
+                count
+            }
+        }
+    }
+    latestFullTableProfile: datasetProfiles(
+        limit: 1
+        filter: {
+            and: [
+                { field: "partitionSpec.partition", values: ["FULL_TABLE_SNAPSHOT", "SAMPLE"], condition: START_WITH }
+            ]
+        }
+    ) {
+        ...datasetProfileFields
+    }
+    latestPartitionProfile: datasetProfiles(
+        limit: 1
+        filter: {
+            and: [
+                {
+                    field: "partitionSpec.partition"
+                    values: ["SAMPLE", "FULL_TABLE_SNAPSHOT"]
+                    negated: true
+                    condition: START_WITH
+                }
+            ]
+        }
+    ) {
+        ...datasetProfileFields
+    }
+    health {
+        ...entityHealth
+    }
+    assertions(start: 0, count: 1) {
+        total
+    }
+    access {
+        roles {
+            role {
+                urn
+            }
+        }
+    }
+    operations(limit: 1) {
+        timestampMillis
+        lastUpdatedTimestamp
+    }
+    ...viewProperties
+    autoRenderAspects: aspects(input: { autoRenderOnly: true }) {
+        ...autoRenderAspectFields
+    }
+    status {
+        removed
+        lifecycleStage {
+            urn
+            name
+            description
+        }
+    }
+    runs: runs(start: 0, count: 20, direction: OUTGOING) {
+        count
+        start
+        total
+    }
+    testResults {
+        passing {
+            test {
+                ...testFields
+            }
+            type
+        }
+        failing {
+            test {
+                ...testFields
+            }
+            type
+        }
+    }
+    statsSummary {
+        queryCountLast30Days
+        uniqueUserCountLast30Days
+        topUsersLast30Days {
+            urn
+            type
+            username
+            properties {
+                displayName
+                firstName
+                lastName
+                fullName
+            }
+            editableProperties {
+                displayName
+                pictureLink
+            }
+        }
+    }
+    siblings {
+        isPrimary
+    }
+    activeIncidents: incidents(start: 0, count: 1, state: ACTIVE) {
+        total
+    }
+    logicalParent {
+        urn
+        type
+        ...logicalParentOrChildFields
+    }
+    physicalChildren: relationships(
+        input: { types: ["PhysicalInstanceOf"], direction: INCOMING, start: 0, count: 10 }
+    ) {
+        start
+        count
+        total
+        relationships {
+            entity {
+                urn
+                type
+                ...logicalParentOrChildFields
+            }
+            direction
+            type
+        }
+    }
+    privileges {
+        ...entityPrivileges
+    }
+    institutionalMemory {
+        ...institutionalMemoryFields
+    }
+    ...notes
+    ...entityProfileVersionProperties
+    settings {
+        ...AssetSettingsFields
+    }
+}
+
+query getRecentQueries($urn: String!) {
+    dataset(urn: $urn) {
+        usageStats(range: MONTH) {
+            buckets {
+                bucket
+                metrics {
+                    topSqlQueries
+                }
+            }
+        }
+    }
+}
+
+query getLastMonthUsageAggregations($urn: String!) {
+    dataset(urn: $urn) {
+        usageStats(range: MONTH) {
+            aggregations {
+                uniqueUserCount
+                totalSqlQueries
+                users {
+                    user {
+                        urn
+                        type
+                        username
+                        properties {
+                            displayName
+                            firstName
+                            lastName
+                            fullName
+                        }
+                        editableProperties {
+                            displayName
+                            pictureLink
+                        }
+                    }
+                    count
+                    userEmail
+                }
+                fields {
+                    fieldName
+                    count
+                }
+            }
+        }
+    }
+}
+
+query getTimeRangeUsageAggregations($urn: String!, $timeRange: TimeRange!, $startTime: Long, $timeZone: String) {
+    dataset(urn: $urn) {
+        usageStats(range: $timeRange, startTimeMillis: $startTime, timeZone: $timeZone) {
+            aggregations {
+                uniqueUserCount
+                totalSqlQueries
+                users {
+                    user {
+                        urn
+                        type
+                        username
+                        properties {
+                            displayName
+                            firstName
+                            lastName
+                            fullName
+                        }
+                        editableProperties {
+                            displayName
+                            pictureLink
+                        }
+                    }
+                    count
+                    userEmail
+                }
+                fields {
+                    fieldName
+                    count
+                }
+            }
+            buckets {
+                bucket
+                metrics {
+                    totalSqlQueries
+                }
+            }
+        }
+    }
+}
+
+mutation updateDataset($urn: String!, $input: DatasetUpdateInput!) {
+    updateDataset(urn: $urn, input: $input) {
+        urn
+    }
+}
+
+fragment viewProperties on Dataset {
+    viewProperties {
+        materialized
+        logic
+        formattedLogic
+        language
+    }
+}
+
+fragment assertionsQuery on Dataset {
+    assertions(start: 0, count: 1000, includeSoftDeleted: false) {
+        start
+        count
+        total
+        assertions {
+            ...assertionDetailsWithRunEvents
+        }
+    }
+}
+
+query getDatasetAssertions($urn: String!, $skipSiblingsSearch: Boolean = false) {
+    dataset(urn: $urn) {
+        ...assertionsQuery
+        siblings {
+            isPrimary
+        }
+        siblingsSearch(input: { query: "*", count: 5 }) @skip(if: $skipSiblingsSearch) {
+            count
+            total
+            searchResults {
+                entity {
+                    urn
+                    type
+                    ...assertionsQuery
+                }
+            }
+        }
+    }
+}
+
+query getDatasetRuns($urn: String!, $start: Int!, $count: Int!, $direction: RelationshipDirection!) {
+    dataset(urn: $urn) {
+        runs(start: $start, count: $count, direction: $direction) {
+            ...runResults
+        }
+    }
+}
+
+fragment datasetSchema on Dataset {
+    schemaMetadata(version: 0) {
+        ...schemaMetadataFields
+    }
+    editableSchemaMetadata {
+        editableSchemaFieldInfo {
+            fieldPath
+            description
+            globalTags {
+                ...globalTagsFields
+            }
+            glossaryTerms {
+                ...glossaryTerms
+            }
+        }
+    }
+}
+
+query getDatasetSchema($urn: String!, $skipSiblingsSearch: Boolean = false) {
+    dataset(urn: $urn) {
+        urn
+        ...datasetSchema
+        siblings {
+            isPrimary
+            siblings {
+                urn
+                type
+                ... on Dataset {
+                    ...datasetSchema
+                }
+            }
+        }
+        siblingsSearch(input: { query: "*", count: 5 }) @skip(if: $skipSiblingsSearch) {
+            count
+            total
+            searchResults {
+                entity {
+                    urn
+                    type
+                    ...datasetSchema
+                }
+            }
+        }
+    }
+}
+
+# Lean fragment: field paths, types, and nullability only -- no descriptions, tags,
+# glossary terms, deprecation, structured properties, or editable metadata. Used by
+# Phase 1 of the two-phase schema fetch so the table renders before the heavy
+# metadata arrives. Descriptions are intentionally excluded to keep Phase 1 small.
+fragment datasetStructuralSchema on Dataset {
+    schemaMetadata(version: 0) {
+        aspectVersion
+        createdAt
+        datasetUrn
+        name
+        platformUrn
+        version
+        cluster
+        hash
+        # platformSchema intentionally excluded: the native schema text (DDL/Avro) can be as
+        # large as the field list itself and is already fetched by the full fragment in
+        # Phase 2. The Raw toggle therefore appears once full metadata has loaded.
+        fields {
+            fieldPath
+            label
+            jsonPath
+            nullable
+            type
+            nativeDataType
+            recursive
+            isPartOfKey
+            isPartitioningKey
+        }
+        primaryKeys
+        foreignKeys {
+            name
+            sourceFields {
+                fieldPath
+            }
+            foreignFields {
+                fieldPath
+            }
+            # foreignDataset intentionally excluded: FK target entity data (name, urn,
+            # platform) is part of the full schemaMetadataFields fragment and arrives
+            # in Phase 2. FK popovers may briefly show an empty dataset name during Phase 1.
+        }
+    }
+}
+
+query getDatasetSchemaStructural($urn: String!, $skipSiblingsSearch: Boolean = false) {
+    dataset(urn: $urn) {
+        urn
+        ...datasetStructuralSchema
+        siblings {
+            isPrimary
+        }
+        siblingsSearch(input: { query: "*", count: 5 }) @skip(if: $skipSiblingsSearch) {
+            count
+            total
+            searchResults {
+                entity {
+                    urn
+                    type
+                    ... on Dataset {
+                        ...datasetStructuralSchema
+                    }
+                }
+            }
+        }
+    }
+}
+
+query getExternalRoles($urn: String!) {
+    dataset(urn: $urn) {
+        access {
+            ...getRoles
+        }
+        __typename
+    }
+}
+
+fragment getRoles on Access {
+    roles {
+        role {
+            id
+            properties {
+                name
+                description
+                type
+                requestUrl
+            }
+            urn
+            isAssignedToMe
+        }
+    }
+}
+
+query getOperations($urn: String!, $limit: Int, $startTime: Long, $endTime: Long, $filters: FilterInput) {
+    dataset(urn: $urn) {
+        operations(limit: $limit, startTimeMillis: $startTime, endTimeMillis: $endTime, filter: $filters) {
+            timestampMillis
+            lastUpdatedTimestamp
+            operationType
+            actor
+            lastUpdatedTimestamp
+            customOperationType
+        }
+    }
+}
+
+fragment assertionsQueryWithRunEvents on Dataset {
+    assertions(start: 0, count: 1000) {
+        start
+        count
+        total
+        assertions {
+            ...assertionDetailsWithRunEvents
+        }
+    }
+}
+
+query getOperationsStatsBuckets($urn: String!, $input: OperationsStatsInput) {
+    dataset(urn: $urn) {
+        operationsStats(input: $input) {
+            aggregations {
+                totalOperations
+                totalInserts
+                totalUpdates
+                totalDeletes
+                totalCreates
+                totalAlters
+                totalDrops
+                totalCustoms
+                customOperationsMap {
+                    key
+                    value
+                }
+            }
+            buckets {
+                bucket
+                aggregations {
+                    totalOperations
+                    totalInserts
+                    totalUpdates
+                    totalDeletes
+                    totalCreates
+                    totalAlters
+                    totalDrops
+                    totalCustoms
+                    customOperationsMap {
+                        key
+                        value
+                    }
+                }
+            }
+        }
+    }
+}
+
+query getDatasetTimeseriesCapability($urn: String!) {
+    dataset(urn: $urn) {
+        timeseriesCapabilities {
+            assetStats {
+                oldestOperationTime
+                oldestDatasetUsageTime
+                oldestDatasetProfileTime
+            }
+        }
+    }
+}
+
+query getOperationsStats($urn: String!, $range: TimeRange!) {
+    dataset(urn: $urn) {
+        operationsStats(input: { range: $range }) {
+            aggregations {
+                totalOperations
+                totalInserts
+                totalUpdates
+                totalDeletes
+                totalCreates
+                totalAlters
+                totalDrops
+                totalCustoms
+                customOperationsMap {
+                    key
+                    value
+                }
+            }
+        }
+    }
+}
+
+query getDatasetAssertionsWithRunEvents($urn: String!, $skipSiblingsSearch: Boolean = false) {
+    dataset(urn: $urn) {
+        ...assertionsQueryWithRunEvents
+        siblings {
+            isPrimary
+        }
+        siblingsSearch(input: { query: "*", count: 5 }) @skip(if: $skipSiblingsSearch) {
+            count
+            total
+            searchResults {
+                entity {
+                    urn
+                    type
+                    ...assertionsQueryWithRunEvents
+                }
+            }
+        }
+    }
+}

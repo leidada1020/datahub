@@ -1,0 +1,199 @@
+import { Pagination, SearchBar, Text, toast } from '@components';
+import React, { useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import styled, { useTheme } from 'styled-components';
+
+import { ViewsTable } from '@app/entityV2/view/ViewsTable';
+import { DEFAULT_LIST_VIEWS_PAGE_SIZE, searchViews } from '@app/entityV2/view/utils';
+import { Message } from '@app/sharedV2/Message';
+import { scrollToTop } from '@app/sharedV2/searchUtils';
+
+import { useListGlobalViewsQuery, useListMyViewsQuery } from '@graphql/view.generated';
+import { DataHubViewType } from '@types';
+
+const PaginationContainer = styled.div`
+    display: flex;
+    justify-content: center;
+`;
+
+const StyledPagination = styled(Pagination)`
+    margin: 40px;
+`;
+
+type Props = {
+    viewType?: DataHubViewType;
+};
+
+const StyledTabToolbar = styled.div`
+    display: flex;
+    justify-content: space-between;
+    padding: 1px 0 16px 0; // 1px at the top to prevent Select's border outline from cutting-off
+    height: auto;
+    z-index: unset;
+    box-shadow: none;
+    flex-shrink: 0;
+`;
+
+export const EmptyContainer = styled.div`
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    width: 100%;
+    gap: 16px;
+
+    svg {
+        width: 160px;
+        height: 160px;
+    }
+`;
+
+const TableContainer = styled.div`
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow: auto;
+
+    /* Make table header sticky */
+    .ant-table-thead {
+        position: sticky;
+        top: 0;
+        z-index: 1;
+        background: ${(props) => props.theme.colors.bgSurface};
+    }
+
+    /* Ensure header cells have proper background */
+    .ant-table-thead > tr > th {
+        background: ${(props) => props.theme.colors.bgSurface} !important;
+        border-bottom: 1px solid ${(props) => props.theme.colors.border};
+    }
+`;
+
+const SearchContainer = styled.div`
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 8px;
+`;
+
+const ViewsContainer = styled.div`
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    padding-top: 7px;
+`;
+
+const StyledSearchBar = styled(SearchBar)`
+    width: 300px;
+`;
+
+/**
+ * This component renders a paginated, searchable list of Views.
+ */
+export const ViewsList = ({ viewType = DataHubViewType.Personal }: Props) => {
+    const { t } = useTranslation('entity.views');
+
+    /**
+     * State
+     */
+    const [page, setPage] = useState(1);
+    const [query, setQuery] = useState<undefined | string>(undefined);
+
+    /**
+     * Queries
+     */
+    const pageSize = DEFAULT_LIST_VIEWS_PAGE_SIZE;
+    const start = (page - 1) * pageSize;
+
+    const isPersonal = viewType === DataHubViewType.Personal;
+
+    const {
+        loading: loadingPersonal,
+        error: errorPersonal,
+        data: dataPersonal,
+    } = useListMyViewsQuery({
+        variables: {
+            start,
+            count: pageSize,
+        },
+        fetchPolicy: 'cache-first',
+        skip: !isPersonal,
+    });
+
+    const {
+        loading: loadingGlobal,
+        error: errorGlobal,
+        data: dataGlobal,
+    } = useListGlobalViewsQuery({
+        variables: {
+            start,
+            count: pageSize,
+        },
+        fetchPolicy: 'cache-first',
+        skip: isPersonal,
+    });
+
+    const onChangePage = (newPage: number) => {
+        scrollToTop();
+        setPage(newPage);
+    };
+
+    /**
+     * Render variables.
+     */
+    const viewsData = isPersonal ? dataPersonal?.listMyViews : dataGlobal?.listGlobalViews;
+    const loading = loadingPersonal || loadingGlobal;
+    const error = errorPersonal || errorGlobal;
+    const totalViews = viewsData?.total || 0;
+    const views = searchViews(viewsData?.views || [], query);
+
+    const theme = useTheme();
+
+    useEffect(() => {
+        if (error) {
+            toast.error(t('loadError'), { duration: 3 });
+        }
+    }, [error, t]);
+
+    if (!totalViews) {
+        return (
+            <EmptyContainer>
+                <Text size="md" weight="bold" style={{ color: theme.colors.textSecondary }}>
+                    {t('emptyTitle')}
+                </Text>
+            </EmptyContainer>
+        );
+    }
+
+    return (
+        <>
+            {!viewsData && loading && <Message type="loading" content={t('loading')} />}
+            <ViewsContainer>
+                <StyledTabToolbar>
+                    <SearchContainer>
+                        <StyledSearchBar placeholder={t('searchPlaceholder')} onChange={setQuery} value={query || ''} />
+                    </SearchContainer>
+                </StyledTabToolbar>
+                <TableContainer>
+                    <ViewsTable views={views} />
+                </TableContainer>
+                {totalViews >= pageSize && (
+                    <PaginationContainer>
+                        <StyledPagination
+                            currentPage={page}
+                            itemsPerPage={pageSize}
+                            total={totalViews}
+                            showLessItems
+                            onPageChange={onChangePage}
+                            showSizeChanger={false}
+                        />
+                    </PaginationContainer>
+                )}
+            </ViewsContainer>
+        </>
+    );
+};

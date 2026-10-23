@@ -1,0 +1,89 @@
+import { User } from '@phosphor-icons/react/dist/csr/User';
+import i18next from 'i18next';
+import * as React from 'react';
+
+import { INGESTION_ACTOR_URN } from '@app/entity/shared/constants';
+import { Entity, EntityCapabilityType, IconStyleType, PreviewType } from '@app/entityV2/Entity';
+import { TYPE_ICON_CLASS_NAME } from '@app/entityV2/shared/components/subtypes';
+import { getDataForEntityType } from '@app/entityV2/shared/containers/profile/entityData';
+import { lazyProfileComponent } from '@app/entityV2/shared/lazyEntityProfile';
+import { Preview } from '@app/entityV2/user/preview/Preview';
+
+import { CorpUser, EntityType, SearchResult } from '@types';
+
+const UserProfile = lazyProfileComponent('UserProfile', () => import('@app/entityV2/user/UserProfile'));
+
+/**
+ * Definition of the DataHub Dataset entity.
+ */
+export class UserEntity implements Entity<CorpUser> {
+    type: EntityType = EntityType.CorpUser;
+
+    icon = (fontSize?: number, styleType?: IconStyleType, color?: string) => {
+        return (
+            <User
+                className={TYPE_ICON_CLASS_NAME}
+                size={fontSize || 14}
+                color={color || 'currentColor'}
+                weight={styleType === IconStyleType.HIGHLIGHT ? 'fill' : 'regular'}
+            />
+        );
+    };
+
+    isSearchEnabled = () => true;
+
+    isBrowseEnabled = () => false;
+
+    isLineageEnabled = () => false;
+
+    getAutoCompleteFieldName = () => 'username';
+
+    getGraphName: () => string = () => 'corpuser';
+
+    getPathName: () => string = () => 'user';
+
+    getEntityName = () => i18next.t('entity.types:user.name');
+
+    getCollectionName: () => string = () => i18next.t('entity.types:user.namePlural');
+
+    renderProfile = (urn: string) => <UserProfile urn={urn} />;
+
+    renderPreview = (_previewType: PreviewType, data: CorpUser) => (
+        <Preview
+            urn={data.urn}
+            name={this.displayName(data)}
+            title={data.editableProperties?.title || data.info?.title || ''}
+        />
+    );
+
+    renderSearch = (result: SearchResult) => {
+        return this.renderPreview(PreviewType.SEARCH, result.entity as CorpUser);
+    };
+
+    displayName = (data: CorpUser) => {
+        if (data?.username === '__datahub_system') return 'Datahub System';
+
+        // SDK default writer (`CorpUserUrn("__ingestion")`) — raw username renders as
+        // "__ingestion" with a broken avatar glyph; show a human label instead.
+        if (data.urn === INGESTION_ACTOR_URN || data.username === '__ingestion') {
+            return i18next.t('entity.types:user.ingestionActor');
+        }
+        return (
+            data.editableProperties?.displayName ||
+            data.properties?.displayName ||
+            data.properties?.fullName ||
+            data.info?.displayName || // Deprecated info field
+            data.info?.fullName || // Deprecated info field
+            data.username ||
+            data.urn
+        );
+    };
+
+    getGenericEntityProperties = (user: CorpUser) => {
+        return getDataForEntityType({ data: user, entityType: this.type, getOverrideProperties: (data) => data });
+    };
+
+    supportedCapabilities = () => {
+        return new Set([EntityCapabilityType.ROLES]);
+    };
+}

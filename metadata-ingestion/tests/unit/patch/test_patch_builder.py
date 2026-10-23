@@ -1,0 +1,481 @@
+import json
+import pathlib
+from typing import Any, Dict, Union
+
+import pytest
+import time_machine
+
+from datahub.emitter.mce_builder import (
+    make_chart_urn,
+    make_dashboard_urn,
+    make_data_flow_urn,
+    make_data_job_urn_with_flow,
+    make_dataset_urn,
+    make_schema_field_urn,
+    make_tag_urn,
+)
+from datahub.ingestion.sink.file import write_metadata_file
+from datahub.metadata.schema_classes import (
+    AuditStampClass,
+    DatasetLineageTypeClass,
+    EdgeClass,
+    FineGrainedLineageClass,
+    FineGrainedLineageDownstreamTypeClass,
+    FineGrainedLineageUpstreamTypeClass,
+    GenericAspectClass,
+    MetadataChangeProposalClass,
+    TagAssociationClass,
+    UpstreamClass,
+)
+from datahub.specific.chart import ChartPatchBuilder
+from datahub.specific.dashboard import DashboardPatchBuilder
+from datahub.specific.datajob import DataJobPatchBuilder
+from datahub.specific.dataproduct import DataProductPatchBuilder
+from datahub.specific.dataset import DatasetPatchBuilder
+from datahub.testing import mce_helpers
+
+TAG_PATCH_VALUE = {
+    "arrayPrimaryKeys": {"tags": ["attribution\u241fsource", "tag"]},
+    "patch": [
+        {
+            "op": "add",
+            "path": "/tags//urn:li:tag:test_tag",
+            "value": {"tag": "urn:li:tag:test_tag"},
+        }
+    ],
+}
+
+
+def test_basic_dataset_patch_builder():
+    patcher = DatasetPatchBuilder(
+        make_dataset_urn(platform="hive", name="fct_users_created", env="PROD")
+    ).add_tag(TagAssociationClass(tag=make_tag_urn("test_tag")))
+
+    assert patcher.build() == [
+        MetadataChangeProposalClass(
+            entityType="dataset",
+            entityUrn="urn:li:dataset:(urn:li:dataPlatform:hive,fct_users_created,PROD)",
+            changeType="PATCH",
+            aspectName="globalTags",
+            aspect=GenericAspectClass(
+                value=json.dumps(TAG_PATCH_VALUE).encode("utf-8"),
+                contentType="application/json-patch+json",
+            ),
+        ),
+    ]
+
+
+def test_add_tag_uses_source_first_path():
+    """Regression test: add_tag must NOT produce a trailing-slash path like /tags/TAG_URN/.
+
+    The old tag-first ordering produced paths of the form /tags/TAG_URN/ (empty source
+    at the end). The Jakarta JSON-P (Parsson) library in GMS cannot apply an 'add'
+    operation when the last JSON Pointer component is an empty string, causing a
+    JsonException when the globalTags aspect does not yet exist for the entity.
+
+    The fix is source-first ordering, which places the empty-source component in the
+    middle: /tags//TAG_URN.  Parsson handles this correctly.
+    """
+    patcher = DatasetPatchBuilder(
+        make_dataset_urn(platform="hive", name="fct_users_created", env="PROD")
+    ).add_tag(TagAssociationClass(tag=make_tag_urn("my_tag")))
+
+    mcps = patcher.build()
+    assert len(mcps) == 1
+    payload = json.loads(mcps[0].aspect.value)  # type: ignore[union-attr]
+
+    apk = payload["arrayPrimaryKeys"]["tags"]
+    patch_ops = payload["patch"]
+
+    # APK must be source-first to avoid the trailing-slash Parsson bug.
+    assert apk == ["attribution\u241fsource", "tag"], (
+        f"Expected source-first APK, got {apk}"
+    )
+
+    add_paths = [op["path"] for op in patch_ops if op["op"] == "add"]
+    for path in add_paths:
+        assert not path.endswith("/"), (
+            f"Patch path '{path}' ends with '/' — this causes GMS to throw "
+            "JsonException when the aspect doesn't yet exist (Parsson bug)."
+        )
+        assert "/tags//" in path or path.startswith("/tags//"), (
+            f"Expected source-first path (source component before tag), got '{path}'"
+        )
+
+
+def test_complex_dataset_patch(
+    pytestconfig: pytest.Config, tmp_path: pathlib.Path
+) -> None:
+    patcher = (
+        DatasetPatchBuilder(
+            make_dataset_urn(platform="hive", name="fct_users_created", env="PROD")
+        )
+        .set_description("test description")
+        .add_custom_property("test_key_1", "test_value_1")
+        .add_custom_property("test_key_2", "test_value_2")
+        .add_tag(TagAssociationClass(tag=make_tag_urn("test_tag")))
+        .add_upstream_lineage(
+            upstream=UpstreamClass(
+                dataset=make_dataset_urn(
+                    platform="hive", name="fct_users_created_upstream", env="PROD"
+                ),
+                type=DatasetLineageTypeClass.TRANSFORMED,
+            )
+        )
+        .add_upstream_lineage(
+            upstream=UpstreamClass(
+                dataset=make_dataset_urn(
+                    platform="s3", name="my-bucket/my-folder/my-file.txt", env="PROD"
+                ),
+                type=DatasetLineageTypeClass.TRANSFORMED,
+            )
+        )
+        .add_fine_grained_lineage(
+            fine_grained_lineage=FineGrainedLineageClass(
+                upstreamType=FineGrainedLineageUpstreamTypeClass.FIELD_SET,
+                downstreams=[
+                    make_schema_field_urn(
+                        make_dataset_urn(
+                            platform="hive",
+                            name="fct_users_created",
+                            env="PROD",
+                        ),
+                        field_path="foo",
+                    )
+                ],
+                upstreams=[
+                    make_schema_field_urn(
+                        make_dataset_urn(
+                            platform="hive",
+                            name="fct_users_created_upstream",
+                            env="PROD",
+                        ),
+                        field_path="bar",
+                    )
+                ],
+                downstreamType=FineGrainedLineageDownstreamTypeClass.FIELD,
+                transformOperation="TRANSFORM",
+                confidenceScore=1.0,
+            )
+        )
+        .add_fine_grained_lineage(
+            fine_grained_lineage=FineGrainedLineageClass(
+                upstreamType=FineGrainedLineageUpstreamTypeClass.DATASET,
+                upstreams=[
+                    make_schema_field_urn(
+                        make_dataset_urn(
+                            platform="s3",
+                            name="my-bucket/my-folder/my-file.txt",
+                            env="PROD",
+                        ),
+                        field_path="foo",
+                    )
+                ],
+                downstreamType=FineGrainedLineageDownstreamTypeClass.FIELD_SET,
+                downstreams=[
+                    make_schema_field_urn(
+                        make_dataset_urn(
+                            platform="hive",
+                            name="fct_users_created",
+                            env="PROD",
+                        ),
+                        field_path="foo",
+                    )
+                ],
+            )
+        )
+    )
+    patcher.for_field("field1").add_tag(TagAssociationClass(tag=make_tag_urn("tag1")))
+    patcher.for_field("field1").remove_term("urn:li:glossaryTerm:term1")
+
+    out_path = tmp_path / "patch.json"
+    write_metadata_file(out_path, patcher.build())
+
+    mce_helpers.check_golden_file(
+        pytestconfig,
+        out_path,
+        pytestconfig.rootpath / "tests/unit/patch/complex_dataset_patch.json",
+    )
+
+
+def test_dataproduct_set_parent_data_product():
+    parent_urn = "urn:li:dataProduct:vendor_equities"
+    patcher = DataProductPatchBuilder(
+        "urn:li:dataProduct:portfolio_analytics"
+    ).set_parent_data_product(parent_urn)
+
+    mcps = patcher.build()
+    assert len(mcps) == 1
+    assert mcps[0].entityUrn == "urn:li:dataProduct:portfolio_analytics"
+    assert mcps[0].aspectName == "dataProductProperties"
+    payload = json.loads(mcps[0].aspect.value)  # type: ignore[union-attr]
+    assert payload == [
+        {
+            "op": "add",
+            "path": "/parentDataProduct",
+            "value": parent_urn,
+        }
+    ]
+
+
+def test_basic_chart_patch_builder():
+    patcher = ChartPatchBuilder(
+        make_chart_urn(platform="hive", name="fct_users_created")
+    ).add_tag(TagAssociationClass(tag=make_tag_urn("test_tag")))
+
+    assert patcher.build() == [
+        MetadataChangeProposalClass(
+            entityType="chart",
+            entityUrn="urn:li:chart:(hive,fct_users_created)",
+            changeType="PATCH",
+            aspectName="globalTags",
+            aspect=GenericAspectClass(
+                value=json.dumps(TAG_PATCH_VALUE).encode("utf-8"),
+                contentType="application/json-patch+json",
+            ),
+        ),
+    ]
+
+
+def test_basic_dashboard_patch_builder():
+    patcher = DashboardPatchBuilder(
+        make_dashboard_urn(platform="hive", name="fct_users_created")
+    ).add_tag(TagAssociationClass(tag=make_tag_urn("test_tag")))
+
+    assert patcher.build() == [
+        MetadataChangeProposalClass(
+            entityType="dashboard",
+            entityUrn="urn:li:dashboard:(hive,fct_users_created)",
+            changeType="PATCH",
+            aspectName="globalTags",
+            aspect=GenericAspectClass(
+                value=json.dumps(TAG_PATCH_VALUE).encode("utf-8"),
+                contentType="application/json-patch+json",
+            ),
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    "created_on,last_modified,expected_actor",
+    [
+        (1586847600000, 1586847600000, "urn:li:corpuser:datahub"),
+        (None, None, "urn:li:corpuser:datahub"),
+        (1586847600000, None, "urn:li:corpuser:datahub"),
+        (None, 1586847600000, "urn:li:corpuser:datahub"),
+    ],
+    ids=["both_timestamps", "no_timestamps", "only_created", "only_modified"],
+)
+@time_machine.travel("2020-04-14 07:00:00", tick=False)
+def test_datajob_patch_builder(created_on, last_modified, expected_actor):
+    def make_edge_or_urn(urn: str) -> Union[EdgeClass, str]:
+        if created_on or last_modified:
+            return EdgeClass(
+                destinationUrn=str(urn),
+                created=(
+                    AuditStampClass(
+                        time=created_on,
+                        actor=expected_actor,
+                    )
+                    if created_on
+                    else None
+                ),
+                lastModified=(
+                    AuditStampClass(
+                        time=last_modified,
+                        actor=expected_actor,
+                    )
+                    if last_modified
+                    else None
+                ),
+            )
+        return urn
+
+    def get_edge_expectation(urn: str) -> Dict[str, Any]:
+        if created_on or last_modified:
+            expected = {
+                "destinationUrn": str(urn),
+                "created": (
+                    AuditStampClass(
+                        time=created_on,
+                        actor=expected_actor,
+                    ).to_obj()
+                    if created_on
+                    else None
+                ),
+                "lastModified": (
+                    AuditStampClass(
+                        time=last_modified,
+                        actor=expected_actor,
+                    ).to_obj()
+                    if last_modified
+                    else None
+                ),
+            }
+            # filter out None values
+            return {k: v for k, v in expected.items() if v is not None}
+        return {"destinationUrn": str(urn)}
+
+    flow_urn = make_data_flow_urn(
+        orchestrator="nifi", flow_id="252C34e5af19-0192-1000-b248-b1abee565b5d"
+    )
+    job_urn = make_data_job_urn_with_flow(
+        flow_urn, "5ca6fee7-0192-1000-f206-dfbc2b0d8bfb"
+    )
+
+    patcher = DataJobPatchBuilder(job_urn)
+    patcher.add_output_dataset(
+        make_edge_or_urn(
+            "urn:li:dataset:(urn:li:dataPlatform:s3,output-bucket/folder1,DEV)"
+        )
+    ).add_output_dataset(
+        make_edge_or_urn(
+            "urn:li:dataset:(urn:li:dataPlatform:s3,output-bucket/folder3,DEV)"
+        )
+    ).add_output_dataset(
+        make_edge_or_urn(
+            "urn:li:dataset:(urn:li:dataPlatform:s3,output-bucket/folder2,DEV)"
+        )
+    ).add_fine_grained_lineage(
+        fine_grained_lineage=FineGrainedLineageClass(
+            upstreamType=FineGrainedLineageUpstreamTypeClass.FIELD_SET,
+            upstreams=[
+                make_schema_field_urn(
+                    make_dataset_urn(
+                        platform="hive",
+                        name="fct_users_created_upstream",
+                        env="PROD",
+                    ),
+                    field_path="bar",
+                )
+            ],
+            downstreamType=FineGrainedLineageDownstreamTypeClass.FIELD,
+            downstreams=[
+                make_schema_field_urn(
+                    make_dataset_urn(
+                        platform="hive",
+                        name="fct_users_created",
+                        env="PROD",
+                    ),
+                    field_path="foo",
+                )
+            ],
+            transformOperation="TRANSFORM",
+            confidenceScore=1.0,
+        )
+    ).add_fine_grained_lineage(
+        fine_grained_lineage=FineGrainedLineageClass(
+            upstreamType=FineGrainedLineageUpstreamTypeClass.DATASET,
+            upstreams=[
+                make_schema_field_urn(
+                    make_dataset_urn(
+                        platform="s3",
+                        name="my-bucket/my-folder/my-file.txt",
+                        env="PROD",
+                    ),
+                    field_path="foo",
+                )
+            ],
+            downstreamType=FineGrainedLineageDownstreamTypeClass.FIELD_SET,
+            downstreams=[
+                make_schema_field_urn(
+                    make_dataset_urn(
+                        platform="hive",
+                        name="fct_users_created",
+                        env="PROD",
+                    ),
+                    field_path="foo",
+                )
+            ],
+        )
+    ).remove_fine_grained_lineage(
+        fine_grained_lineage=FineGrainedLineageClass(
+            upstreamType=FineGrainedLineageUpstreamTypeClass.FIELD_SET,
+            upstreams=[
+                make_schema_field_urn(
+                    make_dataset_urn(
+                        platform="hive",
+                        name="fct_users_deprecated",
+                        env="PROD",
+                    ),
+                    field_path="users",
+                ),
+                make_schema_field_urn(
+                    make_dataset_urn(
+                        platform="hive",
+                        name="fct_users_deprecated",
+                        env="PROD",
+                    ),
+                    field_path="users_old",
+                ),
+            ],
+            downstreamType=FineGrainedLineageDownstreamTypeClass.FIELD,
+            downstreams=[
+                make_schema_field_urn(
+                    make_dataset_urn(
+                        platform="hive",
+                        name="fct_users_created",
+                        env="PROD",
+                    ),
+                    field_path="users",
+                )
+            ],
+        )
+    )
+
+    assert patcher.build() == [
+        MetadataChangeProposalClass(
+            entityType="dataJob",
+            entityUrn="urn:li:dataJob:(urn:li:dataFlow:(nifi,252C34e5af19-0192-1000-b248-b1abee565b5d,prod),5ca6fee7-0192-1000-f206-dfbc2b0d8bfb)",
+            changeType="PATCH",
+            aspectName="dataJobInputOutput",
+            aspect=GenericAspectClass(
+                value=json.dumps(
+                    [
+                        {
+                            "op": "add",
+                            "path": "/outputDatasetEdges/urn:li:dataset:(urn:li:dataPlatform:s3,output-bucket~1folder1,DEV)",
+                            "value": get_edge_expectation(
+                                "urn:li:dataset:(urn:li:dataPlatform:s3,output-bucket/folder1,DEV)"
+                            ),
+                        },
+                        {
+                            "op": "add",
+                            "path": "/outputDatasetEdges/urn:li:dataset:(urn:li:dataPlatform:s3,output-bucket~1folder3,DEV)",
+                            "value": get_edge_expectation(
+                                "urn:li:dataset:(urn:li:dataPlatform:s3,output-bucket/folder3,DEV)"
+                            ),
+                        },
+                        {
+                            "op": "add",
+                            "path": "/outputDatasetEdges/urn:li:dataset:(urn:li:dataPlatform:s3,output-bucket~1folder2,DEV)",
+                            "value": get_edge_expectation(
+                                "urn:li:dataset:(urn:li:dataPlatform:s3,output-bucket/folder2,DEV)"
+                            ),
+                        },
+                        {
+                            "op": "add",
+                            "path": "/fineGrainedLineages/TRANSFORM/urn:li:schemaField:(urn:li:dataset:(urn:li:dataPlatform:hive,fct_users_created,PROD),foo)/NONE/urn:li:schemaField:(urn:li:dataset:(urn:li:dataPlatform:hive,fct_users_created_upstream,PROD),bar)",
+                            "value": {"confidenceScore": 1.0},
+                        },
+                        {
+                            "op": "add",
+                            "path": "/fineGrainedLineages/NONE/urn:li:schemaField:(urn:li:dataset:(urn:li:dataPlatform:hive,fct_users_created,PROD),foo)/NONE/urn:li:schemaField:(urn:li:dataset:(urn:li:dataPlatform:s3,my-bucket~1my-folder~1my-file.txt,PROD),foo)",
+                            "value": {"confidenceScore": 1.0},
+                        },
+                        {
+                            "op": "remove",
+                            "path": "/fineGrainedLineages/NONE/urn:li:schemaField:(urn:li:dataset:(urn:li:dataPlatform:hive,fct_users_created,PROD),users)/NONE/urn:li:schemaField:(urn:li:dataset:(urn:li:dataPlatform:hive,fct_users_deprecated,PROD),users)",
+                            "value": {},
+                        },
+                        {
+                            "op": "remove",
+                            "path": "/fineGrainedLineages/NONE/urn:li:schemaField:(urn:li:dataset:(urn:li:dataPlatform:hive,fct_users_created,PROD),users)/NONE/urn:li:schemaField:(urn:li:dataset:(urn:li:dataPlatform:hive,fct_users_deprecated,PROD),users_old)",
+                            "value": {},
+                        },
+                    ]
+                ).encode("utf-8"),
+                contentType="application/json-patch+json",
+            ),
+        )
+    ]

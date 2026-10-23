@@ -1,0 +1,353 @@
+import logging
+from copy import deepcopy
+from enum import Enum
+from typing import Annotated, Any, Dict, FrozenSet, List, Optional, Tuple
+
+from pydantic import model_validator
+from pydantic.fields import Field
+
+from datahub.configuration import ConfigModel
+from datahub.configuration.common import (
+    AllowDenyPattern,
+    HiddenFromDocs,
+    Qualifier,
+)
+from datahub.configuration.source_common import DatasetLineageProviderConfigBase
+from datahub.configuration.validate_field_removal import pydantic_removed_field
+from datahub.configuration.validate_field_rename import pydantic_renamed_field
+from datahub.ingestion.agent.verdicts import Verdict, VerdictContext, pattern_verdict
+from datahub.ingestion.api.incremental_lineage_helper import (
+    IncrementalLineageConfigMixin,
+)
+from datahub.ingestion.glossary.classification_mixin import (
+    ClassificationSourceConfigMixin,
+)
+from datahub.ingestion.source.common.subtypes import DatasetSubTypes
+from datahub.ingestion.source.data_lake_common.path_spec import PathSpec
+from datahub.ingestion.source.sql.sql_config import (
+    BasicSQLAlchemyConfig,
+    sql_structural_verdict,
+)
+from datahub.ingestion.source.state.stateful_ingestion_base import (
+    StatefulLineageConfigMixin,
+    StatefulProfilingConfigMixin,
+    StatefulUsageConfigMixin,
+)
+from datahub.ingestion.source.usage.usage_common import BaseUsageConfig
+
+logger = logging.Logger(__name__)
+
+
+# A view must pass view_pattern, then table_pattern (redshift.py
+# cache_tables_and_views, then _process_view).
+VIEW_FILTER_FIELDS: Tuple[str, ...] = ("view_pattern", "table_pattern")
+
+
+def dataset_name(database: str, schema: str, table: str) -> str:
+    """The identifier table_pattern/view_pattern is matched against.
+
+    Shared by ingestion (redshift.py) and the probe, so both sides filter on
+    the same string; they used to build it independently and disagreed. The
+    probe reaches it through the `Qualifier(authoritative=True)` on `database`
+    below rather than through an override of its own -- Redshift connects to
+    exactly one database, so the config is the authority on which.
+    """
+    return f"{database}.{schema}.{table}"
+
+
+# The lineage modes are documented in the Redshift source's docstring.
+class LineageMode(Enum):
+    SQL_BASED = "sql_based"
+    STL_SCAN_BASED = "stl_scan_based"
+    MIXED = "mixed"
+
+
+class S3LineageProviderConfig(ConfigModel):
+    """
+    Any source that produces s3 lineage from/to Datasets should inherit this class.
+    """
+
+    path_specs: List[PathSpec] = Field(
+        default=[],
+        description="List of PathSpec. See below the details about PathSpec",
+    )
+
+    strip_urls: bool = Field(
+        default=True,
+        description="Strip filename from s3 url. It only applies if path_specs are not specified.",
+    )
+
+    ignore_non_path_spec_path: bool = Field(
+        default=False,
+        description="Ignore paths that are not match in path_specs. It only applies if path_specs are specified.",
+    )
+
+
+class S3DatasetLineageProviderConfigBase(ConfigModel):
+    """
+    Any source that produces s3 lineage from/to Datasets should inherit this class.
+    This is needeed to group all lineage related configs under `s3_lineage_config` config property.
+    """
+
+    s3_lineage_config: S3LineageProviderConfig = Field(
+        default=S3LineageProviderConfig(),
+        description="Common config for S3 lineage generation",
+    )
+
+
+class RedshiftUsageConfig(BaseUsageConfig, StatefulUsageConfigMixin):
+    email_domain: Optional[str] = Field(
+        default=None,
+        description="Email domain of your organisation so users can be displayed on UI appropriately.",
+    )
+
+
+class RedshiftConfig(
+    BasicSQLAlchemyConfig,
+    DatasetLineageProviderConfigBase,
+    S3DatasetLineageProviderConfigBase,
+    IncrementalLineageConfigMixin,
+    RedshiftUsageConfig,
+    StatefulLineageConfigMixin,
+    StatefulProfilingConfigMixin,
+    ClassificationSourceConfigMixin,
+):
+    database: Annotated[str, Qualifier(authoritative=True)] = Field(
+        default="dev", description="database"
+    )
+
+    # Although Amazon Redshift is compatible with Postgres's wire format,
+    # we actually want to use the sqlalchemy-redshift package and dialect
+    # because it has better caching behavior. In particular, it queries
+    # the full table, column, and constraint information in a single larger
+    # query, and then simply pulls out the relevant information as needed.
+    # Because of this behavior, it uses dramatically fewer round trips for
+    # large Redshift warehouses. As an example, see this query for the columns:
+    # https://github.com/sqlalchemy-redshift/sqlalchemy-redshift/blob/60b4db04c1d26071c291aeea52f1dcb5dd8b0eb0/sqlalchemy_redshift/dialect.py#L745.
+    scheme: HiddenFromDocs[str] = Field(
+        default="redshift+redshift_connector",
+        description="",
+    )
+
+    _database_alias_removed = pydantic_removed_field(
+        "database_alias", month="November", year=2023
+    )
+    _use_lineage_v2_removed = pydantic_removed_field(
+        "use_lineage_v2", month="August", year=2025
+    )
+    _rename_lineage_v2_generate_queries_to_lineage_generate_queries = (
+        pydantic_renamed_field(
+            "lineage_v2_generate_queries", "lineage_generate_queries"
+        )
+    )
+
+    default_schema: Optional[str] = Field(
+        default="public",
+        description=(
+            "The default schema to use if the SQL parser fails to parse the "
+            "schema with the `sql_based` lineage collector. Set to `None` "
+            "(or override at runtime) to leave unqualified table references "
+            "without a schema qualifier in the resulting URN, instead of "
+            "forcing them under the default schema."
+        ),
+    )
+
+    is_serverless: bool = Field(
+        default=False,
+        description="Whether target Redshift instance is serverless (alternative is provisioned cluster)",
+    )
+
+    lineage_generate_queries: bool = Field(
+        default=True,
+        description="Whether to generate queries entities for the SQL-based lineage collector.",
+    )
+
+    include_query_usage_statistics: bool = Field(
+        default=True,
+        description=(
+            "Generate per-query popularity statistics (queryUsageStatistics) for the "
+            "Query entities emitted by the SQL-based lineage collector. This is a "
+            "sub-flag of include_usage_statistics: it only takes effect when "
+            "include_usage_statistics is enabled, and is independent of "
+            "include_column_usage_stats. Requires lineage_generate_queries (default "
+            "True) so Query entities exist to attach stats to."
+        ),
+    )
+
+    include_table_lineage: bool = Field(
+        default=True, description="Whether table lineage should be ingested."
+    )
+    include_copy_lineage: bool = Field(
+        default=True,
+        description="Whether lineage should be collected from copy commands",
+    )
+    include_share_lineage: bool = Field(
+        default=True,
+        description="Whether lineage should be collected from datashares",
+    )
+
+    include_usage_statistics: bool = Field(
+        default=False,
+        description="Generate usage statistic. email_domain config parameter needs to be set if enabled",
+    )
+
+    include_column_usage_stats: bool = Field(
+        default=False,
+        description="Generate column-level usage statistics (`fieldCounts`) by parsing "
+        "the SQL query text instead of attributing reads to the tables reported by "
+        "Redshift's `stl_scan` system table. This is slower (every read query is parsed) "
+        "but adds per-column usage. The full query text is reconstructed from "
+        "`STL_QUERYTEXT` / `SYS_QUERY_TEXT` (the same source used for lineage), not the "
+        "truncated `stl_query.querytxt`. Only applies when `include_usage_statistics` is "
+        "enabled.",
+    )
+
+    include_unload_lineage: bool = Field(
+        default=True,
+        description="Whether lineage should be collected from unload commands",
+    )
+
+    include_table_rename_lineage: bool = Field(
+        default=True,
+        description="Whether we should follow `alter table ... rename to` statements when computing lineage. ",
+    )
+    table_lineage_mode: LineageMode = Field(
+        default=LineageMode.MIXED,
+        description="Which table lineage collector mode to use. Available modes are: [stl_scan_based, sql_based, mixed]",
+    )
+    extra_client_options: Dict[str, Any] = {}
+
+    match_fully_qualified_names: bool = Field(
+        default=False,
+        description="Whether `schema_pattern` is matched against fully qualified schema name `<database>.<schema>`.",
+    )
+
+    extract_column_level_lineage: bool = Field(
+        default=True,
+        description="Whether to extract column level lineage. This config works with rest-sink only.",
+    )
+
+    # TODO - use DatasetPropertiesConfigMixin instead
+    patch_custom_properties: bool = Field(
+        default=True,
+        description="Whether to patch custom properties on existing datasets rather than replace.",
+    )
+
+    resolve_temp_table_in_lineage: bool = Field(
+        default=True,
+        description="Whether to resolve temp table appear in lineage to upstream permanent tables.",
+    )
+
+    skip_external_tables: bool = Field(
+        default=False,
+        description="Whether to skip EXTERNAL tables.",
+    )
+
+    extract_ownership: bool = Field(
+        default=False,
+        description=(
+            "When enabled, extracts table and view owners from the Redshift catalog "
+            "(pg_catalog.pg_user) and emits them as TECHNICAL_OWNER in DataHub. "
+            "Ownership is applied using OVERWRITE mode, meaning any existing ownership "
+            "information (including manually added or modified owners from the UI) "
+            "will be replaced."
+        ),
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_email_is_set_on_usage(cls, values):
+        if values.get("include_usage_statistics"):
+            assert "email_domain" in values and values["email_domain"], (
+                "email_domain needs to be set if usage is enabled"
+            )
+        return values
+
+    @model_validator(mode="after")
+    def check_database_is_set(self) -> "RedshiftConfig":
+        assert self.database, "database must be set"
+        return self
+
+    @property
+    def lineage_enabled(self) -> bool:
+        """True if any lineage source is enabled. Single source of truth so the
+        source-level gating and the aggregator's generate_lineage stay in sync."""
+        return (
+            self.include_table_lineage
+            or self.include_view_lineage
+            or self.include_copy_lineage
+            or self.include_unload_lineage
+            or self.include_share_lineage
+            or self.include_table_rename_lineage
+        )
+
+    @classmethod
+    def default_schemas(cls) -> FrozenSet[str]:
+        # Reuse the same list the schema-listing SQL excludes, so the agent probe
+        # marks pg_catalog / information_schema as auto-dropped, not user-filtered.
+        from datahub.ingestion.source.redshift.query import REDSHIFT_DEFAULT_SCHEMAS
+
+        return frozenset(REDSHIFT_DEFAULT_SCHEMAS)
+
+    @model_validator(mode="after")
+    def backward_compatibility_configs_set(self) -> "RedshiftConfig":
+        if (
+            self.schema_pattern is not None
+            and self.schema_pattern != AllowDenyPattern.allow_all()
+            and self.match_fully_qualified_names is not None
+            and not self.match_fully_qualified_names
+        ):
+            logger.warning(
+                "Please update `schema_pattern` to match against fully qualified schema name `<database_name>.<schema_name>` and set config `match_fully_qualified_names : True`."
+                "Current default `match_fully_qualified_names: False` is only to maintain backward compatibility. "
+                "The config option `match_fully_qualified_names` will be deprecated in future and the default behavior will assume `match_fully_qualified_names: True`."
+            )
+        return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def connection_config_compatibility_set(cls, values: Dict) -> Dict:
+        # Create a copy to avoid modifying the input dictionary, preventing state contamination in tests
+        values = deepcopy(values)
+
+        if (
+            ("options" in values and "connect_args" in values["options"])
+            and "extra_client_options" in values
+            and len(values["extra_client_options"]) > 0
+        ):
+            raise ValueError(
+                "Cannot set both `connect_args` and `extra_client_options` in the config. Please use `extra_client_options` only."
+            )
+
+        if "options" in values and "connect_args" in values["options"]:
+            values["extra_client_options"] = values["options"]["connect_args"]
+
+        if values.get("extra_client_options"):
+            if values.get("options"):
+                values["options"]["connect_args"] = values["extra_client_options"]
+            else:
+                values["options"] = {"connect_args": values["extra_client_options"]}
+        return values
+
+    def view_allowed(self, name: str) -> bool:
+        """Whether every pattern in VIEW_FILTER_FIELDS allows view `name`
+        (dataset_name's form)."""
+        return all(getattr(self, field).allowed(name) for field in VIEW_FILTER_FIELDS)
+
+    def probe_verdict_override(self, ctx: VerdictContext) -> Optional[Verdict]:
+        if ctx.kind == DatasetSubTypes.VIEW and ctx.structural is None:
+            for field in VIEW_FILTER_FIELDS:
+                verdict = pattern_verdict(self, field, ctx.target)
+                if not verdict.included:
+                    return verdict
+        return sql_structural_verdict(self, ctx)
+
+    @classmethod
+    def probe_provider_class(cls) -> type:
+        # Not the inherited SqlAlchemyMetadataProbe: ingestion connects and
+        # enumerates through redshift_connector, not the Inspector.
+        from datahub.ingestion.source.redshift.redshift_probe import (
+            RedshiftMetadataProbe,
+        )
+
+        return RedshiftMetadataProbe

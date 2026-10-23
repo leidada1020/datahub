@@ -1,0 +1,158 @@
+import { Maybe } from 'graphql/jsutils/Maybe';
+import React from 'react';
+import styled from 'styled-components';
+
+import { GenericEntityProperties } from '@app/entity/shared/types';
+import { EntityMenuActions } from '@app/entityV2/Entity';
+import { EntityMenuItems } from '@app/entityV2/shared/EntityDropdown/EntityMenuActions';
+import MoreOptionsMenuAction from '@app/entityV2/shared/EntityDropdown/MoreOptionsMenuAction';
+import ViewInPlatform from '@app/entityV2/shared/externalUrl/ViewInPlatform';
+import ColoredBackgroundPlatformIconGroup, {
+    PlatformContentWrapper,
+} from '@app/previewV2/ColoredBackgroundPlatformIconGroup';
+import ContextPath from '@app/previewV2/ContextPath';
+import EntityHeader from '@app/previewV2/EntityHeader';
+import { ActionsAndStatusSection } from '@app/previewV2/shared';
+
+import { BrowsePathV2, Deprecation, Entity, EntityType, Health } from '@types';
+
+const RowContainer = styled.div`
+    display: flex;
+    flex-direction: row;
+    width: 100%;
+    align-items: self-start;
+    justify-content: space-between;
+
+    ${PlatformContentWrapper} {
+        max-width: fit-content;
+        margin: 0px;
+        margin-right: 5px;
+    }
+`;
+
+const StyledPlatformIconGroup = styled(ColoredBackgroundPlatformIconGroup)`
+    margin: 0;
+`;
+
+const ContextPathRowContainer = styled(RowContainer)`
+    align-items: center;
+    justify-content: start;
+`;
+
+const CompactActionsAndStatusSection = styled(ActionsAndStatusSection)`
+    justify-content: end;
+    margin-right: -0.3rem;
+`;
+
+interface Props {
+    name: string;
+    urn: string;
+    data: GenericEntityProperties | null;
+    isIconPresent: boolean;
+    url: string;
+    entityType: EntityType;
+    platform?: string;
+    platforms?: Maybe<string | undefined>[];
+    deprecation?: Deprecation | null;
+    titleSizePx?: number;
+    onClick?: () => void;
+    // this is provided by the impact analysis view. it is used to display
+    // how the listed node is connected to the source node
+    degree?: number;
+    health?: Health[];
+    // eslint-disable-next-line react/no-unused-prop-types
+    description?: string;
+    isOutputPort?: boolean;
+    headerDropdownItems?: Set<EntityMenuItems>;
+    actions?: EntityMenuActions;
+    entityIcon?: JSX.Element;
+    logoUrls?: Maybe<string | undefined>[];
+    logoUrl?: string;
+    previewData: GenericEntityProperties | null;
+    finalType?: string | undefined;
+    parentEntities?: Entity[] | null;
+    browsePaths?: BrowsePathV2 | undefined;
+}
+
+export const CompactView = ({
+    data,
+    name,
+    onClick,
+    titleSizePx,
+    url,
+    degree,
+    deprecation,
+    actions,
+    health,
+    previewData,
+    isIconPresent,
+    platform,
+    logoUrl,
+    platforms,
+    logoUrls,
+    isOutputPort,
+    entityIcon,
+    headerDropdownItems,
+    urn,
+    entityType,
+    finalType,
+    parentEntities,
+    browsePaths,
+}: Props) => {
+    return (
+        <>
+            <RowContainer>
+                <EntityHeader
+                    name={name}
+                    onClick={onClick}
+                    titleSizePx={titleSizePx}
+                    url={url}
+                    urn={urn}
+                    deprecation={deprecation}
+                    health={health}
+                    degree={degree}
+                    connectionName={previewData?.name}
+                />
+                <CompactActionsAndStatusSection>
+                    <ViewInPlatform data={data} urn={urn} />
+                    {headerDropdownItems && (
+                        <MoreOptionsMenuAction
+                            menuItems={headerDropdownItems}
+                            urn={urn}
+                            entityType={entityType}
+                            entityData={previewData}
+                            triggerType={['click']}
+                            actions={actions}
+                        />
+                    )}
+                </CompactActionsAndStatusSection>
+            </RowContainer>
+            <ContextPathRowContainer>
+                {isIconPresent ? (
+                    <div style={{ display: 'flex', alignItems: 'center' }}>
+                        <StyledPlatformIconGroup
+                            platformName={platform}
+                            platformLogoUrl={logoUrl}
+                            platformNames={platforms}
+                            platformLogoUrls={logoUrls}
+                            isOutputPort={isOutputPort}
+                            icon={entityIcon}
+                            imgSize={10}
+                            backgroundSize={20}
+                        />
+                    </div>
+                ) : (
+                    <div />
+                )}
+                <ContextPath
+                    displayedEntityType={finalType}
+                    entityType={entityType}
+                    browsePaths={browsePaths}
+                    parentEntities={parentEntities}
+                    entityTitleWidth={200}
+                    isCompactView
+                />
+            </ContextPathRowContainer>
+        </>
+    );
+};

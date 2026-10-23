@@ -1,0 +1,132 @@
+import { Tooltip } from '@components';
+import React, { useContext, useEffect, useMemo, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { Link } from 'react-router-dom';
+import styled from 'styled-components';
+
+import analytics, { EventType, HomePageModule } from '@app/analytics';
+import { useUserContext } from '@app/context/useUserContext';
+import { useRegisterInsight } from '@app/homeV2/content/tabs/discovery/sections/insight/InsightStatusProvider';
+import { InsightCard } from '@app/homeV2/content/tabs/discovery/sections/insight/shared/InsightCard';
+import InsightCardSkeleton from '@app/homeV2/content/tabs/discovery/sections/insight/shared/InsightCardSkeleton';
+import { EntityLinkList } from '@app/homeV2/reference/sections/EntityLinkList';
+import { useHomeRecommendations } from '@app/homeV2/useHomeRecommendations';
+import OnboardingContext from '@app/onboarding/OnboardingContext';
+import { PageRoutes } from '@conf/Global';
+
+import { RecommendationRenderType } from '@types';
+
+const Header = styled.div`
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+`;
+
+const Title = styled.div`
+    font-size: 16px;
+    font-weight: bold;
+    display: flex;
+    align-items: center;
+    justify-content: start;
+    color: ${(props) => props.theme.colors.text};
+    white-space: nowrap;
+    margin-right: 20px;
+`;
+
+const ShowAll = styled(Link)`
+    color: ${(props) => props.theme.colors.textSecondary};
+    font-size: 12px;
+    font-weight: 700;
+
+    :hover {
+        cursor: pointer;
+        text-decoration: underline;
+    }
+
+    white-space: nowrap;
+`;
+
+export const POPULAR_GLOSSARY_TERMS_ID = 'PopularGlossaryTerms';
+
+export const PopularGlossaryTerms = () => {
+    const { t } = useTranslation('home.v2');
+    const { t: tc } = useTranslation('common.actions');
+    const [loaded, setLoaded] = useState(false);
+    const { isUserInitializing } = useContext(OnboardingContext);
+    const userContext = useUserContext();
+
+    const { modules: recommendationModules, loading } = useHomeRecommendations();
+    const glossaryRecommendationModules = recommendationModules?.filter(
+        (module) => module.renderType === RecommendationRenderType.GlossaryTermSearchList,
+    );
+    const glossaryRecommendationModule = glossaryRecommendationModules?.[0] || null;
+    const recommendedGlossaryTerms = useMemo(
+        () =>
+            glossaryRecommendationModule?.content
+                ?.map((contentItem) => {
+                    return contentItem?.entity;
+                })
+                ?.slice(0, 5) || [],
+        [glossaryRecommendationModule],
+    );
+
+    const title = t('insights.popularGlossaryTermsTitle');
+    const handleViewAll = () => {
+        analytics.event({
+            type: EventType.HomePageClick,
+            module: HomePageModule.Discover,
+            section: 'For you',
+            subSection: title,
+            value: tc('viewAll'),
+        });
+    };
+
+    const handleClickEntity = (urn?: string) => {
+        analytics.event({
+            type: EventType.HomePageClick,
+            module: HomePageModule.Discover,
+            section: 'For you',
+            subSection: title,
+            value: urn,
+        });
+    };
+
+    useEffect(() => {
+        if (!loading && recommendationModules && !loaded) {
+            setLoaded(true);
+        }
+    }, [loaded, loading, recommendationModules, setLoaded]);
+
+    // Register the insight module with parent component. Important that undefined is used before loading
+    const isPresent = useMemo(
+        () => (loaded ? !!recommendedGlossaryTerms?.length : undefined),
+        [recommendedGlossaryTerms, loaded],
+    );
+    useRegisterInsight(POPULAR_GLOSSARY_TERMS_ID, isPresent);
+
+    const showSkeleton = !userContext.loaded || loading || isUserInitializing;
+    return (
+        <>
+            {showSkeleton && <InsightCardSkeleton />}
+            {!showSkeleton && !!recommendedGlossaryTerms.length && (
+                <InsightCard id={POPULAR_GLOSSARY_TERMS_ID} minWidth={340} maxWidth={500}>
+                    <Header>
+                        <Tooltip title={t('insights.popularGlossaryTermsTooltip')} showArrow={false} placement="top">
+                            <Title>{title}</Title>
+                        </Tooltip>
+                        <ShowAll to={PageRoutes.GLOSSARY} onClick={handleViewAll}>
+                            {tc('viewAll')}
+                        </ShowAll>
+                    </Header>
+                    <EntityLinkList
+                        entities={recommendedGlossaryTerms}
+                        loading={false}
+                        empty={recommendedGlossaryTerms?.length === 0 || t('insights.noAssetsFound')}
+                        onClickEntity={handleClickEntity}
+                    />
+                </InsightCard>
+            )}
+        </>
+    );
+};

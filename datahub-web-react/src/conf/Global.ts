@@ -1,0 +1,71 @@
+/*
+   Default top-level page route names (excludes entity pages)
+*/
+export enum PageRoutes {
+    /**
+     * Server-side authentication route
+     */
+    ROOT = '/',
+    AUTHENTICATE = '/authenticate',
+    SIGN_UP = '/signup',
+    LOG_IN = '/login',
+    RESET_CREDENTIALS = '/reset',
+    SEARCH_RESULTS = '/search/:type?',
+    SEARCH = '/search',
+    BROWSE = '/browse',
+    BROWSE_RESULTS = '/browse/:type',
+    ANALYTICS = '/analytics',
+    POLICIES = '/policies',
+    SETTINGS_POLICIES = '/settings/policies',
+    PERMISSIONS = '/permissions',
+    IDENTITIES = '/identities',
+    INGESTION = '/ingestion',
+    INGESTION_CREATE = '/ingestion/create',
+    INGESTION_UPDATE = '/ingestion/update/:urn',
+    INGESTION_RUN_DETAILS = '/ingestion/run-details/:urn',
+    SETTINGS = '/settings',
+    DOMAINS = '/domains',
+    DOMAIN = '/domain',
+    DOCUMENT = '/document',
+    GLOSSARY = '/glossary',
+    STRUCTURED_PROPERTIES = '/structured-properties',
+    STRUCTURED_PROPERTIES_CREATE = '/structured-properties/create',
+    STRUCTURED_PROPERTIES_EDIT = '/structured-properties/edit/:urn',
+    SETTINGS_VIEWS = '/settings/views',
+    EMBED = '/embed',
+    EMBED_LOOKUP = '/embed/lookup/:url',
+    BUSINESS_ATTRIBUTE = '/business-attribute',
+    INTRODUCE = '/introduce',
+    MANAGE_TAGS = '/tags',
+    MANAGE_APPLICATIONS = '/applications',
+    CONTEXT = '/context',
+    CONTEXT_DOCUMENTS = '/context/documents',
+    METRICS = '/metrics',
+    METRIC_ENTITY = '/metric',
+    SEMANTIC_MODEL_ENTITY = '/semanticModel',
+    MARKETPLACE = '/marketplace',
+    DATA_PRODUCT_ENTITY = '/dataProduct',
+}
+
+export enum HelpLinkRoutes {
+    GRAPHIQL = '/api/graphiql',
+    OPENAPI = '/openapi/swagger-ui/index.html',
+}
+
+/**
+ * Name of the auth cookie checked on client side (contains the currently authenticated user urn).
+ */
+export const CLIENT_AUTH_COOKIE = 'actor';
+
+/**
+ * Name of the unique browser id cookie generated on client side
+ */
+export const BROWSER_ID_COOKIE = 'bid';
+
+/** New Routes Map for redirection */
+export const NEW_ROUTE_MAP = {
+    '/Validation/Assertions': '/Quality/List',
+    '/Validation/Tests': '/Governance/Tests',
+    '/Validation/Data%20Contract': '/Quality/Data%20Contract',
+    '/Validation': '/Quality',
+};

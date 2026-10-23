@@ -1,0 +1,80 @@
+plugins {
+    id 'java-library'
+}
+apply from: '../../gradle/coverage/java-coverage.gradle'
+apply plugin: 'pegasus'
+
+configurations {
+    avro
+}
+
+dependencies {
+    avro project(path: ':metadata-models', configuration: 'avroSchema')
+
+    implementation project(':li-utils')
+    implementation(project(':metadata-service:factories')) {
+        exclude group: 'org.neo4j.test'
+    }
+    implementation project(':metadata-service:auth-config')
+    implementation project(':metadata-service:restli-client-api')
+    implementation project(':metadata-io')
+    implementation project(':ingestion-scheduler')
+    implementation project(':metadata-utils')
+    implementation project(":entity-registry")
+    implementation project(':metadata-events:mxe-avro')
+    implementation project(':metadata-events:mxe-registration')
+    implementation project(':metadata-events:mxe-utils-avro')
+    implementation project(':datahub-graphql-core')
+    api project(':metadata-jobs:common')
+
+    implementation externalDependency.elasticSearchRest
+    implementation externalDependency.kafkaAvroSerde
+    implementation externalDependency.protobuf
+    implementation externalDependency.neo4jJavaDriver
+
+    implementation externalDependency.springKafka
+    implementation externalDependency.annotationApi
+    implementation externalDependency.opentelemetrySdkTrace
+    implementation externalDependency.opentelemetrySdkMetrics
+
+    implementation externalDependency.slf4jApi
+    compileOnly externalDependency.lombok
+
+    annotationProcessor externalDependency.lombok
+
+    runtimeOnly externalDependency.logbackClassic
+
+    // Spring Boot 4.0: Cassandra/Elasticsearch auto-configs moved to separate modules (needed for tests)
+    testImplementation externalDependency.springBootCassandra
+    testImplementation externalDependency.springBootElasticsearch
+    // Spring Boot 4.0: Jackson 2 bridge — provides ObjectMapper bean via Jackson2AutoConfiguration
+    testImplementation externalDependency.springBootJackson2
+    testImplementation externalDependency.mockito
+    testImplementation(testFixtures(project(":metadata-io")))
+    implementation externalDependency.awsMskIamAuth
+    implementation externalDependency.azureIdentityExtensions
+    implementation externalDependency.azureIdentity
+    // kafka-clients OAUTHBEARER JWT validation is compileOnly upstream (KAFKA-20184)
+    runtimeOnly externalDependency.jose4j
+
+    testImplementation externalDependency.testng
+    testImplementation externalDependency.springBootTest
+    testRuntimeOnly externalDependency.logbackClassic
+}
+
+task avroSchemaSources(type: Copy) {
+    dependsOn configurations.avro
+
+    from { // use of closure defers evaluation until execution time
+        configurations.avro.collect { zipTree(it) }
+    }
+    into("src/main/resources/")
+    include("avro/com/linkedin/mxe/")
+}
+
+compileJava.dependsOn avroSchemaSources
+processResources.dependsOn avroSchemaSources
+
+clean {
+    delete "src/main/resources/avro"
+}

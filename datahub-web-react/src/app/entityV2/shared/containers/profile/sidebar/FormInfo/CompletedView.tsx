@@ -1,0 +1,79 @@
+import React, { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useTheme } from 'styled-components';
+
+import OptionalPromptsRemaining from '@app/entity/shared/containers/profile/sidebar/FormInfo/OptionalPromptsRemaining';
+import VerificationAuditStamp from '@app/entity/shared/containers/profile/sidebar/FormInfo/VerificationAuditStamp';
+import {
+    CTAWrapper,
+    Content,
+    FlexWrapper,
+    StyledArrow,
+    StyledBookIcon,
+    StyledButtonWrapper,
+    StyledImgIcon,
+    Title,
+    TitleWrapper,
+} from '@app/entityV2/shared/containers/profile/sidebar/FormInfo/components';
+import { Button } from '@src/alchemy-components';
+
+import ShieldCheck from '@images/shield-check.svg';
+
+interface Props {
+    showVerificationStyles: boolean;
+    numOptionalPromptsRemaining: number;
+    isUserAssigned: boolean;
+    formUrn?: string;
+    openFormModal?: () => void;
+}
+
+export default function CompletedView({
+    showVerificationStyles,
+    numOptionalPromptsRemaining,
+    isUserAssigned,
+    formUrn,
+    openFormModal,
+}: Props) {
+    const { t } = useTranslation('entity.shared.containers');
+    const theme = useTheme();
+    const [isOpen, setIsOpen] = useState(false);
+
+    return (
+        <CTAWrapper backgroundColor="transparent" borderColor={theme.colors.borderSuccess}>
+            <FlexWrapper>
+                <Content>
+                    <TitleWrapper
+                        isOpen={isOpen}
+                        isUserAssigned={isUserAssigned}
+                        onClick={() => isUserAssigned && setIsOpen(!isOpen)}
+                    >
+                        <Title>
+                            {showVerificationStyles ? (
+                                <StyledImgIcon src={ShieldCheck} addLineHeight />
+                            ) : (
+                                <StyledBookIcon color={theme.colors.iconSuccess} $addLineHeight />
+                            )}
+                            {showVerificationStyles
+                                ? t('sidebar.formInfo.verifiedTitle')
+                                : t('sidebar.formInfo.documentedTitle')}
+                        </Title>
+                        {isUserAssigned && <StyledArrow $isOpen={isOpen} />}
+                    </TitleWrapper>
+                    {isUserAssigned && isOpen && (
+                        <>
+                            <VerificationAuditStamp formUrn={formUrn} />
+                            {isUserAssigned && <OptionalPromptsRemaining numRemaining={numOptionalPromptsRemaining} />}
+                            {!!openFormModal && (
+                                <StyledButtonWrapper>
+                                    <Button variant="outline" onClick={openFormModal}>
+                                        {t('sidebar.formInfo.viewAndEditButton')}
+                                    </Button>
+                                </StyledButtonWrapper>
+                            )}
+                        </>
+                    )}
+                </Content>
+            </FlexWrapper>
+        </CTAWrapper>
+    );
+}

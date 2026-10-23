@@ -1,0 +1,303 @@
+import { ArrowsClockwise } from '@phosphor-icons/react/dist/csr/ArrowsClockwise';
+import { FileText } from '@phosphor-icons/react/dist/csr/FileText';
+import { ListBullets } from '@phosphor-icons/react/dist/csr/ListBullets';
+import { Share } from '@phosphor-icons/react/dist/csr/Share';
+import { ShareNetwork } from '@phosphor-icons/react/dist/csr/ShareNetwork';
+import { TreeStructure } from '@phosphor-icons/react/dist/csr/TreeStructure';
+import { WarningCircle } from '@phosphor-icons/react/dist/csr/WarningCircle';
+import i18next from 'i18next';
+import * as React from 'react';
+
+import { GenericEntityProperties } from '@app/entity/shared/types';
+import { Entity, EntityCapabilityType, IconStyleType, PreviewType } from '@app/entityV2/Entity';
+import { Preview } from '@app/entityV2/dataFlow/preview/Preview';
+import { EntityMenuItems } from '@app/entityV2/shared/EntityDropdown/EntityMenuActions';
+import { TYPE_ICON_CLASS_NAME } from '@app/entityV2/shared/components/subtypes';
+import { EntityTabPath } from '@app/entityV2/shared/constants';
+import { getDataForEntityType } from '@app/entityV2/shared/containers/profile/entityData';
+import { lazyProfileComponent } from '@app/entityV2/shared/lazyEntityProfile';
+import {
+    DAGTab,
+    DataProductSection,
+    DocumentationTab,
+    EntityProfile,
+    IncidentTab,
+    PropertiesTab,
+    RunsTab,
+    SidebarAboutSection,
+    SidebarApplicationSection,
+    SidebarDomainSection,
+    SidebarEntityHeader,
+    SidebarGlossaryTermsSection,
+    SidebarNotesSection,
+    SidebarOwnerSection,
+    SidebarStructuredProperties,
+    SidebarTagsSection,
+    StatusSection,
+} from '@app/entityV2/shared/profileChunks';
+import { isOutputPort } from '@app/entityV2/shared/utils';
+import { capitalizeFirstLetterOnly } from '@app/sharedV2/textUtil';
+
+import { GetDataFlowQuery, useGetDataFlowQuery, useUpdateDataFlowMutation } from '@graphql/dataFlow.generated';
+import { DataFlow, EntityType, SearchResult } from '@types';
+
+const DataFlowJobsTab = lazyProfileComponent('DataFlowJobsTab', () =>
+    import('@app/entityV2/shared/tabs/Entity/DataFlowJobsTab').then((module) => ({
+        default: module.DataFlowJobsTab,
+    })),
+);
+
+const headerDropdownItems = new Set([
+    EntityMenuItems.SHARE,
+    EntityMenuItems.UPDATE_DEPRECATION,
+    EntityMenuItems.ANNOUNCE,
+]);
+
+/**
+ * Definition of the DataHub DataFlow entity.
+ */
+export class DataFlowEntity implements Entity<DataFlow> {
+    type: EntityType = EntityType.DataFlow;
+
+    icon = (fontSize?: number, styleType?: IconStyleType, color?: string) => {
+        return (
+            <ShareNetwork
+                className={TYPE_ICON_CLASS_NAME}
+                size={fontSize || 14}
+                color={color || 'currentColor'}
+                weight={styleType === IconStyleType.HIGHLIGHT ? 'fill' : 'regular'}
+            />
+        );
+    };
+
+    isSearchEnabled = () => true;
+
+    isBrowseEnabled = () => true;
+
+    isLineageEnabled = () => false;
+
+    getAutoCompleteFieldName = () => 'name';
+
+    getGraphName = () => 'dataFlow';
+
+    getPathName = () => 'pipelines';
+
+    getEntityName = () => i18next.t('entity.types:dataFlow.name');
+
+    getCollectionName = () => i18next.t('entity.types:dataFlow.namePlural');
+
+    useEntityQuery = useGetDataFlowQuery;
+
+    renderProfile = (urn: string) => (
+        <EntityProfile
+            urn={urn}
+            entityType={EntityType.DataFlow}
+            useEntityQuery={useGetDataFlowQuery}
+            useUpdateQuery={useUpdateDataFlowMutation}
+            getOverrideProperties={this.getOverridePropertiesFromEntity}
+            headerDropdownItems={headerDropdownItems}
+            tabs={[
+                {
+                    name: i18next.t('entity.types:tab.documentation'),
+                    path: EntityTabPath.DOCUMENTATION,
+                    component: DocumentationTab,
+                    icon: FileText,
+                },
+                {
+                    name: i18next.t('entity.types:tab.lineage'),
+                    path: EntityTabPath.LINEAGE,
+                    component: DAGTab,
+                    icon: TreeStructure,
+                    supportsFullsize: true,
+                },
+                {
+                    name: i18next.t('entity.types:dataJob.namePlural'),
+                    path: EntityTabPath.TASKS,
+                    component: DataFlowJobsTab,
+                    icon: Share,
+                    properties: {
+                        urn,
+                    },
+                },
+                {
+                    name: i18next.t('entity.types:tab.incidents'),
+                    path: EntityTabPath.INCIDENTS,
+                    icon: WarningCircle,
+                    component: IncidentTab,
+                    getCount: (_, dataFlow) => {
+                        return dataFlow?.dataFlow?.activeIncidents?.total;
+                    },
+                },
+                {
+                    name: i18next.t('entity.types:tab.properties'),
+                    path: EntityTabPath.PROPERTIES,
+                    component: PropertiesTab,
+                    icon: ListBullets,
+                },
+                {
+                    name: i18next.t('entity.types:tab.runs'),
+                    path: EntityTabPath.RUNS,
+                    component: RunsTab,
+                    icon: ArrowsClockwise,
+                    display: {
+                        visible: (_, _1) => true,
+                        enabled: (_, dataFlow: GetDataFlowQuery) => (dataFlow?.dataFlow?.runs?.total || 0) !== 0,
+                    },
+                },
+            ]}
+            sidebarSections={this.getSidebarSections()}
+            sidebarTabs={this.getSidebarTabs()}
+        />
+    );
+
+    getSidebarSections = () => [
+        {
+            component: SidebarEntityHeader,
+        },
+        {
+            component: SidebarAboutSection,
+        },
+        {
+            component: SidebarNotesSection,
+        },
+        {
+            component: SidebarOwnerSection,
+        },
+        {
+            component: SidebarDomainSection,
+        },
+        {
+            component: SidebarApplicationSection,
+        },
+        {
+            component: DataProductSection,
+        },
+        {
+            component: SidebarGlossaryTermsSection,
+        },
+        {
+            component: SidebarTagsSection,
+        },
+        {
+            component: SidebarStructuredProperties,
+        },
+        {
+            component: StatusSection,
+        },
+    ];
+
+    getSidebarTabs = () => [
+        {
+            name: i18next.t('entity.types:tab.properties'),
+            component: PropertiesTab,
+            description: i18next.t('entity.types:sidebar.propertiesDescription'),
+            icon: ListBullets,
+        },
+    ];
+
+    getOverridePropertiesFromEntity = (dataFlow?: DataFlow | null): GenericEntityProperties => {
+        // TODO: Get rid of this once we have correctly formed platform coming back.
+        const name = dataFlow?.properties?.name;
+        const externalUrl = dataFlow?.properties?.externalUrl;
+        return {
+            name,
+            externalUrl,
+        };
+    };
+
+    renderPreview = (previewType: PreviewType, data: DataFlow) => {
+        const genericProperties = this.getGenericEntityProperties(data);
+        return (
+            <Preview
+                urn={data.urn}
+                data={genericProperties}
+                name={data.properties?.name || ''}
+                description={data.editableProperties?.description || data.properties?.description}
+                platformName={
+                    data?.platform?.properties?.displayName || capitalizeFirstLetterOnly(data?.platform?.name)
+                }
+                platformLogo={data?.platform?.properties?.logoUrl || ''}
+                owners={data.ownership?.owners}
+                globalTags={data.globalTags}
+                externalUrl={data.properties?.externalUrl}
+                headerDropdownItems={headerDropdownItems}
+                previewType={previewType}
+                subTypes={genericProperties?.subTypes}
+            />
+        );
+    };
+
+    renderSearch = (result: SearchResult) => {
+        const data = result.entity as DataFlow;
+        const genericProperties = this.getGenericEntityProperties(data);
+        return (
+            <Preview
+                urn={data.urn}
+                data={genericProperties}
+                name={data.properties?.name || ''}
+                platformInstanceId={data.dataPlatformInstance?.instanceId}
+                description={data.editableProperties?.description || data.properties?.description || ''}
+                platformName={
+                    data?.platform?.properties?.displayName || capitalizeFirstLetterOnly(data?.platform?.name)
+                }
+                platformLogo={data?.platform?.properties?.logoUrl || ''}
+                owners={data.ownership?.owners}
+                globalTags={data.globalTags}
+                insights={result.insights}
+                externalUrl={data.properties?.externalUrl}
+                jobCount={(data as any).childJobs?.total}
+                deprecation={data.deprecation}
+                degree={(result as any).degree}
+                paths={(result as any).paths}
+                isOutputPort={isOutputPort(result)}
+                headerDropdownItems={headerDropdownItems}
+                parentContainers={data.parentContainers}
+                subTypes={genericProperties?.subTypes}
+                previewType={PreviewType.SEARCH}
+            />
+        );
+    };
+
+    getLineageVizConfig = (entity: DataFlow) => {
+        return {
+            urn: entity?.urn,
+            type: EntityType.DataFlow,
+            name: this.displayName(entity),
+            icon: entity?.platform?.properties?.logoUrl || undefined,
+        };
+    };
+
+    displayName = (data: DataFlow) => {
+        return data.properties?.name || data.urn;
+    };
+
+    getGenericEntityProperties = (data: DataFlow) => {
+        return getDataForEntityType({
+            data,
+            entityType: this.type,
+            getOverrideProperties: this.getOverridePropertiesFromEntity,
+        });
+    };
+
+    supportedCapabilities = () => {
+        return new Set([
+            EntityCapabilityType.OWNERS,
+            EntityCapabilityType.GLOSSARY_TERMS,
+            EntityCapabilityType.TAGS,
+            EntityCapabilityType.DOMAINS,
+            EntityCapabilityType.DEPRECATION,
+            EntityCapabilityType.SOFT_DELETE,
+            EntityCapabilityType.DATA_PRODUCTS,
+            EntityCapabilityType.TEST,
+            EntityCapabilityType.LINEAGE,
+            EntityCapabilityType.HEALTH,
+            EntityCapabilityType.APPLICATIONS,
+            EntityCapabilityType.RELATED_DOCUMENTS,
+            EntityCapabilityType.FORMS,
+        ]);
+    };
+
+    getPlatformProperties = (data: DataFlow) => {
+        return data?.platform;
+    };
+}

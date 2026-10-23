@@ -1,0 +1,91 @@
+import { Image } from '@phosphor-icons/react/dist/csr/Image';
+import { useCommands } from '@remirror/react';
+import { Form, Input } from 'antd';
+import React, { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useTheme } from 'styled-components';
+
+import { CommandButton } from '@components/components/Editor/toolbar/CommandButton';
+import { Modal } from '@components/components/Modal';
+import { Text } from '@components/components/Text';
+
+// Sample URL shown as input placeholder — illustrative, not user-facing copy.
+const EXAMPLE_IMAGE_URL = 'http://www.example.com/image.jpg';
+
+export const AddImageButton = () => {
+    const { t } = useTranslation('alchemy');
+    const { t: tc } = useTranslation('common.actions');
+    const [isModalVisible, setModalVisible] = useState(false);
+    const [form] = Form.useForm();
+    const { insertImage } = useCommands();
+    const styledTheme = useTheme();
+    const iconColor = styledTheme.colors.icon;
+
+    const handleButtonClick = () => {
+        setModalVisible(true);
+    };
+
+    const handleOk = () => {
+        form.validateFields()
+            .then((values) => {
+                form.resetFields();
+                setModalVisible(false);
+                insertImage(values);
+            })
+            .catch((info) => {
+                console.log('Validate Failed:', info);
+            });
+    };
+
+    const handleCancel = () => {
+        setModalVisible(false);
+    };
+
+    return (
+        <>
+            <CommandButton
+                active={false}
+                icon={<Image size={20} color={iconColor} />}
+                commandName="insertImage"
+                onClick={handleButtonClick}
+            />
+            <Modal
+                title={t('editor.addImage.title')}
+                open={isModalVisible}
+                onCancel={handleCancel}
+                buttons={[
+                    {
+                        text: tc('save'),
+                        variant: 'filled',
+                        onClick: handleOk,
+                    },
+                ]}
+                zIndex={1200}
+            >
+                <Form form={form} layout="vertical" colon={false} requiredMark={false}>
+                    <Form.Item
+                        name="src"
+                        label={
+                            <Text type="span" weight="bold">
+                                {t('editor.addImage.urlLabel')}
+                            </Text>
+                        }
+                        rules={[{ required: true }]}
+                    >
+                        <Input placeholder={EXAMPLE_IMAGE_URL} autoFocus />
+                    </Form.Item>
+                    <Form.Item
+                        name="alt"
+                        label={
+                            <Text type="span" weight="bold">
+                                {t('editor.addImage.altLabel')}
+                            </Text>
+                        }
+                    >
+                        <Input />
+                    </Form.Item>
+                </Form>
+            </Modal>
+        </>
+    );
+};

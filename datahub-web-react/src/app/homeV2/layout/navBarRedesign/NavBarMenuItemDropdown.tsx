@@ -1,0 +1,113 @@
+import { Dropdown } from '@components';
+import React from 'react';
+import { useHistory } from 'react-router';
+import styled from 'styled-components';
+
+import NavBarMenuItem from '@app/homeV2/layout/navBarRedesign/NavBarMenuItem';
+import { NavBarMenuDropdownItem } from '@app/homeV2/layout/navBarRedesign/types';
+import { Text } from '@src/alchemy-components';
+import analytics, { EventType } from '@src/app/analytics';
+
+const StyledDropdownContentWrapper = styled.div`
+    background-color: ${(props) => props.theme.colors.bg};
+    border-radius: ${(props) => props.theme.styles['border-radius-navbar-redesign']};
+    box-shadow: ${(props) => props.theme.colors.shadowMd};
+    padding: 8px;
+`;
+
+const StyledDropDownOption = styled.div<{ $disabled?: boolean }>`
+    padding: 8px;
+    border-radius: ${(props) => props.theme.styles['border-radius-navbar-redesign']};
+    ${(props) =>
+        props.$disabled
+            ? `color: ${props.theme.colors.textTertiary};`
+            : `
+                color: ${props.theme.colors.text};
+                cursor: pointer;
+                &:hover {
+                    background: ${props.theme.colors.bgHover};
+                }
+    `}
+`;
+
+const DescriptionText = styled.span`
+    display: block;
+    font-size: 12px;
+    color: ${(props) => props.theme.colors.textSecondary};
+`;
+
+type Props = {
+    item: NavBarMenuDropdownItem;
+    isCollapsed?: boolean;
+    isSelected?: boolean;
+} & React.HTMLAttributes<HTMLDivElement>;
+
+export default function NavBarMenuItemDropdown({ item, isCollapsed, isSelected, ...props }: Props) {
+    const history = useHistory();
+
+    const dropdownItems = item.items?.filter((subItem) => !subItem.isHidden);
+    const shouldScroll = item.key === 'mfe-dropdown' && dropdownItems && dropdownItems.length > 5; // 5 can be changed depending on requirement
+
+    const onItemClick = (key) => {
+        const clickedItem = item.items?.filter((dropdownItem) => dropdownItem.key === key)?.[0];
+        if (!clickedItem) return null;
+
+        if (clickedItem.disabled) return null;
+
+        analytics.event({ type: EventType.NavBarItemClick, label: item.title, subLabel: clickedItem.title });
+
+        if (item.key === 'mfe-dropdown' && clickedItem.link) {
+            return history.push(clickedItem.link);
+        }
+
+        if (clickedItem.onClick) return clickedItem.onClick();
+
+        if (clickedItem.link && clickedItem.isExternalLink)
+            return window.open(clickedItem.link, '_blank', 'noopener,noreferrer');
+        if (clickedItem.link && !clickedItem.isExternalLink) return history.push(clickedItem.link);
+
+        return null;
+    };
+
+    return (
+        <Dropdown
+            trigger={['click']}
+            dropdownRender={() => {
+                return (
+                    <StyledDropdownContentWrapper style={shouldScroll ? { maxHeight: 200, overflowY: 'auto' } : {}}>
+                        {dropdownItems?.map((dropdownItem) => {
+                            return (
+                                <StyledDropDownOption
+                                    key={dropdownItem.key}
+                                    $disabled={dropdownItem.disabled}
+                                    role="menuitem"
+                                    aria-label={dropdownItem.title}
+                                    aria-disabled={dropdownItem.disabled}
+                                    onClick={() => onItemClick(dropdownItem.key)}
+                                >
+                                    {item.key === 'mfe-dropdown' ? (
+                                        // Flex container for icon and title only for key "mfe"
+                                        <div style={{ display: 'flex', alignItems: 'center' }}>
+                                            {dropdownItem.icon && (
+                                                <span style={{ marginRight: 8, display: 'flex', alignItems: 'center' }}>
+                                                    {dropdownItem.icon}
+                                                </span>
+                                            )}
+                                            <Text>{dropdownItem.title}</Text>
+                                        </div>
+                                    ) : (
+                                        // Default rendering for other items
+                                        <Text>{dropdownItem.title}</Text>
+                                    )}
+                                    <DescriptionText>{dropdownItem.description}</DescriptionText>
+                                </StyledDropDownOption>
+                            );
+                        })}
+                    </StyledDropdownContentWrapper>
+                );
+            }}
+        >
+            <NavBarMenuItem item={item} isCollapsed={isCollapsed} isSelected={isSelected} {...props} />
+        </Dropdown>
+    );
+}

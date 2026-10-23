@@ -1,0 +1,1441 @@
+import ipaddress
+import logging
+import pathlib
+import socket
+import tempfile
+from collections import OrderedDict, defaultdict
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Dict, Iterable, List, Optional, Set, Tuple, Union
+from urllib.parse import urlparse
+
+import lkml
+import lkml.simple
+from looker_sdk.error import SDKError
+
+from datahub.configuration.common import AllowDenyPattern
+from datahub.configuration.git import GitInfo
+from datahub.emitter.mce_builder import make_schema_field_urn
+from datahub.emitter.mcp_builder import mcps_from_mce
+from datahub.ingestion.api.common import PipelineContext
+from datahub.ingestion.api.decorators import (
+    SupportStatus,
+    capability,
+    config_class,
+    platform_name,
+    support_status,
+)
+from datahub.ingestion.api.source import SourceCapability
+from datahub.ingestion.api.workunit import MetadataWorkUnit
+from datahub.ingestion.source.common.subtypes import (
+    BIContainerSubTypes,
+    DatasetSubTypes,
+    SourceCapabilityModifier,
+)
+from datahub.ingestion.source.git.git_import import GitClone
+from datahub.ingestion.source.looker.looker_common import (
+    CORPUSER_DATAHUB,
+    LookerExplore,
+    LookerUtil,
+    LookerViewId,
+    ViewField,
+    ViewFieldType,
+    ViewFieldValue,
+    deduplicate_fields,
+    gen_project_key,
+)
+from datahub.ingestion.source.looker.looker_connection import (
+    get_connection_def_based_on_connection_string,
+)
+from datahub.ingestion.source.looker.looker_dataclasses import LookerConstant
+from datahub.ingestion.source.looker.looker_lib_wrapper import LookerAPI
+from datahub.ingestion.source.looker.looker_template_language import (
+    load_and_preprocess_file,
+)
+from datahub.ingestion.source.looker.looker_view_id_cache import (
+    LookerModel,
+    LookerViewFileLoader,
+    LookerViewIdCache,
+)
+from datahub.ingestion.source.looker.lookml_concept_context import (
+    LookerFieldContext,
+    LookerViewContext,
+)
+from datahub.ingestion.source.looker.lookml_config import (
+    BASE_PROJECT_NAME,
+    MODEL_FILE_EXTENSION,
+    VIEW_FILE_EXTENSION,
+    LookerConnectionDefinition,
+    LookMLSourceConfig,
+    LookMLSourceReport,
+)
+from datahub.ingestion.source.looker.lookml_refinement import LookerRefinementResolver
+from datahub.ingestion.source.looker.view_upstream import (
+    AbstractViewUpstream,
+    create_view_upstream,
+)
+from datahub.ingestion.source.state.stateful_ingestion_base import (
+    StatefulIngestionSourceBase,
+)
+from datahub.metadata.com.linkedin.pegasus2avro.common import Status
+from datahub.metadata.com.linkedin.pegasus2avro.dataset import (
+    DatasetLineageTypeClass,
+    FineGrainedLineageDownstreamType,
+    UpstreamClass,
+    UpstreamLineage,
+    ViewProperties,
+)
+from datahub.metadata.schema_classes import (
+    AuditStampClass,
+    DatasetPropertiesClass,
+    FineGrainedLineageClass,
+    FineGrainedLineageUpstreamTypeClass,
+)
+from datahub.sdk.container import Container
+from datahub.sdk.dataset import Dataset
+from datahub.sdk.entity import Entity
+from datahub.sql_parsing.sqlglot_lineage import (
+    ColumnRef,
+    column_refs_to_schema_field_urns,
+)
+
+VIEW_LANGUAGE_LOOKML: str = "lookml"
+VIEW_LANGUAGE_SQL: str = "sql"
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class LookerView:
+    id: LookerViewId
+    absolute_file_path: str
+    connection: LookerConnectionDefinition
+    upstream_dataset_urns: List[str]
+    fields: List[ViewField]
+    raw_file_content: str
+    view_details: Optional[ViewProperties] = None
+
+    @classmethod
+    def determine_view_file_path(
+        cls, base_folder_path: str, absolute_file_path: str
+    ) -> str:
+        splits: List[str] = absolute_file_path.split(base_folder_path, 1)
+        if len(splits) != 2:
+            logger.debug(
+                f"base_folder_path({base_folder_path}) and absolute_file_path({absolute_file_path}) not matching"
+            )
+            return ViewFieldValue.NOT_AVAILABLE.value
+
+        file_path: str = splits[1]
+        logger.debug(f"file_path={file_path}")
+
+        return file_path.strip(
+            "/"
+        )  # strip / from path to make it equivalent to source_file attribute of LookerModelExplore API
+
+    @classmethod
+    def from_looker_dict(
+        cls,
+        project_name: str,
+        model_name: str,
+        view_context: LookerViewContext,
+        looker_view_id_cache: LookerViewIdCache,
+        reporter: LookMLSourceReport,
+        max_file_snippet_length: int,
+        config: LookMLSourceConfig,
+        ctx: PipelineContext,
+        extract_col_level_lineage: bool = False,
+        populate_sql_logic_in_descriptions: bool = False,
+        looker_client: Optional[LookerAPI] = None,
+        view_to_explore_map: Optional[Dict[str, str]] = None,
+    ) -> Optional["LookerView"]:
+        view_name = view_context.name()
+
+        logger.debug(f"Handling view {view_name} in model {model_name}")
+
+        looker_view_id: LookerViewId = LookerViewId(
+            project_name=project_name,
+            model_name=model_name,
+            view_name=view_name,
+            file_path=view_context.view_file_name(),
+        )
+
+        view_upstream: AbstractViewUpstream = create_view_upstream(
+            view_context=view_context,
+            looker_view_id_cache=looker_view_id_cache,
+            config=config,
+            ctx=ctx,
+            reporter=reporter,
+            looker_client=looker_client,
+            view_to_explore_map=view_to_explore_map,
+        )
+
+        field_type_vs_raw_fields = OrderedDict(
+            {
+                ViewFieldType.DIMENSION: view_context.dimensions(),
+                ViewFieldType.DIMENSION_GROUP: view_context.dimension_groups(),
+                ViewFieldType.MEASURE: view_context.measures(),
+            }
+        )  # in order to maintain order in golden file
+
+        view_fields: List[ViewField] = []
+
+        for field_type, fields in field_type_vs_raw_fields.items():
+            for field in fields:
+                upstream_column_ref: List[ColumnRef] = []
+                if extract_col_level_lineage:
+                    upstream_column_ref = view_upstream.get_upstream_column_ref(
+                        field_context=LookerFieldContext(raw_field=field)
+                    )
+
+                view_fields.append(
+                    ViewField.view_fields_from_dict(
+                        field_dict=field,
+                        upstream_column_ref=upstream_column_ref,
+                        type_cls=field_type,
+                        populate_sql_logic_in_descriptions=populate_sql_logic_in_descriptions,
+                    )
+                )
+
+        # special case where view is defined as derived sql, however fields are not defined
+        if (
+            len(view_fields) == 0
+            and view_context.is_sql_based_derived_view_without_fields_case()
+        ):
+            view_fields = view_upstream.create_fields()
+
+        view_fields = deduplicate_fields(view_fields)
+
+        # Prep "default" values for the view, which will be overridden by the logic below.
+        view_logic = view_context.view_file.raw_file_content[:max_file_snippet_length]
+
+        if view_context.is_sql_based_derived_case():
+            view_logic = view_context.sql()
+            view_details = ViewProperties(
+                materialized=False,
+                viewLogic=view_logic,
+                viewLanguage=VIEW_LANGUAGE_SQL,
+            )
+        elif view_context.is_native_derived_case():
+            # We want this to render the full lkml block
+            # e.g. explore_source: source_name { ... }
+            # As such, we use the full derived_table instead of the explore_source.
+            view_logic = str(lkml.dump(view_context.derived_table()))[
+                :max_file_snippet_length
+            ]
+            view_lang = VIEW_LANGUAGE_LOOKML
+
+            materialized = view_context.is_materialized_derived_view()
+
+            view_details = ViewProperties(
+                materialized=materialized, viewLogic=view_logic, viewLanguage=view_lang
+            )
+        else:
+            view_details = ViewProperties(
+                materialized=False,
+                viewLogic=view_logic,
+                viewLanguage=VIEW_LANGUAGE_LOOKML,
+            )
+
+        return LookerView(
+            id=looker_view_id,
+            absolute_file_path=view_context.view_file.absolute_file_path,
+            connection=view_context.view_connection,
+            upstream_dataset_urns=view_upstream.get_upstream_dataset_urn(),
+            fields=view_fields,
+            raw_file_content=view_context.view_file.raw_file_content,
+            view_details=view_details,
+        )
+
+
+@dataclass
+class LookerRemoteDependency:
+    name: str
+    url: str
+    ref: Optional[str]
+
+
+@dataclass
+class LookerManifest:
+    # This must be set if the manifest has local_dependency entries.
+    # See https://cloud.google.com/looker/docs/reference/param-manifest-project-name
+    project_name: Optional[str]
+    constants: Optional[List[Dict[str, str]]]
+
+    local_dependencies: List[str]
+    remote_dependencies: List[LookerRemoteDependency]
+
+
+# git:// is omitted: it is unauthenticated and not a typical Looker remote_dependency URL.
+_ALLOWED_GIT_SCHEMES = frozenset({"https", "ssh"})
+# A parsed clone host is only ever ASCII letters, digits, and .:-_ (hostnames,
+# IPv4, bracket-stripped IPv6). Reject anything else -- percent-encoding, IPv6
+# zone ids, backslashes, non-ASCII/IDN, control bytes -- because git/libcurl may
+# decode or IDNA-normalize it into a different, possibly blocked host than the
+# validator sees. Reject-on-ambiguity beats trying to match every decode.
+_SAFE_HOST_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789.:-_")
+_BLOCKED_GIT_HOSTNAMES = frozenset(
+    {
+        "localhost.localdomain",
+        "metadata",
+        "metadata.google.internal",
+        "metadata.goog",
+    }
+)
+# Only metadata IPs the generic _is_blocked_ip checks miss. Loopback, unspecified,
+# and link-local (incl. 169.254.169.254 / 169.254.170.2) are already covered there.
+_BLOCKED_GIT_IPS = frozenset(
+    {
+        ipaddress.ip_address("fd00:ec2::254"),  # AWS IMDS over IPv6 (unique-local)
+        ipaddress.ip_address(
+            "100.100.100.200"
+        ),  # AliCloud metadata (globally routable)
+        ipaddress.ip_address("192.0.0.192"),  # Oracle Cloud IMDS
+    }
+)
+
+
+@dataclass(frozen=True)
+class RemoteDependencyUrlCheck:
+    allowed: bool
+    reason: Optional[str] = None
+    hostname: Optional[str] = None
+
+
+def _normalize_hostname(hostname: str) -> str:
+    """Normalize a hostname for denylist/allowlist comparison."""
+    h = hostname.strip().lower()
+    if h.endswith("."):
+        h = h[:-1]  # trailing FQDN root dot
+    return h
+
+
+def _parse_ip(
+    hostname: str,
+) -> Optional[Union[ipaddress.IPv4Address, ipaddress.IPv6Address]]:
+    """Parse a hostname as an IP literal. Handles alternative IPv4 encodings
+    (decimal/hex/octal) and IPv4-mapped IPv6, which curl/git accept but
+    ``ipaddress.ip_address`` does not."""
+    normalized = _normalize_hostname(hostname)
+    try:
+        return ipaddress.ip_address(normalized)
+    except ValueError:
+        pass
+    if normalized.startswith("::ffff:"):
+        return _parse_ipv4_loose(normalized[len("::ffff:") :])
+    return _parse_ipv4_loose(normalized)
+
+
+def _parse_ipv4_loose(s: str) -> Optional[ipaddress.IPv4Address]:
+    """Parse inet_aton-style IPv4 forms libcurl/git accept but
+    ``ipaddress.ip_address`` rejects: per-octet octal/hex (``0177.0.0.1``),
+    single-integer decimal/octal/hex (``2130706433``), and 2-/3-part short
+    forms (``127.1``, ``127.0.1``)."""
+    try:
+        return ipaddress.IPv4Address(socket.inet_aton(s))
+    except (OSError, ValueError):
+        # ValueError covers AddressValueError, an embedded null, and a lone
+        # surrogate (UnicodeError); a malformed host must not abort the run.
+        return None
+
+
+def _scp_userhost(url: str) -> Optional[str]:
+    """The ``[user@]host`` part of an scp URL: the text before the first colon
+    outside an IPv6 ``[ ]`` group. None if the brackets are unbalanced or there
+    is no such colon."""
+    depth = 0
+    for i, ch in enumerate(url):
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif ch == ":" and depth == 0:
+            return url[:i]
+    return None
+
+
+def _scp_host(url: str) -> Optional[str]:
+    """Host of an scp-style ``[user@]host:path`` Git URL. The host is the text
+    after the last ``@``, or a single bracketed ``[ipv6]`` group that is the
+    whole host token (``git@[::1]:p`` -> ``::1``). git and ssh resolve
+    multi-bracket authorities such as ``[a]@[b]`` inconsistently, so anything
+    that is not one of those two clean shapes is rejected rather than guessed
+    at, since a real remote_dependency URL is never that shape."""
+    if "@" not in url or ":" not in url:
+        return None
+    userhost = _scp_userhost(url)
+    if userhost is None:
+        return None
+    if "[" in userhost or "]" in userhost:
+        # A legitimate bracketed host is a single [ ] pair that IS the whole
+        # host token, optionally preceded by 'user@'. Reject every other bracket
+        # shape instead of guessing which of several hosts git/ssh will use.
+        if (
+            userhost.count("[") != 1
+            or userhost.count("]") != 1
+            or not userhost.endswith("]")
+        ):
+            return None
+        open_i = userhost.index("[")
+        if userhost[:open_i] and not userhost[:open_i].endswith("@"):
+            return None
+        host = userhost[open_i + 1 : -1]
+    else:
+        host = userhost.rsplit("@", 1)[-1]
+    if not host or any(c in host for c in "[]@/"):
+        return None
+    return host
+
+
+def _hostname_from_git_url(url: str) -> Optional[str]:
+    """Extract the hostname from an HTTPS, SSH, or scp-style Git URL."""
+    stripped = url.strip()
+    if not stripped:
+        return None
+
+    if "://" not in stripped:
+        host = _scp_host(stripped)
+        return _normalize_hostname(host) if host else None
+
+    try:
+        parsed = urlparse(stripped)
+    except ValueError:
+        return None
+    if parsed.hostname:
+        return _normalize_hostname(parsed.hostname)
+    return None
+
+
+def _is_blocked_ip(ip: Union[ipaddress.IPv4Address, ipaddress.IPv6Address]) -> bool:
+    # Unwrap IPv4-mapped IPv6 so literal blocked IPs (e.g. AliCloud 100.100.100.200)
+    # are caught; is_loopback/is_link_local don't flag their mapped forms.
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if ip in _BLOCKED_GIT_IPS:
+        return True
+    return bool(
+        ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast
+    )
+
+
+def _is_blocked_git_host(hostname: str) -> bool:
+    normalized = _normalize_hostname(hostname)
+    # RFC 6761 6.3 reserves the entire .localhost TLD for loopback, so block it by
+    # name rather than trusting our resolver to agree with git's on *.localhost.
+    if normalized == "localhost" or normalized.endswith(".localhost"):
+        return True
+    if normalized in _BLOCKED_GIT_HOSTNAMES:
+        return True
+    ip = _parse_ip(normalized)
+    if ip is not None:
+        return _is_blocked_ip(ip)
+    return False
+
+
+def _resolves_to_blocked_ip(hostname: str) -> bool:
+    """Reject a DNS name that resolves to a blocked IP right now.
+
+    This is not DNS-rebinding protection: git re-resolves the host at clone time,
+    so a host that returns a public IP here and a blocked IP at clone is still
+    cloned. Closing that needs IP pinning or executor egress limits, not a
+    pre-flight check.
+    """
+    if _parse_ip(hostname) is not None:
+        return False  # IP literal, handled by _is_blocked_git_host
+    try:
+        infos = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    except (OSError, ValueError) as e:
+        # Fail open: an unresolvable host cannot be cloned anyway, and split-horizon
+        # DNS on the executor is legitimate. getaddrinfo IDNA-encodes a str host, so a
+        # bad label (empty or >63 chars) raises UnicodeError (a ValueError, not an
+        # OSError); catch it here or it aborts the run. Log so a skip stays visible.
+        logger.debug(f"DNS check skipped for {hostname}: {e}")
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if _is_blocked_ip(ip):
+            return True
+    return False
+
+
+def check_remote_dependency_url(
+    url: str,
+    allowed_pattern: Optional[AllowDenyPattern] = None,
+) -> RemoteDependencyUrlCheck:
+    """Validate a manifest.lkml remote_dependency URL before git clone."""
+    if not isinstance(url, str):
+        # lkml parses `url: { ... }` / `url: [ ... ]` to a dict/list and
+        # LookerRemoteDependency does not enforce str, so guard before .strip().
+        return RemoteDependencyUrlCheck(
+            allowed=False, reason="remote_dependency URL is not a string"
+        )
+    stripped = url.strip()
+    if not stripped:
+        return RemoteDependencyUrlCheck(
+            allowed=False, reason="remote_dependency URL is empty"
+        )
+
+    scheme: Optional[str] = None
+    if "://" in stripped:
+        try:
+            parsed = urlparse(stripped)
+        except ValueError as exc:
+            return RemoteDependencyUrlCheck(
+                allowed=False, reason=f"invalid Git URL: {exc}"
+            )
+        if "\\" in parsed.netloc:
+            # A backslash in the authority is parsed differently by browsers,
+            # libcurl, and urlparse; reject rather than guess which host wins.
+            return RemoteDependencyUrlCheck(
+                allowed=False, reason="backslash in URL authority is not allowed"
+            )
+        scheme = (parsed.scheme or "").lower()
+        if scheme not in _ALLOWED_GIT_SCHEMES:
+            return RemoteDependencyUrlCheck(
+                allowed=False,
+                reason=(
+                    f"scheme '{scheme}' is not allowed; "
+                    "use https:// or an SSH Git URL (git@host:path or ssh://)"
+                ),
+            )
+    elif not (stripped.startswith("git@") or ("@" in stripped and ":" in stripped)):
+        return RemoteDependencyUrlCheck(
+            allowed=False,
+            reason=(
+                "URL must be https://, ssh://, or an SCP-style Git URL such as "
+                "git@host:org/repo.git"
+            ),
+        )
+
+    hostname = _hostname_from_git_url(stripped)
+    if not hostname:
+        return RemoteDependencyUrlCheck(
+            allowed=False, reason="could not parse a hostname from the Git URL"
+        )
+
+    if not all(c in _SAFE_HOST_CHARS for c in hostname):
+        return RemoteDependencyUrlCheck(
+            allowed=False,
+            reason=(
+                f"hostname '{hostname}' has characters not allowed in a Git host "
+                "(percent-encoding, IPv6 zone id, or non-ASCII)"
+            ),
+            hostname=hostname,
+        )
+
+    if _is_blocked_git_host(hostname):
+        return RemoteDependencyUrlCheck(
+            allowed=False,
+            reason=f"hostname '{hostname}' is not allowed (loopback, link-local, or metadata)",
+            hostname=hostname,
+        )
+
+    if allowed_pattern is not None and not allowed_pattern.allowed(hostname):
+        return RemoteDependencyUrlCheck(
+            allowed=False,
+            reason=(
+                f"hostname '{hostname}' does not match remote_dependency_domain_pattern"
+            ),
+            hostname=hostname,
+        )
+
+    if _resolves_to_blocked_ip(hostname):
+        return RemoteDependencyUrlCheck(
+            allowed=False,
+            reason=(
+                f"hostname '{hostname}' resolves to a blocked IP "
+                "(loopback, link-local, or metadata)"
+            ),
+            hostname=hostname,
+        )
+
+    return RemoteDependencyUrlCheck(allowed=True, hostname=hostname)
+
+
+@platform_name("Looker")
+@config_class(LookMLSourceConfig)
+@support_status(SupportStatus.GA)
+@capability(
+    SourceCapability.PLATFORM_INSTANCE,
+    "Use the `platform_instance` and `connection_to_platform_map` fields",
+)
+@capability(SourceCapability.LINEAGE_COARSE, "Supported by default")
+@capability(
+    SourceCapability.LINEAGE_FINE,
+    "Enabled by default, configured using `extract_column_level_lineage`",
+)
+@capability(
+    SourceCapability.CONTAINERS,
+    "Enabled by default",
+    subtype_modifier=[
+        SourceCapabilityModifier.LOOKML_PROJECT,
+    ],
+)
+class LookMLSource(StatefulIngestionSourceBase):
+    """
+    Source that parses LookML files to extract view and model metadata.
+
+    Implementation notes:
+    - Uses lkml parser library to parse LookML syntax
+    - Optional integration with Looker API for enhanced name resolution
+    - Supports both git-based ingestion (clones repo) and local file ingestion
+    - Implements stateful ingestion with StaleEntityRemovalHandler
+    - Uses SQL parsing for extracting upstream table names from derived tables
+    """
+
+    platform = "lookml"
+
+    def __init__(self, config: LookMLSourceConfig, ctx: PipelineContext):
+        super().__init__(config, ctx)
+        self.source_config: LookMLSourceConfig = config
+        self.ctx = ctx
+        self.reporter = LookMLSourceReport()
+
+        # To keep track of projects (containers) which have already been ingested
+        self.processed_projects: List[str] = []
+
+        # This is populated during the git clone step.
+        self.base_projects_folder: Dict[str, pathlib.Path] = {}
+        self.remote_projects_git_info: Dict[str, GitInfo] = {}
+
+        self.looker_client: Optional[LookerAPI] = None
+        if self.source_config.api:
+            self.looker_client = LookerAPI(self.source_config.api)
+            self.reporter._looker_api = self.looker_client
+            try:
+                self.looker_client.all_connections()
+            except SDKError as err:
+                raise ValueError(
+                    "Failed to retrieve connections from looker client. Please check to ensure that you have "
+                    "manage_models permission enabled on this API key."
+                ) from err
+
+        self.manifest_constants: Dict[str, "LookerConstant"] = {}
+
+    def _load_model(self, path: str) -> LookerModel:
+        logger.debug(f"Loading model from file {path}")
+
+        parsed = load_and_preprocess_file(
+            path=path,
+            reporter=self.reporter,
+            source_config=self.source_config,
+        )
+
+        looker_model = LookerModel.from_looker_dict(
+            parsed,
+            BASE_PROJECT_NAME,
+            self.source_config.project_name,
+            self.base_projects_folder,
+            path,
+            self.source_config,
+            self.reporter,
+        )
+        return looker_model
+
+    def _get_upstream_lineage(
+        self, looker_view: LookerView
+    ) -> Optional[UpstreamLineage]:
+        upstream_dataset_urns = looker_view.upstream_dataset_urns
+
+        # Generate the upstream + fine grained lineage objects.
+        upstreams = []
+        observed_lineage_ts = datetime.now(tz=timezone.utc)
+        for upstream_dataset_urn in upstream_dataset_urns:
+            upstream = UpstreamClass(
+                dataset=upstream_dataset_urn,
+                type=DatasetLineageTypeClass.VIEW,
+                auditStamp=AuditStampClass(
+                    time=int(observed_lineage_ts.timestamp() * 1000),
+                    actor=CORPUSER_DATAHUB,
+                ),
+            )
+            upstreams.append(upstream)
+
+        fine_grained_lineages: List[FineGrainedLineageClass] = []
+
+        for field in looker_view.fields:
+            fine_grained_lineages.append(
+                FineGrainedLineageClass(
+                    upstreamType=FineGrainedLineageUpstreamTypeClass.FIELD_SET,
+                    upstreams=column_refs_to_schema_field_urns(field.upstream_fields),
+                    downstreamType=FineGrainedLineageDownstreamType.FIELD,
+                    downstreams=[
+                        make_schema_field_urn(
+                            looker_view.id.get_urn(self.source_config),
+                            field.name,
+                        )
+                    ],
+                )
+            )
+
+        if upstreams:
+            return UpstreamLineage(
+                upstreams=upstreams, fineGrainedLineages=fine_grained_lineages or None
+            )
+        else:
+            return None
+
+    def _get_custom_properties(self, looker_view: LookerView) -> DatasetPropertiesClass:
+        assert self.source_config.base_folder  # this is always filled out
+        base_folder = self.base_projects_folder.get(
+            looker_view.id.project_name, self.source_config.base_folder
+        )
+        try:
+            file_path = str(
+                pathlib.Path(looker_view.absolute_file_path).relative_to(
+                    base_folder.resolve()
+                )
+            )
+        except Exception:
+            file_path = None
+            logger.warning(
+                f"Failed to resolve relative path for file {looker_view.absolute_file_path} w.r.t. folder {self.source_config.base_folder}"
+            )
+
+        custom_properties = {
+            "looker.file.path": file_path or looker_view.absolute_file_path,
+            "looker.model": looker_view.id.model_name,
+        }
+        dataset_props = DatasetPropertiesClass(
+            name=looker_view.id.view_name, customProperties=custom_properties
+        )
+
+        maybe_git_info = self.source_config.project_dependencies.get(
+            looker_view.id.project_name,
+            self.remote_projects_git_info.get(looker_view.id.project_name),
+        )
+        if isinstance(maybe_git_info, GitInfo):
+            git_info: Optional[GitInfo] = maybe_git_info
+        else:
+            git_info = self.source_config.git_info
+        if git_info is not None and file_path:
+            # It should be that looker_view.id.project_name is the base project.
+            github_file_url = git_info.get_url_for_file_path(file_path)
+            dataset_props.externalUrl = github_file_url
+
+        return dataset_props
+
+    def _build_dataset_entities(self, looker_view: LookerView) -> Iterable[Dataset]:
+        dataset_extra_aspects: List[Union[ViewProperties, Status]] = [
+            Status(removed=False)
+        ]
+        if looker_view.view_details is not None:
+            dataset_extra_aspects.append(looker_view.view_details)
+
+        schema_metadata = LookerUtil._get_schema(
+            self.source_config.platform_name,
+            looker_view.id.view_name,
+            looker_view.fields,
+            self.reporter,
+            tag_measures_and_dimensions=self.source_config.tag_measures_and_dimensions,
+        )
+
+        custom_properties: DatasetPropertiesClass = self._get_custom_properties(
+            looker_view
+        )
+
+        yield Dataset(
+            platform=self.source_config.platform_name,
+            name=looker_view.id.get_view_dataset_name(self.source_config),
+            display_name=looker_view.id.view_name,
+            platform_instance=self.source_config.platform_instance,
+            env=self.source_config.env,
+            subtype=DatasetSubTypes.VIEW,
+            parent_container=looker_view.id.get_view_dataset_parent_container(
+                self.source_config
+            ),
+            schema=schema_metadata,
+            custom_properties=custom_properties.customProperties,
+            external_url=custom_properties.externalUrl,
+            upstreams=self._get_upstream_lineage(looker_view),
+            extra_aspects=dataset_extra_aspects,
+        )
+
+    def get_project_name(self, model_name: str) -> str:
+        if self.source_config.project_name is not None:
+            return self.source_config.project_name
+
+        assert self.looker_client is not None, (
+            "Failed to find a configured Looker API client"
+        )
+        try:
+            model = self.looker_client.lookml_model(model_name, fields="project_name")
+            assert model.project_name is not None, (
+                f"Failed to find a project name for model {model_name}"
+            )
+            return model.project_name
+        except SDKError as e:
+            self.reporter.failure(
+                title="Failed to find a project name for model",
+                message="Consider configuring a static project name in your config file",
+                context=str(dict(model_name=model_name)),
+                exc=e,
+            )
+            raise ValueError(
+                f"Could not locate a project name for model {model_name}. Consider configuring a static project name "
+                f"in your config file"
+            ) from None
+
+    def get_manifest_if_present(self, folder: pathlib.Path) -> Optional[LookerManifest]:
+        manifest_file = folder / "manifest.lkml"
+
+        if not manifest_file.exists():
+            self.reporter.warning(
+                title="Manifest File Missing",
+                message="manifest.lkml file missing from project",
+                context=str(manifest_file),
+                log=False,
+            )
+            return None
+
+        manifest_dict = load_and_preprocess_file(
+            path=manifest_file,
+            source_config=self.source_config,
+            reporter=self.reporter,
+        )
+
+        manifest = LookerManifest(
+            project_name=manifest_dict.get("project_name"),
+            constants=manifest_dict.get("constants", []),
+            local_dependencies=[
+                x["project"]
+                for x in manifest_dict.get("local_dependencies", [])
+                if x.get("project")
+            ],
+            remote_dependencies=[
+                LookerRemoteDependency(name=x["name"], url=x["url"], ref=x.get("ref"))
+                for x in manifest_dict.get("remote_dependencies", [])
+                if x.get("name") and x.get("url")
+            ],
+        )
+        return manifest
+
+    def get_workunits_internal(self) -> Iterable[Union[MetadataWorkUnit, Entity]]:
+        with tempfile.TemporaryDirectory("lookml_tmp") as tmp_dir:
+            # Clone the base_folder if necessary.
+            if not self.source_config.base_folder:
+                assert self.source_config.git_info
+                # we don't have a base_folder, so we need to clone the repo and process it locally
+                start_time = datetime.now()
+                try:
+                    checkout_dir = self.source_config.git_info.clone(
+                        tmp_path=tmp_dir,
+                    )
+                    self.reporter.git_clone_latency = datetime.now() - start_time
+                    self.source_config.base_folder = checkout_dir.resolve()
+                except Exception as e:
+                    self.reporter.failure(
+                        title="Failed to clone LookML repository",
+                        message="Unable to clone the git repository.",
+                        context=self.source_config.git_info.repo,
+                        exc=e,
+                    )
+                    return
+
+            self.base_projects_folder[BASE_PROJECT_NAME] = (
+                self.source_config.base_folder
+            )
+
+            visited_projects: Set[str] = set()
+
+            # We clone everything that we're pointed at.
+            for project, p_ref in self.source_config.project_dependencies.items():
+                # If we were given GitHub info, we need to clone the project.
+                if isinstance(p_ref, GitInfo):
+                    try:
+                        p_checkout_dir = p_ref.clone(
+                            tmp_path=f"{tmp_dir}/_included_/{project}",
+                            # If a deploy key was provided, use it. Otherwise, fall back
+                            # to the main project deploy key, if present.
+                            fallback_deploy_key=(
+                                self.source_config.git_info.deploy_key
+                                if self.source_config.git_info
+                                else None
+                            ),
+                        )
+
+                        p_ref = p_checkout_dir.resolve()
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to clone project dependency {project}. This can lead to failures in parsing lookml files later on: {e}",
+                        )
+                        visited_projects.add(project)
+                        continue
+
+                self.base_projects_folder[project] = p_ref
+
+            self._recursively_check_manifests(
+                tmp_dir,
+                BASE_PROJECT_NAME,
+                visited_projects,
+                self.manifest_constants,
+            )
+
+            yield from self.get_internal_workunits()
+
+            if not self.report.events_produced and not self.report.failures:
+                # Don't pass if we didn't produce any events.
+                self.report.failure(
+                    message="No metadata was produced. Check the logs for more details.",
+                )
+
+    def _recursively_check_manifests(
+        self,
+        tmp_dir: str,
+        project_name: str,
+        project_visited: Set[str],
+        manifest_constants: Dict[str, "LookerConstant"],
+    ) -> None:
+        if project_name in project_visited:
+            return
+        project_visited.add(project_name)
+
+        project_path = self.base_projects_folder.get(project_name)
+        if not project_path:
+            logger.warning(
+                f"Could not find {project_name} in the project_dependencies config. This can lead to failures in parsing lookml files later on.",
+            )
+            return
+
+        manifest = self.get_manifest_if_present(project_path)
+        if not manifest:
+            return
+
+        if manifest.constants:
+            for constant in manifest.constants:
+                if constant.get("name") and constant.get("value"):
+                    manifest_constants[constant["name"]] = LookerConstant(
+                        name=constant["name"],
+                        value=constant["value"],
+                    )
+
+        # Special case handling if the root project has a name in the manifest file.
+        if project_name == BASE_PROJECT_NAME and manifest.project_name:
+            if (
+                self.source_config.project_name is not None
+                and manifest.project_name != self.source_config.project_name
+            ):
+                logger.warning(
+                    f"The project name in the manifest file '{manifest.project_name}'"
+                    f"does not match the configured project name '{self.source_config.project_name}'. "
+                    "This can lead to failures in LookML include resolution and lineage generation."
+                )
+            elif self.source_config.project_name is None:
+                self.source_config.project_name = manifest.project_name
+
+        # Clone the remote project dependencies.
+        for remote_project in manifest.remote_dependencies:
+            if remote_project.name in project_visited:
+                continue
+            if remote_project.name in self.base_projects_folder:
+                # In case a remote_dependency is specified in the project_dependencies config,
+                # we don't need to clone it again.
+                continue
+
+            url_check = check_remote_dependency_url(
+                url=remote_project.url,
+                allowed_pattern=self.source_config.remote_dependency_domain_pattern,
+            )
+            if not url_check.allowed:
+                self.reporter.warning(
+                    title="Skipped remote LookML dependency",
+                    message=(
+                        "Did not clone a remote_dependency from manifest.lkml because "
+                        "its URL is not allowed."
+                    ),
+                    context=(
+                        f"project={remote_project.name}, "
+                        f"url={GitClone.sanitize_repo_url(remote_project.url)}, "
+                        f"reason={url_check.reason}"
+                    ),
+                )
+                continue
+
+            p_cloner = GitClone(f"{tmp_dir}/_remote_/{remote_project.name}")
+            try:
+                # TODO: For 100% correctness, we should be consulting
+                # the manifest lock file for the exact ref to use.
+
+                p_checkout_dir = p_cloner.clone(
+                    ssh_key=(
+                        self.source_config.git_info.deploy_key
+                        if self.source_config.git_info
+                        else None
+                    ),
+                    repo_url=remote_project.url,
+                )
+
+                self.base_projects_folder[remote_project.name] = (
+                    p_checkout_dir.resolve()
+                )
+                repo = p_cloner.get_last_repo_cloned()
+                assert repo
+                remote_git_info = GitInfo(
+                    url_template=remote_project.url,
+                    repo="dummy/dummy",  # set to dummy values to bypass validation
+                    branch=repo.active_branch.name,
+                )
+                remote_git_info.repo = (
+                    ""  # set to empty because url already contains the full path
+                )
+                self.remote_projects_git_info[remote_project.name] = remote_git_info
+
+            except Exception as e:
+                logger.warning(
+                    f"Failed to clone remote project {project_name}. This can lead to failures in parsing lookml files later on: {e}",
+                )
+                project_visited.add(project_name)
+            else:
+                self._recursively_check_manifests(
+                    tmp_dir,
+                    remote_project.name,
+                    project_visited,
+                    manifest_constants,
+                )
+
+        for project in manifest.local_dependencies:
+            self._recursively_check_manifests(
+                tmp_dir, project, project_visited, manifest_constants
+            )
+
+    def get_internal_workunits(self) -> Iterable[Union[MetadataWorkUnit, Entity]]:  # noqa: C901
+        assert self.source_config.base_folder
+        viewfile_loader = LookerViewFileLoader(
+            self.source_config.project_name,
+            self.base_projects_folder,
+            self.reporter,
+            self.source_config,
+            self.manifest_constants,
+        )
+        logger.debug(f"LookML Constants : {', '.join(self.manifest_constants.keys())}")
+
+        # Some views can be mentioned by multiple 'include' statements and can be included via different connections.
+
+        # This map is used to keep track of which views files have already been processed
+        # for a connection in order to prevent creating duplicate events.
+        # Key: connection name, Value: view file paths
+        processed_view_map: Dict[str, Set[str]] = {}
+
+        # This map is used to keep track of the connection that a view is processed with.
+        # Key: view unique identifier - determined by variables present in config `view_naming_pattern`
+        # Value: Tuple(model file name, connection name)
+        view_connection_map: Dict[str, Tuple[str, str]] = {}
+
+        # Map of view name to all possible explores for API-based view lineage
+        # A view can be referenced by multiple explores, we'll optimize the assignment
+        # Key: view_name, Value: set of explore_names
+        view_to_explores: Dict[str, Set[str]] = defaultdict(set)
+
+        # Temporary map to keep track of the views in an explore
+        # Key: explore_name, Value: set of view_names
+        explore_to_views: Dict[str, Set[str]] = defaultdict(set)
+
+        # The ** means "this directory and all subdirectories", and hence should
+        # include all the files we want.
+        model_files = sorted(
+            self.source_config.base_folder.glob(f"**/*{MODEL_FILE_EXTENSION}")
+        )
+        model_suffix_len = len(".model")
+
+        for file_path in model_files:
+            self.reporter.report_models_scanned()
+            model_name = file_path.stem[:-model_suffix_len]
+
+            if not self.source_config.model_pattern.allowed(model_name):
+                self.reporter.report_models_dropped(model_name)
+                continue
+            try:
+                logger.debug(f"Attempting to load model: {file_path}")
+                model = self._load_model(str(file_path))
+            except Exception as e:
+                self.reporter.warning(
+                    title="Error Loading Model File",
+                    message="Unable to load Looker model from file.",
+                    context=f"Model Name: {model_name}, File Path: {file_path}",
+                    exc=e,
+                    log=False,
+                )
+                continue
+
+            assert model.connection is not None
+            connection_definition = get_connection_def_based_on_connection_string(
+                connection=model.connection,
+                looker_client=self.looker_client,
+                source_config=self.source_config,
+                reporter=self.reporter,
+            )
+
+            if connection_definition is None:
+                self.reporter.warning(
+                    title="Failed to Load Connection",
+                    message="Failed to load connection. Check your API key permissions and/or connection_to_platform_map configuration.",
+                    context=f"Connection: {model.connection}",
+                    log=False,
+                )
+                self.reporter.report_models_dropped(model_name)
+                continue
+
+            explore_reachable_views: Set[str] = set()
+            looker_refinement_resolver: LookerRefinementResolver = (
+                LookerRefinementResolver(
+                    looker_model=model,
+                    connection_definition=connection_definition,
+                    looker_viewfile_loader=viewfile_loader,
+                    source_config=self.source_config,
+                    reporter=self.reporter,
+                )
+            )
+
+            model_explores_map = {d["name"]: d for d in model.explores}
+            for explore_dict in model.explores:
+                try:
+                    if LookerRefinementResolver.is_refinement(explore_dict["name"]):
+                        continue
+
+                    # Abstract explores (extension: required) are base templates that
+                    # cannot be queried via the Looker API — skip to avoid 404 errors.
+                    # https://docs.cloud.google.com/looker/docs/reference/param-explore-extension
+                    if explore_dict.get("extension") == "required":
+                        continue
+
+                    explore_dict = looker_refinement_resolver.apply_explore_refinement(
+                        explore_dict
+                    )
+                    explore: LookerExplore = LookerExplore.from_dict(
+                        model_name,
+                        explore_dict,
+                        model.resolved_includes,
+                        viewfile_loader,
+                        self.reporter,
+                        model_explores_map,
+                    )
+                    if explore.upstream_views:
+                        for view_name in explore.upstream_views:
+                            if self.source_config.emit_reachable_views_only:
+                                explore_reachable_views.add(view_name.include)
+
+                            view_to_explores[view_name.include].add(explore.name)
+                            explore_to_views[explore.name].add(view_name.include)
+                except Exception as e:
+                    self.reporter.warning(
+                        title="Failed to process explores",
+                        message="Failed to process explore dictionary.",
+                        context=f"Explore Details: {explore_dict}",
+                        exc=e,
+                        log=False,
+                    )
+                    logger.debug("Failed to process explore", exc_info=e)
+
+            processed_view_files = processed_view_map.setdefault(
+                model.connection, set()
+            )
+
+            view_to_explore_map = {}
+            if view_to_explores and explore_to_views:
+                view_to_explore_map = self._optimize_views_by_common_explore(
+                    view_to_explores, explore_to_views
+                )
+            else:
+                logger.warning(
+                    f"Either view_to_explores: {view_to_explores} or explore_to_views: {explore_to_views} is empty"
+                )
+
+            project_name = self.get_project_name(model_name)
+
+            looker_view_id_cache: LookerViewIdCache = LookerViewIdCache(
+                project_name=project_name,
+                model_name=model_name,
+                looker_model=model,
+                looker_viewfile_loader=viewfile_loader,
+                reporter=self.reporter,
+            )
+
+            logger.debug(f"Model: {model_name}; Includes: {model.resolved_includes}")
+
+            for include in model.resolved_includes:
+                logger.debug(f"Considering {include} for model {model_name}")
+                if include.include in processed_view_files:
+                    logger.debug(f"view '{include}' already processed, skipping it")
+                    continue
+                logger.debug(f"Attempting to load view file: {include}")
+                looker_viewfile = viewfile_loader.load_viewfile(
+                    path=include.include,
+                    project_name=include.project,
+                    connection=connection_definition,
+                    reporter=self.reporter,
+                )
+
+                if looker_viewfile is not None:
+                    for raw_view in looker_viewfile.views:
+                        raw_view_name = raw_view["name"]
+                        if LookerRefinementResolver.is_refinement(raw_view_name):
+                            continue
+
+                        if (
+                            self.source_config.emit_reachable_views_only
+                            and raw_view_name not in explore_reachable_views
+                        ):
+                            logger.debug(
+                                f"view {raw_view_name} is not reachable from an explore, skipping.."
+                            )
+                            self.reporter.report_unreachable_view_dropped(raw_view_name)
+                            continue
+
+                        self.reporter.report_views_scanned()
+                        try:
+                            raw_view = looker_refinement_resolver.apply_view_refinement(
+                                raw_view=raw_view,
+                            )
+
+                            current_project_name: str = (
+                                include.project
+                                if include.project != BASE_PROJECT_NAME
+                                else project_name
+                            )
+
+                            # if project is base project then it is available as self.base_projects_folder[
+                            # _BASE_PROJECT_NAME]
+                            base_folder_path: str = str(
+                                self.base_projects_folder.get(
+                                    current_project_name,
+                                    self.base_projects_folder[BASE_PROJECT_NAME],
+                                )
+                            )
+
+                            view_context: LookerViewContext = LookerViewContext(
+                                raw_view=raw_view,
+                                view_file=looker_viewfile,
+                                view_connection=connection_definition,
+                                view_file_loader=viewfile_loader,
+                                looker_refinement_resolver=looker_refinement_resolver,
+                                base_folder_path=base_folder_path,
+                                reporter=self.reporter,
+                            )
+
+                            maybe_looker_view = LookerView.from_looker_dict(
+                                project_name=current_project_name,
+                                model_name=model_name,
+                                view_context=view_context,
+                                looker_view_id_cache=looker_view_id_cache,
+                                reporter=self.reporter,
+                                max_file_snippet_length=self.source_config.max_file_snippet_length,
+                                extract_col_level_lineage=self.source_config.extract_column_level_lineage,
+                                populate_sql_logic_in_descriptions=self.source_config.populate_sql_logic_for_missing_descriptions,
+                                config=self.source_config,
+                                ctx=self.ctx,
+                                looker_client=self.looker_client,
+                                view_to_explore_map=view_to_explore_map,
+                            )
+                        except Exception as e:
+                            self.reporter.warning(
+                                title="Error Loading View",
+                                message="Unable to load Looker View.",
+                                context=f"View Details: {raw_view}",
+                                exc=e,
+                                log=False,
+                            )
+
+                            logger.debug(e, exc_info=e)
+
+                            continue
+
+                        if maybe_looker_view:
+                            if self.source_config.view_pattern.allowed(
+                                maybe_looker_view.id.view_name
+                            ):
+                                view_urn = maybe_looker_view.id.get_urn(
+                                    self.source_config
+                                )
+
+                                view_connection_mapping = view_connection_map.get(
+                                    view_urn
+                                )
+                                if not view_connection_mapping:
+                                    view_connection_map[view_urn] = (
+                                        model_name,
+                                        model.connection,
+                                    )
+                                    # first time we are discovering this view
+                                    logger.debug(
+                                        f"Generating MCP for view {raw_view['name']}"
+                                    )
+
+                                    if (
+                                        maybe_looker_view.id.project_name
+                                        not in self.processed_projects
+                                    ):
+                                        yield from self.gen_project_containers(
+                                            maybe_looker_view.id.project_name
+                                        )
+
+                                        self.processed_projects.append(
+                                            maybe_looker_view.id.project_name
+                                        )
+
+                                    yield from self._build_dataset_entities(
+                                        maybe_looker_view
+                                    )
+
+                                    processed_view_files.add(include.include)
+                                else:
+                                    (
+                                        prev_model_name,
+                                        prev_model_connection,
+                                    ) = view_connection_mapping
+                                    if prev_model_connection != model.connection:
+                                        # this view has previously been discovered and emitted using a different
+                                        # connection
+                                        logger.warning(
+                                            f"view {maybe_looker_view.id.view_name} from model {model_name}, connection {model.connection} was previously processed via model {prev_model_name}, connection {prev_model_connection} and will likely lead to incorrect lineage to the underlying tables"
+                                        )
+                                        if not self.source_config.emit_reachable_views_only:
+                                            logger.warning(
+                                                "Consider enabling the `emit_reachable_views_only` flag to handle this case."
+                                            )
+                            else:
+                                self.reporter.report_views_dropped(
+                                    str(maybe_looker_view.id)
+                                )
+
+        if not self.source_config.emit_reachable_views_only:
+            self.report_skipped_unreachable_views(viewfile_loader, processed_view_map)
+
+        if (
+            self.source_config.tag_measures_and_dimensions
+            and self.reporter.events_produced != 0
+        ):
+            # Emit tag MCEs for measures and dimensions if we produced any explores:
+            for tag_mce in LookerUtil.get_tag_mces():
+                # Convert MCE to MCPs
+                for mcp in mcps_from_mce(tag_mce):
+                    yield mcp.as_workunit()
+
+    def gen_project_containers(self, project_name: str) -> Iterable[Container]:
+        project_key = gen_project_key(
+            self.source_config,
+            project_name,
+        )
+
+        yield Container(
+            container_key=project_key,
+            display_name=project_name,
+            subtype=BIContainerSubTypes.LOOKML_PROJECT,
+            parent_container=["Folders"],
+        )
+
+    def report_skipped_unreachable_views(
+        self,
+        viewfile_loader: LookerViewFileLoader,
+        processed_view_map: Optional[Dict[str, Set[str]]] = None,
+    ) -> None:
+        processed_view_map = processed_view_map or {}
+        view_files: Dict[str, List[pathlib.Path]] = {}
+        for project, folder_path in self.base_projects_folder.items():
+            folder = pathlib.Path(folder_path)
+            view_files[project] = list(folder.glob(f"**/*{VIEW_FILE_EXTENSION}"))
+
+        skipped_view_paths: Dict[str, List[str]] = {}
+        for project, views in view_files.items():
+            skipped_paths: Set[str] = set()
+
+            for view_path in views:
+                # Check if the view is already in processed_view_map
+                if not any(
+                    str(view_path) in view_set
+                    for view_set in processed_view_map.values()
+                ):
+                    looker_viewfile = viewfile_loader.load_viewfile(
+                        path=str(view_path),
+                        project_name=project,
+                        connection=None,
+                        reporter=self.reporter,
+                    )
+
+                    if looker_viewfile is not None:
+                        for raw_view in looker_viewfile.views:
+                            raw_view_name = raw_view.get("name", "")
+
+                            if (
+                                raw_view_name
+                                and self.source_config.view_pattern.allowed(
+                                    raw_view_name
+                                )
+                            ):
+                                skipped_paths.add(str(view_path))
+
+            skipped_view_paths[project] = list(skipped_paths)
+
+        for project, view_paths in skipped_view_paths.items():
+            for path in view_paths:
+                self.reporter.warning(
+                    title="Skipped View File",
+                    message=(
+                        "The Looker view file was skipped because it may not be referenced by any models."
+                    ),
+                    context=(f"Project: {project}, View File Path: {path}"),
+                    log=False,
+                )
+
+    def _optimize_views_by_common_explore(
+        self,
+        view_to_explores: Dict[str, Set[str]],
+        explore_to_views: Dict[str, Set[str]],
+    ) -> Dict[str, str]:
+        """
+        Optimize view-to-explore mapping by grouping views to minimize API calls.
+
+        This uses a greedy algorithm that prioritizes explores that appear in the most views,
+        maximizing the number of views assigned to the same explore.
+
+        Args:
+            view_to_explores: Dict mapping view_name -> set of explore_names
+            explore_to_views: Dict mapping explore_name -> set of view_names
+
+        Returns:
+            Dict mapping view_name -> explore_name (optimized assignment)
+        """
+
+        # Pre-compute explore sizes
+        explore_sizes = {
+            explore: len(views) for explore, views in explore_to_views.items()
+        }
+
+        # Build view-to-explore mapping using dynamic programming approach
+        view_to_explore: Dict[str, str] = {}
+
+        # For each view, find the explore with maximum size that contains it
+        for view_name, candidate_explores in view_to_explores.items():
+            if candidate_explores:
+                # Find explore with maximum size using max() with key function
+                # This assings the view to the explore with the most views that contains it
+                best_explore = max(
+                    candidate_explores, key=lambda explore: explore_sizes[explore]
+                )
+                view_to_explore[view_name] = best_explore
+
+        # Log optimization results
+        unique_explores_used = len(set(view_to_explore.values()))
+        total_views = len(view_to_explore)
+        total_explores = len(explore_to_views)
+
+        if total_explores > 0:
+            efficiency = (1 - unique_explores_used / total_explores) * 100
+            logger.info(
+                f"View-explore optimization: Using {unique_explores_used}/{total_explores} "
+                f"explores for {total_views} views (efficiency: {efficiency:.1f}% savings)"
+            )
+        else:
+            logger.info(
+                f"View-explore optimization: No explores to optimize for {total_views} views"
+            )
+
+        logger.debug(f"Final View-to-explore mapping: {view_to_explore}")
+        return view_to_explore
+
+    def get_report(self):
+        return self.reporter

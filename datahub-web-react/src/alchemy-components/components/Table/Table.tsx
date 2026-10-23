@@ -1,0 +1,346 @@
+import { CaretDown } from '@phosphor-icons/react/dist/csr/CaretDown';
+import { CaretLeft } from '@phosphor-icons/react/dist/csr/CaretLeft';
+import { CaretRight } from '@phosphor-icons/react/dist/csr/CaretRight';
+import { CaretUp } from '@phosphor-icons/react/dist/csr/CaretUp';
+import { CircleNotch } from '@phosphor-icons/react/dist/csr/CircleNotch';
+import React, { useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import styled, { keyframes } from 'styled-components';
+
+import { StructuredPopover } from '@components/components/StructuredPopover';
+import {
+    BaseTable,
+    HeaderContainer,
+    LoadingContainer,
+    SortIcon,
+    SortIconsContainer,
+    TableCell,
+    TableContainer,
+    TableHeader,
+    TableHeaderCell,
+    TableRow,
+} from '@components/components/Table/components';
+import { SortingState, TableProps } from '@components/components/Table/types';
+import { useGetSelectionColumn } from '@components/components/Table/useGetSelectionColumn';
+import { getRowKey, getSortedData, handleActiveSort, renderCell } from '@components/components/Table/utils';
+import { Text } from '@components/components/Text';
+
+// Placeholder token for the unsorted state inside React row keys (programmatic, not user-facing).
+const NO_SORT_KEY = 'none';
+
+export const CellHoverWrapper = styled.div`
+    width: 100%;
+    min-height: 100%;
+    display: flex;
+    align-items: center;
+    margin: -16px;
+    padding: 16px;
+`;
+
+const spin = keyframes`
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+`;
+
+const LoadingSpinner = styled(CircleNotch)`
+    animation: ${spin} 1s linear infinite;
+    color: ${({ theme }) => theme.colors.iconBrand};
+`;
+
+export const tableDefaults: TableProps<any> = {
+    columns: [],
+    data: [],
+    showHeader: true,
+    isLoading: false,
+    isScrollable: false,
+    maxHeight: '100%',
+    isBorderless: false,
+};
+
+export const Table = <T,>({
+    columns = tableDefaults.columns,
+    data = tableDefaults.data,
+    showHeader = tableDefaults.showHeader,
+    isLoading = tableDefaults.isLoading,
+    isScrollable = tableDefaults.isScrollable,
+    maxHeight = tableDefaults.maxHeight,
+    expandable,
+    isBorderless = tableDefaults.isBorderless,
+    onRowClick,
+    focusedRowKey,
+    onExpand,
+    rowClassName,
+    handleSortColumnChange = undefined,
+    rowKey,
+    rowSelection,
+    rowRefs,
+    headerRef,
+    rowDataTestId,
+    footer,
+    renderScrollObserver,
+    ...props
+}: TableProps<T>) => {
+    const { t } = useTranslation('alchemy');
+    const [sortColumn, setSortColumn] = useState<string | null>(null);
+    const [sortOrder, setSortOrder] = useState<SortingState>(SortingState.ORIGINAL);
+    const [focusedRowIndex, setFocusedRowIndex] = useState<number | null>(null);
+
+    const sortedData = getSortedData(columns, data, sortColumn, sortOrder);
+    const isRowClickable = !!onRowClick;
+
+    const selectionColumn = useGetSelectionColumn(data, rowKey, rowSelection);
+    const finalColumns = [...selectionColumn, ...columns];
+
+    useEffect(() => {
+        if (handleSortColumnChange && sortOrder && sortColumn) {
+            handleSortColumnChange({ sortColumn, sortOrder });
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [sortOrder, sortColumn]);
+
+    useEffect(() => {
+        setFocusedRowIndex(null);
+    }, [data]);
+
+    if (isLoading) {
+        return (
+            <LoadingContainer>
+                <LoadingSpinner />
+                <Text>{t('table.loading')}</Text>
+            </LoadingContainer>
+        );
+    }
+
+    return (
+        <TableContainer isScrollable={isScrollable} maxHeight={maxHeight} isBorderless={isBorderless}>
+            <BaseTable {...props}>
+                {/* Render the table header if enabled */}
+                {showHeader && (
+                    <TableHeader ref={headerRef}>
+                        <tr>
+                            {/* Map through columns to create header cells */}
+                            {finalColumns.map((column, index) => (
+                                <TableHeaderCell
+                                    key={column.key} // Unique key for each header cell
+                                    width={column.width}
+                                    minWidth={column.minWidth}
+                                    maxWidth={column.maxWidth}
+                                    shouldAddRightBorder={index !== finalColumns.length - 1} // Add border unless last column
+                                >
+                                    {column?.tooltipTitle ? (
+                                        <StructuredPopover title={column.tooltipTitle}>
+                                            <HeaderContainer alignment={column.alignment}>
+                                                {column.title}
+                                                {column.sorter && ( // Render sort icons if the column is sortable
+                                                    <SortIconsContainer
+                                                        data-testid={`sort-${column.key}`}
+                                                        onClick={() =>
+                                                            handleActiveSort(
+                                                                column.key,
+                                                                sortColumn,
+                                                                setSortColumn,
+                                                                setSortOrder,
+                                                            )
+                                                        }
+                                                    >
+                                                        {/* Sort icons for ascending and descending */}
+                                                        <SortIcon
+                                                            icon={CaretLeft}
+                                                            size="md"
+                                                            rotate="90"
+                                                            isActive={
+                                                                column.key === sortColumn &&
+                                                                sortOrder === SortingState.ASCENDING
+                                                            }
+                                                        />
+                                                        <SortIcon
+                                                            icon={CaretRight}
+                                                            size="md"
+                                                            rotate="90"
+                                                            isActive={
+                                                                column.key === sortColumn &&
+                                                                sortOrder === SortingState.DESCENDING
+                                                            }
+                                                        />
+                                                    </SortIconsContainer>
+                                                )}
+                                            </HeaderContainer>
+                                        </StructuredPopover>
+                                    ) : (
+                                        <HeaderContainer alignment={column.alignment}>
+                                            {column.title}
+                                            {column.sorter && ( // Render sort icons if the column is sortable
+                                                <SortIconsContainer
+                                                    data-testid={`sort-${column.key}`}
+                                                    onClick={() =>
+                                                        handleActiveSort(
+                                                            column.key,
+                                                            sortColumn,
+                                                            setSortColumn,
+                                                            setSortOrder,
+                                                        )
+                                                    }
+                                                >
+                                                    {/* Sort icons for ascending and descending */}
+                                                    <SortIcon
+                                                        icon={CaretLeft}
+                                                        size="md"
+                                                        rotate="90"
+                                                        isActive={
+                                                            column.key === sortColumn &&
+                                                            sortOrder === SortingState.ASCENDING
+                                                        }
+                                                    />
+                                                    <SortIcon
+                                                        icon={CaretRight}
+                                                        size="md"
+                                                        rotate="90"
+                                                        isActive={
+                                                            column.key === sortColumn &&
+                                                            sortOrder === SortingState.DESCENDING
+                                                        }
+                                                    />
+                                                </SortIconsContainer>
+                                            )}
+                                        </HeaderContainer>
+                                    )}
+                                </TableHeaderCell>
+                            ))}
+                            {/* Placeholder for expandable icon if enabled */}
+                        </tr>
+                    </TableHeader>
+                )}
+                {/* Render table body with rows and cells */}
+                <tbody>
+                    {sortedData.map((row: any, index) => {
+                        const isExpanded = expandable?.expandedGroupIds?.includes(row?.name); // Check if row is expanded
+                        const canExpand = expandable?.rowExpandable?.(row); // Check if row is expandable
+                        const key = `row-${index}-${sortColumn ?? NO_SORT_KEY}-${sortOrder ?? NO_SORT_KEY}`;
+                        const rowId = getRowKey(row, index, rowKey);
+                        const isFocused =
+                            focusedRowKey !== undefined ? focusedRowKey === rowId : focusedRowIndex === index;
+                        return (
+                            <React.Fragment key={key}>
+                                {/* Render the main row */}
+                                <TableRow
+                                    canExpand={canExpand}
+                                    onClick={(e) => {
+                                        if (focusedRowKey === undefined) {
+                                            if (focusedRowIndex === index) {
+                                                setFocusedRowIndex(null);
+                                            } else {
+                                                setFocusedRowIndex(index);
+                                            }
+                                        }
+                                        if (canExpand) onExpand?.(row); // Handle row expansion
+                                        onRowClick?.(row); // Handle row click
+                                        e.stopPropagation();
+                                    }}
+                                    isFocused={isFocused}
+                                    className={rowClassName?.(row)} // Add row-specific class
+                                    ref={(el) => {
+                                        if (rowRefs && el) {
+                                            const currentRefs = rowRefs.current;
+                                            currentRefs[index] = el;
+                                        }
+                                    }}
+                                    isRowClickable={isRowClickable}
+                                    data-testid={rowDataTestId?.(row)}
+                                    canHover
+                                >
+                                    {/* Render each cell in the row */}
+
+                                    {finalColumns.map((column, i) => {
+                                        return (() => {
+                                            let content;
+                                            if (columns.length - 1 === i && canExpand) {
+                                                content = (
+                                                    <div
+                                                        style={{
+                                                            cursor: 'pointer',
+                                                            paddingTop: '10px',
+                                                            paddingRight: '10px',
+                                                        }}
+                                                    >
+                                                        {isExpanded ? (
+                                                            <CaretDown
+                                                                size={16}
+                                                                weight="bold"
+                                                                data-testid="group-header-expanded-icon"
+                                                            /> // Expanded icon
+                                                        ) : (
+                                                            <CaretUp
+                                                                size={16}
+                                                                weight="bold"
+                                                                data-testid="group-header-collapsed-icon"
+                                                            /> // Collapsed icon
+                                                        )}
+                                                    </div>
+                                                );
+                                            } else {
+                                                content = renderCell(column, row, index);
+                                            }
+
+                                            const cellContent = column.cellWrapper
+                                                ? column.cellWrapper(content, row)
+                                                : content;
+                                            const clickable = column.isCellClickable
+                                                ? column.isCellClickable(row)
+                                                : !!column.onCellClick;
+
+                                            return (
+                                                <TableCell
+                                                    key={column.key}
+                                                    width={column.width}
+                                                    alignment={
+                                                        columns.length - 1 === i && canExpand
+                                                            ? 'right'
+                                                            : column.alignment
+                                                    }
+                                                    isGroupHeader={canExpand}
+                                                    isExpanded={isExpanded}
+                                                    onClick={() => {
+                                                        if (clickable && column.onCellClick) {
+                                                            column.onCellClick(row);
+                                                        }
+                                                    }}
+                                                    style={{ cursor: clickable ? 'pointer' : 'default' }}
+                                                    className={column.cellWrapper ? 'hoverable-cell' : undefined}
+                                                    data-testid={column.key}
+                                                >
+                                                    {cellContent}
+                                                </TableCell>
+                                            );
+                                        })();
+                                    })}
+                                </TableRow>
+                                {/* Render expanded content if row is expanded */}
+                                {isExpanded && expandable?.expandedRowRender && (
+                                    <TableRow isRowClickable={isRowClickable} canHover={false}>
+                                        <TableCell
+                                            colSpan={columns.length + (expandable?.expandIconPosition ? 1 : 0)}
+                                            style={{ padding: 0, fontWeight: 'normal' }}
+                                        >
+                                            <div
+                                                style={{
+                                                    display: 'flex',
+                                                    flexDirection: 'column',
+                                                    width: '100%',
+                                                    minWidth: 0,
+                                                }}
+                                            >
+                                                {expandable.expandedRowRender(row, index)} {/* Expanded content */}
+                                            </div>
+                                        </TableCell>
+                                    </TableRow>
+                                )}
+                            </React.Fragment>
+                        );
+                    })}
+                    {renderScrollObserver?.()}
+                    {footer}
+                </tbody>
+            </BaseTable>
+        </TableContainer>
+    );
+};

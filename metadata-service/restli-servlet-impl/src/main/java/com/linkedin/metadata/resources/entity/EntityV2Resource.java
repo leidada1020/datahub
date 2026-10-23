@@ -1,0 +1,199 @@
+package com.linkedin.metadata.resources.entity;
+
+import static com.linkedin.metadata.authorization.ApiOperation.READ;
+import static com.linkedin.metadata.resources.restli.RestliConstants.*;
+import static com.linkedin.metadata.authorization.EntityAuthorizationUtils.isAPIAuthorizedEntityUrns;
+import static com.linkedin.metadata.utils.PegasusUtils.urnToEntityName;
+
+import com.codahale.metrics.MetricRegistry;
+import com.google.common.annotations.VisibleForTesting;
+import com.datahub.authentication.Authentication;
+import com.datahub.authentication.AuthenticationContext;
+import com.datahub.plugins.auth.authorization.Authorizer;
+import com.linkedin.common.urn.Urn;
+import com.linkedin.entity.EntityResponse;
+import com.linkedin.metadata.authorization.SensitiveAspectAuthUtil;
+import com.linkedin.metadata.authorization.EntityAuthorizationUtils;
+import com.linkedin.metadata.entity.EntityService;
+import com.linkedin.metadata.resources.restli.RestliUtils;
+import com.linkedin.parseq.Task;
+import com.linkedin.restli.common.HttpStatus;
+import com.linkedin.restli.server.RestLiServiceException;
+import com.linkedin.restli.server.annotations.Optional;
+import com.linkedin.restli.server.annotations.QueryParam;
+import com.linkedin.restli.server.annotations.RestLiCollection;
+import com.linkedin.restli.server.annotations.RestMethod;
+import com.linkedin.restli.server.resources.CollectionResourceTaskTemplate;
+import io.datahubproject.metadata.context.OperationContext;
+import io.datahubproject.metadata.context.usage.UsageOperation;
+import io.datahubproject.metadata.context.RequestContext;
+import io.opentelemetry.instrumentation.annotations.WithSpan;
+import java.net.URISyntaxException;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+import javax.inject.Inject;
+import javax.inject.Named;
+import lombok.extern.slf4j.Slf4j;
+
+/** Single unified resource for fetching, updating, searching, & browsing DataHub entities */
+@Slf4j
+@RestLiCollection(name = "entitiesV2", namespace = "com.linkedin.entity")
+public class EntityV2Resource extends CollectionResourceTaskTemplate<String, EntityResponse> {
+
+  @Inject
+  @Named("entityService")
+  private EntityService<?> _entityService;
+
+  @Inject
+  @Named("authorizerChain")
+  private Authorizer _authorizer;
+
+  @Inject
+  @Named("systemOperationContext")
+  private OperationContext systemOperationContext;
+
+  @VisibleForTesting
+  void setEntityService(EntityService<?> entityService) {
+    this._entityService = entityService;
+  }
+
+  @VisibleForTesting
+  void setAuthorizer(Authorizer authorizer) {
+    this._authorizer = authorizer;
+  }
+
+  @VisibleForTesting
+  void setSystemOperationContext(OperationContext systemOperationContext) {
+    this.systemOperationContext = systemOperationContext;
+  }
+
+  /** Retrieves the value for an entity that is made up of latest versions of specified aspects. */
+  @RestMethod.Get
+  @Nonnull
+  @WithSpan
+  public Task<EntityResponse> get(
+      @Nonnull String urnStr, @QueryParam(PARAM_ASPECTS) @Optional @Nullable String[] aspectNames,
+      @QueryParam(PARAM_ALWAYS_INCLUDE_KEY_ASPECT) @Optional @Nullable Boolean alwaysIncludeKeyAspect)
+      throws URISyntaxException {
+    log.debug("GET V2 {}", urnStr);
+    final Urn urn = Urn.createFromString(urnStr);
+
+      final Authentication auth = AuthenticationContext.getAuthentication();
+    final OperationContext opContext = RestliUtils.asSession(
+            systemOperationContext, RequestContext.builder().buildRestli(auth.getActor().toUrnStr(), getContext(),
+                    "getEntityV2", urn.getEntityType()).withUsageOperation(UsageOperation.METADATA_READ), _authorizer, auth, true);
+
+    if (!isAuthorizedToReadEntities(opContext, List.of(urn))) {
+      throw new RestLiServiceException(
+          HttpStatus.S_403_FORBIDDEN, "User is unauthorized to get entity " + urn);
+    }
+
+      return RestliUtils.toTask(opContext,
+        () -> {
+          final String entityName = urnToEntityName(urn);
+          final Set<String> projectedAspects =
+              aspectNames == null
+                  ? opContext.getEntityAspectNames(entityName)
+                  : new HashSet<>(Arrays.asList(aspectNames));
+          try {
+            EntityResponse response =
+                _entityService.getEntityV2(
+                    opContext,
+                    entityName,
+                    urn,
+                    projectedAspects,
+                    alwaysIncludeKeyAspect == null || alwaysIncludeKeyAspect);
+            // getEntityV2 returns null for some empty-projection requests (e.g. an explicit
+            // aspects=List()) rather than treating empty as "fetch everything" the way the legacy
+            // getEntity does. Map.of rejects null values, so this must be skipped for a null
+            // response instead of unconditionally redacting.
+            if (response != null) {
+              EntityAuthorizationUtils.completelyRedactUnauthorizedQuerySqlAspects(
+                  opContext, Map.of(urn, response));
+            }
+            return SensitiveAspectAuthUtil.omitUnauthorizedAspects(opContext, response);
+          } catch (Exception e) {
+            throw new RuntimeException(
+                String.format(
+                    "Failed to get entity with urn: %s, aspects: %s", urn, projectedAspects),
+                e);
+          }
+        },
+        MetricRegistry.name(this.getClass(), "get"));
+  }
+
+  @RestMethod.BatchGet
+  @Nonnull
+  @WithSpan
+  public Task<Map<Urn, EntityResponse>> batchGet(
+      @Nonnull Set<String> urnStrs,
+      @QueryParam(PARAM_ASPECTS) @Optional @Nullable String[] aspectNames,
+      @QueryParam(PARAM_ALWAYS_INCLUDE_KEY_ASPECT) @Optional @Nullable Boolean alwaysIncludeKeyAspect)
+      throws URISyntaxException {
+    log.debug("BATCH GET V2 {}", urnStrs);
+    final Set<Urn> urns = new HashSet<>();
+    for (final String urnStr : urnStrs) {
+      urns.add(Urn.createFromString(urnStr));
+    }
+
+      final Authentication auth = AuthenticationContext.getAuthentication();
+    final OperationContext opContext = RestliUtils.asSession(
+            systemOperationContext, RequestContext.builder().buildRestli(auth.getActor().toUrnStr(), getContext(),
+                    "getEntityV2", urns.stream().map(Urn::getEntityType).collect(Collectors.toList())).withUsageOperation(UsageOperation.METADATA_READ), _authorizer, auth, true);
+
+    if (!isAuthorizedToReadEntities(opContext, urns)) {
+      throw new RestLiServiceException(
+          HttpStatus.S_403_FORBIDDEN, "User is unauthorized to get entities " + urnStrs);
+    }
+
+      if (urns.size() <= 0) {
+      return Task.value(Collections.emptyMap());
+    }
+    final String entityName = urnToEntityName(urns.iterator().next());
+    return RestliUtils.toTask(opContext,
+        () -> {
+          final Set<String> projectedAspects =
+              aspectNames == null
+                  ? opContext.getEntityAspectNames(entityName)
+                  : new HashSet<>(Arrays.asList(aspectNames));
+          try {
+            Map<Urn, EntityResponse> response =
+                _entityService.getEntitiesV2(
+                    opContext,
+                    entityName,
+                    urns,
+                    projectedAspects,
+                    alwaysIncludeKeyAspect == null || alwaysIncludeKeyAspect);
+            EntityAuthorizationUtils.completelyRedactUnauthorizedQuerySqlAspects(opContext, response);
+            return SensitiveAspectAuthUtil.omitUnauthorizedAspects(opContext, response);
+          } catch (Exception e) {
+            throw new RuntimeException(
+                String.format(
+                    "Failed to batch get entities with urns: %s, projectedAspects: %s",
+                    urns, projectedAspects),
+                e);
+          }
+        },
+        MetricRegistry.name(this.getClass(), "batchGet"));
+  }
+
+  /**
+   * Delegates to the shared {@link
+   * com.linkedin.metadata.authorization.EntityAuthorizationUtils#isAPIAuthorizedEntityUrns} check,
+   * which now partitions query entities and enforces subject-derived {@code VIEW_ENTITY_QUERIES}
+   * authorization for READ (governed by the REST API authorization setting), alongside the
+   * document/schema-field specializations and standard Rest.li READ checks for other types.
+   */
+  private static boolean isAuthorizedToReadEntities(
+      @Nonnull OperationContext opContext, @Nonnull Collection<Urn> urns) {
+    return isAPIAuthorizedEntityUrns(opContext, READ, urns);
+  }
+}

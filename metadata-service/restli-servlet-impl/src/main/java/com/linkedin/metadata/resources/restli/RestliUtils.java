@@ -1,0 +1,200 @@
+package com.linkedin.metadata.resources.restli;
+
+import com.codahale.metrics.MetricRegistry;
+import com.datahub.util.exception.DatabaseTransactionConflictException;
+import com.datahub.authentication.Authentication;
+import com.datahub.plugins.auth.authorization.Authorizer;
+import com.linkedin.metadata.dao.throttle.APIThrottleException;
+import com.linkedin.metadata.dao.throttle.DatabaseTransactionConflictRestLiServiceException;
+import com.linkedin.metadata.dao.throttle.ThrottledRestLiServiceException;
+import com.linkedin.metadata.graph.LineageTimeoutException;
+import com.linkedin.metadata.restli.NonExceptionHttpErrorResponse;
+import com.linkedin.metadata.utils.metrics.MetricUtils;
+import com.linkedin.parseq.Task;
+import com.linkedin.restli.common.HttpStatus;
+import com.linkedin.restli.server.RestLiServiceException;
+import io.datahubproject.metadata.context.OperationContext;
+import io.datahubproject.metadata.context.RequestContext;
+import io.datahubproject.metadata.exception.ActorAccessException;
+import java.util.Optional;
+import java.util.function.Supplier;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+
+public class RestliUtils {
+
+  private RestliUtils() {
+    // Utils class
+  }
+
+  /**
+   * Executes the provided supplier and convert the results to a {@link Task}. Exceptions thrown
+   * during the execution will be properly wrapped in {@link RestLiServiceException}.
+   *
+   * @param supplier The supplier to execute
+   * @return A parseq {@link Task}
+   */
+  @Nonnull
+  public static <T> Task<T> toTask(@Nonnull Supplier<T> supplier) {
+    try {
+      return Task.value(supplier.get());
+    } catch (Throwable throwable) {
+
+      final RestLiServiceException finalException;
+
+      // Convert IllegalArgumentException to BAD REQUEST
+      if (throwable instanceof IllegalArgumentException
+          || throwable.getCause() instanceof IllegalArgumentException) {
+        finalException = badRequestException(throwable.getMessage());
+      } else if (throwable instanceof ActorAccessException) {
+        finalException = forbidden(throwable.getMessage());
+      } else if (throwable.getCause() instanceof ActorAccessException) {
+        finalException = forbidden(throwable.getCause().getMessage());
+      } else if (throwable instanceof APIThrottleException apiThrottleException) {
+        finalException = apiThrottled(apiThrottleException);
+      } else {
+        DatabaseTransactionConflictException conflict =
+            findCause(throwable, DatabaseTransactionConflictException.class);
+        LineageTimeoutException lineageTimeout =
+            conflict == null ? findCause(throwable, LineageTimeoutException.class) : null;
+        if (conflict != null) {
+          finalException = databaseTransactionConflict(conflict);
+        } else if (lineageTimeout != null) {
+          // Same classification as the GraphQL DEADLINE_EXCEEDED mapping, so SDK/CLI callers can
+          // tell a graph-query deadline from an outage (clients already retry 500 and 504 alike).
+          finalException =
+              new RestLiServiceException(
+                  HttpStatus.S_504_GATEWAY_TIMEOUT, lineageTimeout.getMessage(), lineageTimeout);
+        } else if (throwable instanceof RestLiServiceException) {
+          finalException = (RestLiServiceException) throwable;
+        } else {
+          finalException =
+              new RestLiServiceException(HttpStatus.S_500_INTERNAL_SERVER_ERROR, throwable);
+        }
+      }
+
+      throw finalException;
+    }
+  }
+
+
+  @Nonnull
+  private static RestLiServiceException databaseTransactionConflict(
+      @Nonnull DatabaseTransactionConflictException conflict) {
+    // RestLiServiceException has no setHeader(); Retry-After is exposed via
+    // DatabaseTransactionConflictRestLiServiceException.getResponseHeaders() and applied by
+    // RestliThrottleResponseFilter (same pattern as ThrottledRestLiServiceException).
+    return new DatabaseTransactionConflictRestLiServiceException(conflict);
+  }
+
+  @Nullable
+  private static <T extends Throwable> T findCause(
+      @Nonnull Throwable throwable, @Nonnull Class<T> type) {
+    Throwable current = throwable;
+    while (current != null) {
+      if (type.isInstance(current)) {
+        return type.cast(current);
+      }
+      current = current.getCause();
+    }
+    return null;
+  }
+
+  @Nonnull
+  public static <T> Task<T> toTask(@Nonnull OperationContext opContext, @Nonnull Supplier<T> supplier, String metricName) {
+    return opContext.withSpan(metricName, () -> {
+      // Stop timer on success and failure
+      return toTask(supplier)
+              .transform(
+                      orig -> {
+                        if (orig.isFailed()) {
+                          opContext.getMetricUtils().ifPresent(metricUtils -> metricUtils.increment(MetricRegistry.name(metricName, "failed"),1 ));
+                        } else {
+                          opContext.getMetricUtils().ifPresent(metricUtils -> metricUtils.increment(MetricRegistry.name(metricName, "success"),1 ));
+                        }
+                        return orig;
+                      });
+    }, MetricUtils.DROPWIZARD_METRIC, "true");
+  }
+
+  /**
+   * Builds a request-scoped session {@link OperationContext} at the Rest.li resource boundary and
+   * maps {@link ActorAccessException} (inactive/denied actor) to a 403, matching the HTTP semantics
+   * that {@link #toTask(Supplier)} already applies for exceptions thrown inside the supplier.
+   *
+   * <p>Call on the Rest.li request thread (typically before {@link #toTask}). The 403 is thrown
+   * directly on the calling thread so Rest.li maps it to the response; it is not wrapped as a failed
+   * Task.
+   */
+  @Nonnull
+  public static OperationContext asSession(
+      @Nonnull OperationContext systemOperationContext,
+      @Nonnull RequestContext.RequestContextBuilder requestContext,
+      @Nonnull Authorizer authorizer,
+      @Nonnull Authentication sessionAuthentication,
+      boolean allowSystemAuthentication) {
+    try {
+      return OperationContext.asSession(
+          systemOperationContext,
+          requestContext,
+          authorizer,
+          sessionAuthentication,
+          allowSystemAuthentication);
+    } catch (ActorAccessException e) {
+      throw forbidden(e.getMessage());
+    }
+  }
+
+  /**
+   * Similar to {@link #toTask(Supplier)} but the supplier is expected to return an {@link Optional}
+   * instead. A {@link RestLiServiceException} with 404 HTTP status code will be thrown if the
+   * optional is emtpy.
+   *
+   * @param supplier The supplier to execute
+   * @return A parseq {@link Task}
+   */
+  @Nonnull
+  public static <T> Task<T> toTaskFromOptional(@Nonnull Supplier<Optional<T>> supplier) {
+    return toTask(() -> supplier.get().orElseThrow(RestliUtils::resourceNotFoundException));
+  }
+
+  @Nonnull
+  public static RestLiServiceException resourceNotFoundException() {
+    return resourceNotFoundException(null);
+  }
+
+  @Nonnull
+  public static RestLiServiceException nonExceptionResourceNotFound() {
+    return new NonExceptionHttpErrorResponse(HttpStatus.S_404_NOT_FOUND);
+  }
+
+  @Nonnull
+  public static RestLiServiceException resourceNotFoundException(@Nullable String message) {
+    return new RestLiServiceException(HttpStatus.S_404_NOT_FOUND, message);
+  }
+
+  @Nonnull
+  public static RestLiServiceException badRequestException(@Nullable String message) {
+    return new RestLiServiceException(HttpStatus.S_400_BAD_REQUEST, message);
+  }
+
+  @Nonnull
+  public static RestLiServiceException invalidArgumentsException(@Nullable String message) {
+    return new RestLiServiceException(HttpStatus.S_412_PRECONDITION_FAILED, message);
+  }
+
+  @Nonnull
+  public static RestLiServiceException apiThrottled(@Nonnull APIThrottleException throttleException) {
+    return new ThrottledRestLiServiceException(throttleException);
+  }
+
+  @Nonnull
+  public static RestLiServiceException apiThrottled(@Nullable String message) {
+    return new RestLiServiceException(HttpStatus.S_429_TOO_MANY_REQUESTS, message);
+  }
+
+  @Nonnull
+  public static RestLiServiceException forbidden(@Nullable String message) {
+    return new RestLiServiceException(HttpStatus.S_403_FORBIDDEN, message);
+  }
+}

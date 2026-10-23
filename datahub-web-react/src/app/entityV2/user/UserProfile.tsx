@@ -1,0 +1,237 @@
+import { BookOpen } from '@phosphor-icons/react/dist/csr/BookOpen';
+import { Col } from 'antd';
+import React, { useContext, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { matchPath } from 'react-router';
+import { useLocation } from 'react-router-dom';
+import styled from 'styled-components';
+
+import { EntityContext } from '@app/entity/shared/EntityContext';
+import { GenericEntityProperties } from '@app/entity/shared/types';
+import {
+    StyledEntitySidebarContainer,
+    StyledSidebar,
+} from '@app/entityV2/shared/containers/profile/sidebar/EntityProfileSidebar';
+import EntitySidebarSectionsTab from '@app/entityV2/shared/containers/profile/sidebar/EntitySidebarSectionsTab';
+import { EntitySidebarTabs } from '@app/entityV2/shared/containers/profile/sidebar/EntitySidebarTabs';
+import SidebarCollapsibleHeader from '@app/entityV2/shared/containers/profile/sidebar/SidebarCollapsibleHeader';
+import { UserAssets } from '@app/entityV2/user/UserAssets';
+import UserGroups from '@app/entityV2/user/UserGroups';
+import UserSideBar from '@app/entityV2/user/UserSidebar';
+import useGetUserGroupUrns from '@app/entityV2/user/useGetUserGroupUrns';
+import { AlchemyRoutedTabs } from '@app/sharedV2/AlchemyRoutedTabs';
+import CompactContext from '@app/sharedV2/CompactContext';
+import { EntityHead } from '@app/sharedV2/EntityHead';
+import EntitySidebarContext from '@app/sharedV2/EntitySidebarContext';
+import { ErrorSection } from '@app/sharedV2/error/ErrorSection';
+import { useEntityRegistry } from '@app/useEntityRegistry';
+import { PageRoutes } from '@conf/Global';
+import { useShowNavBarRedesign } from '@src/app/useShowNavBarRedesign';
+
+import { useGetUserOwnedAssetsQuery, useGetUserQuery } from '@graphql/user.generated';
+import { EntityRelationship, EntityType } from '@types';
+
+interface Props {
+    urn: string;
+}
+
+enum TabType {
+    /* untranslated-text -- enum doubles as route path + identity key */
+    Assets = 'Owner Of',
+    /* untranslated-text -- enum doubles as route path + identity key */
+    Groups = 'Groups',
+}
+
+const ENABLED_TAB_TYPES = [TabType.Assets, TabType.Groups];
+
+const GROUP_PAGE_SIZE = 20;
+
+const defaultTabDisplayConfig = {
+    visible: (_, _1) => true,
+    enabled: (_, _1) => true,
+};
+
+/**
+ * Styled Components
+ */
+const UserProfileWrapper = styled.div<{ $isShowNavBarRedesign?: boolean }>`
+    background-color: ${(props) => props.theme.colors.bg};
+    height: 100%;
+    overflow: hidden;
+    display: flex;
+
+    ${(props) =>
+        props.$isShowNavBarRedesign &&
+        `
+        box-shadow: ${props.theme.colors.shadowNavbar};
+        margin: 5px;
+    `}
+    border-radius: ${(props) =>
+        props.$isShowNavBarRedesign ? props.theme.styles['border-radius-navbar-redesign'] : '8px'};
+`;
+
+const ContentContainer = styled.div<{ isVisible: boolean }>`
+    flex: 1;
+    ${(props) => props.isVisible && `border-right: 1px solid ${props.theme.colors.border};`}
+    overflow: inherit;
+`;
+
+const TabsContainer = styled.div``;
+
+const Tabs = styled.div``;
+
+const SidebarColumn = styled(Col)`
+    height: 100%;
+    overflow: auto;
+`;
+
+const ContentColumn = styled(Col)`
+    border-left: 1px solid ${(props) => props.theme.colors.border};
+    height: 100%;
+    padding: 8px 16px;
+`;
+
+/**
+ * Responsible for reading & writing users.
+ */
+export default function UserProfile({ urn }: Props) {
+    const { t } = useTranslation('entity.types');
+    const isShowNavBarRedesign = useShowNavBarRedesign();
+    const entityRegistry = useEntityRegistry();
+    const location = useLocation();
+    const isCompact = React.useContext(CompactContext);
+    const isInSearch = matchPath(location.pathname, PageRoutes.SEARCH_RESULTS) !== null;
+
+    const { error, data, loading, refetch } = useGetUserQuery({ variables: { urn, groupsCount: GROUP_PAGE_SIZE } });
+
+    const corpUser = data?.corpUser;
+
+    const userGroups: Array<EntityRelationship> =
+        corpUser?.groups?.relationships?.map((relationship) => relationship as EntityRelationship) || [];
+    const totalRelationships = corpUser?.groups?.total || 0;
+    const userRoles: Array<EntityRelationship> =
+        corpUser?.roles?.relationships?.map((relationship) => relationship as EntityRelationship) || [];
+
+    const { groupUrns } = useGetUserGroupUrns(urn);
+
+    const { data: userOwnedAsset } = useGetUserOwnedAssetsQuery({ variables: { urns: [urn, ...groupUrns] } });
+    // Routed Tabs Constants
+    const getTabs = () => {
+        return [
+            {
+                name: t('user.tab.ownerOf'),
+                path: TabType.Assets.toLocaleLowerCase(),
+                content: <UserAssets urn={urn} />,
+                display: {
+                    enabled: () => true,
+                },
+            },
+            {
+                name: t('user.tab.groups'),
+                path: TabType.Groups.toLocaleLowerCase(),
+                content: (
+                    <UserGroups
+                        urn={urn}
+                        initialRelationships={userGroups}
+                        pageSize={GROUP_PAGE_SIZE}
+                        totalRelationships={totalRelationships}
+                    />
+                ),
+                display: {
+                    enabled: () => userGroups?.length > 0,
+                },
+            },
+        ].filter((tab) => ENABLED_TAB_TYPES.some((tabType) => tabType.toLocaleLowerCase() === tab.path));
+    };
+    const defaultTabPath = getTabs() && getTabs()?.length > 0 ? getTabs()[0].path : '';
+    const onTabChange = () => null;
+
+    const displayName =
+        data?.corpUser?.editableProperties?.displayName ||
+        (data?.corpUser && entityRegistry.getDisplayName(EntityType.CorpUser, data?.corpUser)) ||
+        undefined;
+
+    // Side bar data
+    const sidebarData = {
+        photoUrl: data?.corpUser?.editableProperties?.pictureLink || undefined,
+        avatarName:
+            data?.corpUser?.editableProperties?.displayName ||
+            data?.corpUser?.info?.displayName ||
+            data?.corpUser?.info?.fullName ||
+            data?.corpUser?.urn,
+        name: displayName,
+        role: data?.corpUser?.editableProperties?.title || data?.corpUser?.info?.title || undefined,
+        team: data?.corpUser?.editableProperties?.teams?.join(',') || data?.corpUser?.info?.departmentName || undefined,
+        email: data?.corpUser?.editableProperties?.email || data?.corpUser?.info?.email || undefined,
+        slack: data?.corpUser?.editableProperties?.slack || undefined,
+        phone: data?.corpUser?.editableProperties?.phone || undefined,
+        aboutText: data?.corpUser?.editableProperties?.aboutMe || undefined,
+        groupsDetails: userGroups,
+        dataHubRoles: userRoles,
+        ownershipResults: userOwnedAsset?.searchAcrossEntities || undefined,
+        urn,
+    };
+
+    const finalTabs = [
+        {
+            name: t('tab.about'),
+            icon: BookOpen,
+            component: EntitySidebarSectionsTab,
+            display: {
+                ...defaultTabDisplayConfig,
+            },
+        },
+    ];
+
+    const [selectedTabName, setSelectedTabName] = useState(finalTabs[0].name);
+    const selectedTab = finalTabs.find((tab) => tab.name === selectedTabName);
+    const { width, isClosed } = useContext(EntitySidebarContext);
+
+    if (isCompact) {
+        return (
+            <StyledEntitySidebarContainer isCollapsed={isClosed} $width={width} isFocused={isInSearch}>
+                <StyledSidebar isCard={isInSearch} isFocused={isInSearch}>
+                    <ContentContainer isVisible={!isClosed}>
+                        <SidebarCollapsibleHeader currentTab={selectedTab} />
+                        {!isClosed && <UserSideBar sidebarData={sidebarData} refetch={refetch} />}
+                    </ContentContainer>
+                    <TabsContainer>
+                        <Tabs>
+                            <EntitySidebarTabs
+                                tabs={finalTabs}
+                                selectedTab={selectedTab}
+                                onSelectTab={(name) => setSelectedTabName(name)}
+                            />
+                        </Tabs>
+                    </TabsContainer>
+                </StyledSidebar>
+            </StyledEntitySidebarContainer>
+        );
+    }
+
+    return (
+        <EntityContext.Provider
+            value={{
+                urn,
+                loading,
+                refetch,
+                entityType: EntityType.CorpUser,
+                entityData: (data?.corpUser ?? null) as GenericEntityProperties | null,
+                routeToTab: () => {},
+                dataNotCombinedWithSiblings: null,
+                baseEntity: null,
+            }}
+        >
+            <EntityHead />
+            {error && <ErrorSection />}
+            <UserProfileWrapper $isShowNavBarRedesign={isShowNavBarRedesign}>
+                <SidebarColumn xl={7} lg={7} md={7} sm={24} xs={24}>
+                    <UserSideBar sidebarData={sidebarData} refetch={refetch} />
+                </SidebarColumn>
+                <ContentColumn xl={17} lg={17} md={17} sm={24} xs={24}>
+                    <AlchemyRoutedTabs defaultPath={defaultTabPath} tabs={getTabs()} onTabChange={onTabChange} />
+                </ContentColumn>
+            </UserProfileWrapper>
+        </EntityContext.Provider>
+    );
+}

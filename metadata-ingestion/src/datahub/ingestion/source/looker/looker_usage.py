@@ -1,0 +1,950 @@
+# This module is written on the basis of below requirement
+#     1) Entity absolute stat
+#     2) Entity timeseries stat
+#     3) Entity timeseries stat by user
+
+import concurrent
+import concurrent.futures
+import dataclasses
+import datetime
+import json as json_module
+import logging
+import re
+from abc import ABC, abstractmethod
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, cast
+
+from looker_sdk.sdk.api40.models import Dashboard, LookWithQuery
+
+from datahub.emitter.mce_builder import Aspect
+from datahub.emitter.mcp import MetadataChangeProposalWrapper
+from datahub.ingestion.source.looker import looker_common
+from datahub.ingestion.source.looker.looker_common import (
+    LookerDashboardSourceReport,
+    LookerUser,
+    LookerUserRegistry,
+)
+from datahub.ingestion.source.looker.looker_lib_wrapper import LookerAPI
+from datahub.ingestion.source.looker.looker_query_model import (
+    HistoryViewField,
+    LookerExplore,
+    LookerModel,
+    LookerQuery,
+    LookViewField,
+    QueryViewField,
+    StrEnum,
+    UserViewField,
+    ViewField,
+)
+from datahub.metadata.schema_classes import (
+    CalendarIntervalClass,
+    ChartUsageStatisticsClass,
+    ChartUserUsageCountsClass,
+    DashboardUsageStatisticsClass,
+    DashboardUserUsageCountsClass,
+    DatasetFieldUsageCountsClass,
+    DatasetUsageStatisticsClass,
+    DatasetUserUsageCountsClass,
+    TimeWindowSizeClass,
+    _Aspect as AspectAbstract,
+)
+from datahub.utilities.lossy_collections import LossySet
+
+logger = logging.getLogger(__name__)
+
+_QUERY_FIELDS_SPLIT_RE = re.compile(r"[,\n]")
+
+
+@dataclass
+class ModelForUsage:
+    id: Optional[str]
+
+
+@dataclass
+class LookerChartForUsage(ModelForUsage):
+    view_count: Optional[int]
+
+    @classmethod
+    def from_chart(cls, chart: LookWithQuery) -> "LookerChartForUsage":
+        return cls(id=str(chart.id) if chart.id else None, view_count=chart.view_count)
+
+
+@dataclass
+class LookerDashboardForUsage(ModelForUsage):
+    view_count: Optional[int]
+    favorite_count: Optional[int]
+    last_viewed_at: Optional[int]
+    looks: List[LookerChartForUsage] = dataclasses.field(default_factory=list)
+
+    @classmethod
+    def from_dashboard(cls, dashboard: Dashboard) -> "LookerDashboardForUsage":
+        return cls(
+            id=dashboard.id,
+            view_count=dashboard.view_count,
+            favorite_count=dashboard.favorite_count,
+            last_viewed_at=(
+                round(dashboard.last_viewed_at.timestamp() * 1000)
+                if dashboard.last_viewed_at
+                else None
+            ),
+            looks=(
+                [
+                    LookerChartForUsage.from_chart(e.look)
+                    for e in dashboard.dashboard_elements
+                    if e.look is not None
+                ]
+                if dashboard.dashboard_elements
+                else []
+            ),
+        )
+
+
+@dataclass
+class LookerExploreForUsage(ModelForUsage):
+    # An explore is identified in System Activity by (model, name); `id` holds
+    # the composite key so the base generator's id/urn plumbing works unchanged.
+    model_name: str
+    name: str
+
+
+@dataclass
+class StatGeneratorConfig:
+    looker_api_wrapper: LookerAPI
+    looker_user_registry: LookerUserRegistry
+    strip_user_ids_from_email: bool
+    interval: str
+    max_threads: int = 1
+
+
+# QueryId and query_collection helps to return dummy responses in test cases
+# Filter syntax reference: https://docs.cloud.google.com/looker/docs/filter-expressions
+# String fields use "-NULL" for is-not-null; numeric fields use "NOT NULL".
+class QueryId(StrEnum):
+    DASHBOARD_PER_DAY_USAGE_STAT = "counts_per_day_per_dashboard"
+    DASHBOARD_PER_USER_PER_DAY_USAGE_STAT = "counts_per_day_per_user_per_dashboard"
+    LOOK_PER_DAY_USAGE_STAT = "counts_per_day_per_look"
+    LOOK_PER_USER_PER_DAY_USAGE_STAT = "counts_per_day_per_user_per_look"
+    EXPLORE_PER_DAY_USAGE_STAT = "counts_per_day_per_explore"
+    EXPLORE_PER_USER_PER_DAY_USAGE_STAT = "counts_per_day_per_user_per_explore"
+    EXPLORE_PER_FIELD_PER_DAY_USAGE_STAT = "counts_per_day_per_field_per_explore"
+
+
+query_collection: Dict[QueryId, LookerQuery] = {
+    QueryId.DASHBOARD_PER_DAY_USAGE_STAT: LookerQuery(
+        model=LookerModel.SYSTEM_ACTIVITY,
+        explore=LookerExplore.HISTORY,
+        fields=[
+            HistoryViewField.HISTORY_DASHBOARD_ID,
+            HistoryViewField.HISTORY_CREATED_DATE,
+            HistoryViewField.HISTORY_DASHBOARD_USER,
+            HistoryViewField.HISTORY_DASHBOARD_RUN_COUNT,
+        ],
+    ),
+    QueryId.DASHBOARD_PER_USER_PER_DAY_USAGE_STAT: LookerQuery(
+        model=LookerModel.SYSTEM_ACTIVITY,
+        explore=LookerExplore.HISTORY,
+        fields=[
+            HistoryViewField.HISTORY_CREATED_DATE,
+            HistoryViewField.HISTORY_DASHBOARD_ID,
+            HistoryViewField.HISTORY_DASHBOARD_RUN_COUNT,
+            UserViewField.USER_ID,
+        ],
+    ),
+    QueryId.LOOK_PER_DAY_USAGE_STAT: LookerQuery(
+        model=LookerModel.SYSTEM_ACTIVITY,
+        explore=LookerExplore.HISTORY,
+        fields=[
+            HistoryViewField.HISTORY_CREATED_DATE,
+            HistoryViewField.HISTORY_COUNT,
+            LookViewField.LOOK_ID,
+        ],
+        filters={
+            LookViewField.LOOK_ID: "NOT NULL",
+        },
+    ),
+    QueryId.LOOK_PER_USER_PER_DAY_USAGE_STAT: LookerQuery(
+        model=LookerModel.SYSTEM_ACTIVITY,
+        explore=LookerExplore.HISTORY,
+        fields=[
+            HistoryViewField.HISTORY_CREATED_DATE,
+            HistoryViewField.HISTORY_COUNT,
+            LookViewField.LOOK_ID,
+            UserViewField.USER_ID,
+        ],
+        filters={
+            LookViewField.LOOK_ID: "NOT NULL",
+        },
+    ),
+    QueryId.EXPLORE_PER_DAY_USAGE_STAT: LookerQuery(
+        model=LookerModel.SYSTEM_ACTIVITY,
+        explore=LookerExplore.HISTORY,
+        fields=[
+            HistoryViewField.HISTORY_CREATED_DATE,
+            HistoryViewField.HISTORY_COUNT,
+            QueryViewField.QUERY_MODEL,
+            QueryViewField.QUERY_VIEW,
+        ],
+        filters={
+            QueryViewField.QUERY_VIEW: "-NULL",
+        },
+    ),
+    QueryId.EXPLORE_PER_USER_PER_DAY_USAGE_STAT: LookerQuery(
+        model=LookerModel.SYSTEM_ACTIVITY,
+        explore=LookerExplore.HISTORY,
+        fields=[
+            HistoryViewField.HISTORY_CREATED_DATE,
+            HistoryViewField.HISTORY_COUNT,
+            QueryViewField.QUERY_MODEL,
+            QueryViewField.QUERY_VIEW,
+            UserViewField.USER_ID,
+        ],
+        filters={
+            QueryViewField.QUERY_VIEW: "-NULL",
+        },
+    ),
+    # Kept separate from the per-day explore query: adding query.fields would
+    # fragment the (model, view, date) grouping that feeds totalSqlQueries.
+    # Rows here are exploded client-side into per-field counts.
+    QueryId.EXPLORE_PER_FIELD_PER_DAY_USAGE_STAT: LookerQuery(
+        model=LookerModel.SYSTEM_ACTIVITY,
+        explore=LookerExplore.HISTORY,
+        fields=[
+            HistoryViewField.HISTORY_CREATED_DATE,
+            HistoryViewField.HISTORY_COUNT,
+            QueryViewField.QUERY_MODEL,
+            QueryViewField.QUERY_VIEW,
+            QueryViewField.QUERY_FIELDS,
+        ],
+        filters={
+            QueryViewField.QUERY_VIEW: "-NULL",
+            QueryViewField.QUERY_FIELDS: "-NULL",
+        },
+    ),
+}
+
+
+class BaseStatGenerator(ABC):
+    """
+    A Template class to encapsulate looker stat processing
+    """
+
+    def __init__(
+        self,
+        config: StatGeneratorConfig,
+        looker_models: Sequence[ModelForUsage],
+        report: LookerDashboardSourceReport,
+    ):
+        self.config = config
+        self.looker_models = looker_models
+        # Later it will help to find out for what are the looker entities from query result
+        self.id_to_model: Dict[str, ModelForUsage] = {
+            self.get_id(looker_object): looker_object for looker_object in looker_models
+        }
+        self.post_filter = len(self.looker_models) > 100
+        self.report = report
+
+    @abstractmethod
+    def get_stats_generator_name(self) -> str:
+        """All implementing classes should provide a name identifying them"""
+        pass
+
+    @abstractmethod
+    def get_entity_timeseries_query(self) -> LookerQuery:
+        pass
+
+    @abstractmethod
+    def get_entity_user_timeseries_query(self) -> LookerQuery:
+        pass
+
+    @abstractmethod
+    def get_filter(self) -> Dict[ViewField, str]:
+        pass
+
+    @abstractmethod
+    def to_entity_absolute_stat_aspect(
+        self, looker_object: ModelForUsage
+    ) -> AspectAbstract:
+        pass
+
+    @abstractmethod
+    def to_entity_timeseries_stat_aspect(self, row: Dict) -> AspectAbstract:
+        pass
+
+    @abstractmethod
+    def get_entity_stat_key(self, row: Dict) -> Tuple[str, str]:
+        pass
+
+    @abstractmethod
+    def _get_urn(self, model: ModelForUsage) -> str:
+        pass
+
+    @abstractmethod
+    def append_user_stat(
+        self, entity_stat_aspect: Aspect, user: LookerUser, row: Dict
+    ) -> None:
+        pass
+
+    @abstractmethod
+    def get_id(self, looker_object: ModelForUsage) -> str:
+        pass
+
+    @abstractmethod
+    def get_id_from_row(self, row: dict) -> str:
+        pass
+
+    @abstractmethod
+    def report_skip_set(self) -> LossySet[str]:
+        pass
+
+    def create_mcp(
+        self, model: ModelForUsage, aspect: Aspect
+    ) -> MetadataChangeProposalWrapper:
+        return MetadataChangeProposalWrapper(
+            entityUrn=self._get_urn(model=model),
+            aspect=aspect,
+        )
+
+    def _round_time(self, date_time: str) -> int:
+        return round(
+            datetime.datetime.strptime(date_time, "%Y-%m-%d")
+            .replace(tzinfo=datetime.timezone.utc)
+            .timestamp()
+            * 1000
+        )
+
+    def _get_user_identifier(self, row: Dict) -> str:
+        return row[UserViewField.USER_ID]
+
+    def _process_entity_timeseries_rows(
+        self, rows: List[Dict]
+    ) -> Dict[Tuple[str, str], AspectAbstract]:
+        # Convert Looker entity stat i.e. rows to DataHub stat aspect
+        entity_stat_aspect: Dict[Tuple[str, str], AspectAbstract] = {}
+
+        for row in rows:
+            logger.debug(row)
+            entity_stat_aspect[self.get_entity_stat_key(row)] = (
+                self.to_entity_timeseries_stat_aspect(row)
+            )
+
+        return entity_stat_aspect
+
+    def _fill_user_stat_aspect(
+        self,
+        entity_usage_stat: Dict[Tuple[str, str], Aspect],
+        user_wise_rows: List[Dict],
+    ) -> Iterable[Tuple[str, Aspect]]:
+        logger.debug("Entering fill user stat aspect")
+
+        # We first resolve all the users using a threadpool to warm up the cache
+        user_ids = {self._get_user_identifier(row) for row in user_wise_rows}
+        start_time = datetime.datetime.now()
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.config.max_threads
+        ) as async_executor:
+            user_futures = {
+                async_executor.submit(
+                    self.config.looker_user_registry.get_by_id, user_id
+                ): 1
+                for user_id in user_ids
+            }
+            for future in concurrent.futures.as_completed(user_futures):
+                logger.debug("User result: %s", future.result())
+                del user_futures[future]
+
+        user_resolution_latency = datetime.datetime.now() - start_time
+        logger.debug(
+            f"Resolved {len(user_ids)} in {user_resolution_latency.total_seconds()} seconds"
+        )
+        self.report.report_user_resolution_latency(
+            self.get_stats_generator_name(), user_resolution_latency
+        )
+
+        for row in user_wise_rows:
+            # Confirm looker object was given for stat generation
+            looker_object = self.id_to_model.get(self.get_id_from_row(row))
+            if looker_object is None:
+                logger.warning(
+                    "Looker object with id({}) was not register with stat generator".format(
+                        self.get_id_from_row(row)
+                    )
+                )
+                continue
+
+            # Confirm we do have user with user id
+            user: Optional[LookerUser] = self.config.looker_user_registry.get_by_id(
+                self._get_user_identifier(row)
+            )
+            if user is None:
+                logger.warning(
+                    f"Unable to resolve user with id {self._get_user_identifier(row)}, skipping"
+                )
+                continue
+
+            # Confirm for the user row (entity + time) the entity stat is present for the same time
+            entity_stat_aspect: Optional[Aspect] = entity_usage_stat.get(
+                self.get_entity_stat_key(row)
+            )
+            if entity_stat_aspect is None:
+                logger.warning(
+                    f"entity stat is not found for the row = {row}, in entity_stat = {entity_usage_stat}"
+                )
+                logger.warning(
+                    "entity stat is not found for the user stat key = {}".format(
+                        self.get_entity_stat_key(row)
+                    )
+                )
+                continue
+            self.append_user_stat(entity_stat_aspect, user, row)
+
+        logger.debug("Starting to yield answers for user-wise counts")
+
+        for (id, _), aspect in entity_usage_stat.items():
+            yield id, aspect
+
+    def _execute_query(self, query: LookerQuery, query_name: str) -> List[Dict]:
+        rows = []
+        try:
+            start_time = datetime.datetime.now()
+            rows = self.config.looker_api_wrapper.execute_query(
+                write_query=query.to_write_query()
+            )
+            end_time = datetime.datetime.now()
+
+            logger.debug(
+                f"{self.get_stats_generator_name()}: Retrieved {len(rows)} rows in {(end_time - start_time).total_seconds()} seconds"
+            )
+            self.report.report_query_latency(
+                f"{self.get_stats_generator_name()}:{query_name}", end_time - start_time
+            )
+            if self.post_filter:
+                logger.debug("post filtering")
+                rows = [r for r in rows if self.get_id_from_row(r) in self.id_to_model]
+                logger.debug("Filtered down to %d rows", len(rows))
+        except Exception as e:
+            logger.warning(f"Failed to execute {query_name} query: {e}")
+
+        return rows
+
+    def _append_filters(self, query: LookerQuery) -> LookerQuery:
+        query.filters.update(
+            {HistoryViewField.HISTORY_CREATED_DATE: self.config.interval}
+        )
+        if not self.post_filter:
+            query.filters.update(self.get_filter())
+        return query
+
+    def emits_absolute_stats(self) -> bool:
+        """Whether the source exposes an absolute usage snapshot for this entity.
+
+        Dashboards and looks expose absolute counters (view/favorite counts) in
+        Looker; explores do not (System Activity has no per-explore absolute
+        snapshot). Generators for such entities override this to emit only the
+        per-day timeseries + per-user stats.
+        """
+        return True
+
+    def _augment_entity_timeseries_aspects(
+        self, entity_usage_stat: Dict[Tuple[str, str], Any]
+    ) -> None:
+        """Hook for subclasses to enrich per-day entity aspects with extra
+        signals (keyed by the same ``get_entity_stat_key`` tuple).  No-op by
+        default so dashboards/looks are unaffected."""
+        return
+
+    def generate_usage_stat_mcps(self) -> Iterable[MetadataChangeProposalWrapper]:
+        # No looker entities available to process stat generation
+        if len(self.looker_models) == 0:
+            return
+
+        # yield absolute stat for looker entities
+        if self.emits_absolute_stats():
+            for looker_object in self.looker_models:
+                aspect = self.to_entity_absolute_stat_aspect(looker_object)
+                yield self.create_mcp(looker_object, aspect)
+
+        # Execute query and process the raw json which contains stat information
+        entity_query_with_filters: LookerQuery = self._append_filters(
+            self.get_entity_timeseries_query()
+        )
+        entity_rows: List[Dict] = self._execute_query(
+            entity_query_with_filters, "entity_query"
+        )
+        entity_usage_stat: Dict[Tuple[str, str], Any] = (
+            self._process_entity_timeseries_rows(entity_rows)
+        )  # Any type to pass mypy unbound Aspect type error
+
+        # Optional per-entity enrichment (e.g. explore field-usage counts).
+        # Default no-op; subclasses override to run extra queries.
+        self._augment_entity_timeseries_aspects(entity_usage_stat)
+
+        user_wise_query_with_filters: LookerQuery = self._append_filters(
+            self.get_entity_user_timeseries_query()
+        )
+        user_wise_rows = self._execute_query(user_wise_query_with_filters, "user_query")
+        # yield absolute stat for entity
+        for object_id, aspect in self._fill_user_stat_aspect(
+            entity_usage_stat, user_wise_rows
+        ):
+            if object_id in self.id_to_model:
+                yield self.create_mcp(self.id_to_model[object_id], aspect)
+            else:
+                self.report_skip_set().add(object_id)
+
+
+class DashboardStatGenerator(BaseStatGenerator):
+    def __init__(
+        self,
+        config: StatGeneratorConfig,
+        looker_dashboards: Sequence[LookerDashboardForUsage],
+        report: LookerDashboardSourceReport,
+        urn_builder: Callable[[str], str],
+    ):
+        super().__init__(
+            config,
+            looker_models=looker_dashboards,
+            report=report,
+        )
+        self.urn_builder = urn_builder
+        self.report = report
+        self.report.report_dashboards_scanned_for_usage(len(looker_dashboards))
+
+    def get_stats_generator_name(self) -> str:
+        return "DashboardStats"
+
+    def report_skip_set(self) -> LossySet[str]:
+        return self.report.dashboards_skipped_for_usage
+
+    def get_filter(self) -> Dict[ViewField, str]:
+        return {
+            HistoryViewField.HISTORY_DASHBOARD_ID: ",".join(
+                [
+                    looker_dashboard.id
+                    for looker_dashboard in self.looker_models
+                    if looker_dashboard.id is not None
+                ]
+            )
+        }
+
+    def get_id(self, looker_object: ModelForUsage) -> str:
+        if looker_object.id is None:
+            raise ValueError("Looker dashboard id is None")
+        return looker_object.id
+
+    def get_id_from_row(self, row: dict) -> str:
+        return str(row[HistoryViewField.HISTORY_DASHBOARD_ID])
+
+    def get_entity_stat_key(self, row: Dict) -> Tuple[str, str]:
+        self.report.dashboards_with_activity.add(
+            row[HistoryViewField.HISTORY_DASHBOARD_ID]
+        )
+        return (
+            row[HistoryViewField.HISTORY_DASHBOARD_ID],
+            row[HistoryViewField.HISTORY_CREATED_DATE],
+        )
+
+    def _get_urn(self, model: ModelForUsage) -> str:
+        assert isinstance(model, LookerDashboardForUsage)
+        assert model.id is not None
+
+        return self.urn_builder(looker_common.get_urn_looker_dashboard_id(model.id))
+
+    def to_entity_absolute_stat_aspect(
+        self, looker_object: ModelForUsage
+    ) -> DashboardUsageStatisticsClass:
+        looker_dashboard: LookerDashboardForUsage = cast(
+            LookerDashboardForUsage, looker_object
+        )
+        if looker_dashboard.view_count:
+            self.report.dashboards_with_activity.add(str(looker_dashboard.id))
+        return DashboardUsageStatisticsClass(
+            timestampMillis=round(datetime.datetime.now().timestamp() * 1000),
+            favoritesCount=looker_dashboard.favorite_count,
+            viewsCount=looker_dashboard.view_count,
+            lastViewedAt=looker_dashboard.last_viewed_at,
+        )
+
+    def get_entity_timeseries_query(self) -> LookerQuery:
+        return query_collection[QueryId.DASHBOARD_PER_DAY_USAGE_STAT]
+
+    def get_entity_user_timeseries_query(self) -> LookerQuery:
+        return query_collection[QueryId.DASHBOARD_PER_USER_PER_DAY_USAGE_STAT]
+
+    def to_entity_timeseries_stat_aspect(
+        self, row: dict
+    ) -> DashboardUsageStatisticsClass:
+        self.report.dashboards_with_activity.add(
+            row[HistoryViewField.HISTORY_DASHBOARD_ID]
+        )
+        return DashboardUsageStatisticsClass(
+            timestampMillis=self._round_time(
+                row[HistoryViewField.HISTORY_CREATED_DATE]
+            ),
+            eventGranularity=TimeWindowSizeClass(unit=CalendarIntervalClass.DAY),
+            uniqueUserCount=row[HistoryViewField.HISTORY_DASHBOARD_USER],
+            executionsCount=row[HistoryViewField.HISTORY_DASHBOARD_RUN_COUNT],
+        )
+
+    def append_user_stat(
+        self, entity_stat_aspect: Aspect, user: LookerUser, row: Dict
+    ) -> None:
+        dashboard_stat_aspect: DashboardUsageStatisticsClass = cast(
+            DashboardUsageStatisticsClass, entity_stat_aspect
+        )
+
+        if dashboard_stat_aspect.userCounts is None:
+            dashboard_stat_aspect.userCounts = []
+
+        user_urn: Optional[str] = user.get_urn(self.config.strip_user_ids_from_email)
+
+        if user_urn is None:
+            logger.warning(f"user_urn not found for the user {user}")
+            return
+
+        dashboard_stat_aspect.userCounts.append(
+            DashboardUserUsageCountsClass(
+                user=user_urn,
+                executionsCount=row[HistoryViewField.HISTORY_DASHBOARD_RUN_COUNT],
+                usageCount=row[HistoryViewField.HISTORY_DASHBOARD_RUN_COUNT],
+                userEmail=user.email,
+            )
+        )
+
+
+class LookStatGenerator(BaseStatGenerator):
+    def __init__(
+        self,
+        config: StatGeneratorConfig,
+        looker_looks: Sequence[LookerChartForUsage],
+        report: LookerDashboardSourceReport,
+        urn_builder: Callable[[str], str],
+    ):
+        super().__init__(
+            config,
+            looker_models=looker_looks,
+            report=report,
+        )
+        self.urn_builder = urn_builder
+        self.report = report
+        report.report_charts_scanned_for_usage(len(looker_looks))
+
+    def get_stats_generator_name(self) -> str:
+        return "ChartStats"
+
+    def report_skip_set(self) -> LossySet[str]:
+        return self.report.charts_skipped_for_usage
+
+    def get_filter(self) -> Dict[ViewField, str]:
+        return {
+            LookViewField.LOOK_ID: ",".join(
+                [look.id for look in self.looker_models if look.id is not None]
+            )
+        }
+
+    def get_id(self, looker_object: ModelForUsage) -> str:
+        look: LookerChartForUsage = cast(LookerChartForUsage, looker_object)
+        if (
+            look.id is None
+        ):  # This condition never become true, this check is to pass the mypy lint error
+            raise ValueError("Looker look model id is None")
+        return str(look.id)
+
+    def get_id_from_row(self, row: dict) -> str:
+        return str(row[LookViewField.LOOK_ID])
+
+    def get_entity_stat_key(self, row: Dict) -> Tuple[str, str]:
+        return (
+            str(row[LookViewField.LOOK_ID]),
+            row[HistoryViewField.HISTORY_CREATED_DATE],
+        )
+
+    def _get_urn(self, model: ModelForUsage) -> str:
+        assert isinstance(model, LookerChartForUsage)
+        assert model.id is not None
+
+        return self.urn_builder(looker_common.get_urn_looker_element_id(str(model.id)))
+
+    def to_entity_absolute_stat_aspect(
+        self, looker_object: ModelForUsage
+    ) -> ChartUsageStatisticsClass:
+        looker_look: LookerChartForUsage = cast(LookerChartForUsage, looker_object)
+        assert looker_look.id
+        if looker_look.view_count:
+            self.report.charts_with_activity.add(looker_look.id)
+
+        return ChartUsageStatisticsClass(
+            timestampMillis=round(datetime.datetime.now().timestamp() * 1000),
+            viewsCount=looker_look.view_count,
+        )
+
+    def get_entity_timeseries_query(self) -> LookerQuery:
+        return query_collection[QueryId.LOOK_PER_DAY_USAGE_STAT]
+
+    def get_entity_user_timeseries_query(self) -> LookerQuery:
+        return query_collection[QueryId.LOOK_PER_USER_PER_DAY_USAGE_STAT]
+
+    def to_entity_timeseries_stat_aspect(self, row: dict) -> ChartUsageStatisticsClass:
+        self.report.charts_with_activity.add(str(row[LookViewField.LOOK_ID]))
+
+        return ChartUsageStatisticsClass(
+            timestampMillis=self._round_time(
+                row[HistoryViewField.HISTORY_CREATED_DATE]
+            ),
+            eventGranularity=TimeWindowSizeClass(unit=CalendarIntervalClass.DAY),
+            viewsCount=row[HistoryViewField.HISTORY_COUNT],
+        )
+
+    def append_user_stat(
+        self, entity_stat_aspect: Aspect, user: LookerUser, row: Dict
+    ) -> None:
+        chart_stat_aspect: ChartUsageStatisticsClass = cast(
+            ChartUsageStatisticsClass, entity_stat_aspect
+        )
+
+        if chart_stat_aspect.userCounts is None:
+            chart_stat_aspect.userCounts = []
+
+        user_urn: Optional[str] = user.get_urn(self.config.strip_user_ids_from_email)
+
+        if user_urn is None:
+            logger.warning(f"user_urn not found for the user {user}")
+            return
+
+        chart_stat_aspect.userCounts.append(
+            ChartUserUsageCountsClass(
+                user=user_urn,
+                viewsCount=row[HistoryViewField.HISTORY_COUNT],
+            )
+        )
+
+
+class ExploreStatGenerator(BaseStatGenerator):
+    """Emits per-explore usage from Looker's System Activity `history` explore.
+
+    Unlike dashboards and looks, Looker exposes no absolute usage snapshot for an
+    explore, so this generator emits only the per-day timeseries stats (entity +
+    per-user).
+    """
+
+    def __init__(
+        self,
+        config: StatGeneratorConfig,
+        looker_explores: Sequence[LookerExploreForUsage],
+        report: LookerDashboardSourceReport,
+        source_config: looker_common.LookerCommonConfig,
+    ):
+        super().__init__(
+            config,
+            looker_models=looker_explores,
+            report=report,
+        )
+        self.source_config = source_config
+        report.report_explores_scanned_for_usage(len(looker_explores))
+
+    @staticmethod
+    def _stat_key(model: str, explore: str) -> str:
+        return f"{model}::{explore}"
+
+    def get_stats_generator_name(self) -> str:
+        return "ExploreStats"
+
+    def report_skip_set(self) -> LossySet[str]:
+        return self.report.explores_skipped_for_usage
+
+    def get_filter(self) -> Dict[ViewField, str]:
+        return {
+            QueryViewField.QUERY_VIEW: ",".join(
+                sorted(
+                    {
+                        explore.name
+                        for explore in cast(
+                            Sequence[LookerExploreForUsage], self.looker_models
+                        )
+                    }
+                )
+            )
+        }
+
+    def get_id(self, looker_object: ModelForUsage) -> str:
+        explore = cast(LookerExploreForUsage, looker_object)
+        return self._stat_key(explore.model_name, explore.name)
+
+    def get_id_from_row(self, row: dict) -> str:
+        return self._stat_key(
+            str(row[QueryViewField.QUERY_MODEL]),
+            str(row[QueryViewField.QUERY_VIEW]),
+        )
+
+    def get_entity_stat_key(self, row: Dict) -> Tuple[str, str]:
+        return (
+            self.get_id_from_row(row),
+            row[HistoryViewField.HISTORY_CREATED_DATE],
+        )
+
+    def _get_urn(self, model: ModelForUsage) -> str:
+        explore = cast(LookerExploreForUsage, model)
+        return looker_common.LookerExplore(
+            name=explore.name, model_name=explore.model_name
+        ).get_explore_urn(self.source_config)
+
+    def emits_absolute_stats(self) -> bool:
+        # Looker has no absolute usage snapshot for an explore (only the per-day
+        # timeseries from System Activity), so skip the absolute-stat MCP.
+        return False
+
+    def to_entity_absolute_stat_aspect(
+        self, looker_object: ModelForUsage
+    ) -> DatasetUsageStatisticsClass:
+        # Unreachable: emits_absolute_stats() is False, so the base template
+        # never requests an absolute-stat aspect for explores.
+        raise NotImplementedError
+
+    def get_entity_timeseries_query(self) -> LookerQuery:
+        return query_collection[QueryId.EXPLORE_PER_DAY_USAGE_STAT]
+
+    def get_entity_user_timeseries_query(self) -> LookerQuery:
+        return query_collection[QueryId.EXPLORE_PER_USER_PER_DAY_USAGE_STAT]
+
+    def to_entity_timeseries_stat_aspect(
+        self, row: dict
+    ) -> DatasetUsageStatisticsClass:
+        self.report.explores_with_activity.add(self.get_id_from_row(row))
+        return DatasetUsageStatisticsClass(
+            timestampMillis=self._round_time(
+                row[HistoryViewField.HISTORY_CREATED_DATE]
+            ),
+            eventGranularity=TimeWindowSizeClass(unit=CalendarIntervalClass.DAY),
+            totalSqlQueries=row[HistoryViewField.HISTORY_COUNT],
+            uniqueUserCount=0,
+            userCounts=[],
+        )
+
+    @staticmethod
+    def _parse_query_fields(raw_fields: object) -> List[str]:
+        # The Looker Query API model defines fields as Sequence[str].
+        # System Activity serialises it into a JSON array string
+        # (e.g. '["view.field", ...]') when returned as a dimension value.
+        if isinstance(raw_fields, str):
+            try:
+                parsed = json_module.loads(raw_fields)
+                if isinstance(parsed, list):
+                    return [str(t).strip() for t in parsed if str(t).strip()]
+            except (json_module.JSONDecodeError, ValueError):
+                pass
+            tokens = _QUERY_FIELDS_SPLIT_RE.split(raw_fields)
+        elif isinstance(raw_fields, list):
+            tokens = [str(t) for t in raw_fields]
+        else:
+            tokens = _QUERY_FIELDS_SPLIT_RE.split(str(raw_fields))
+        return [t.strip() for t in tokens if t.strip()]
+
+    def _augment_entity_timeseries_aspects(
+        self, entity_usage_stat: Dict[Tuple[str, str], Any]
+    ) -> None:
+        """Attach per-field usage (``query.fields``) to each per-day explore
+        aspect.  Each System Activity row is one ``(date, model, explore,
+        field-set)`` bucket with its execution count.  We explode each
+        field-set and sum the row's count into every field it names."""
+        field_query_with_filters: LookerQuery = self._append_filters(
+            query_collection[QueryId.EXPLORE_PER_FIELD_PER_DAY_USAGE_STAT]
+        )
+        # _execute_query handles exceptions internally and returns [] on failure.
+        field_rows = self._execute_query(field_query_with_filters, "field_query")
+
+        per_key_counts: Dict[Tuple[str, str], Dict[str, int]] = defaultdict(
+            lambda: defaultdict(int)
+        )
+        for row in field_rows:
+            raw_fields = row.get(QueryViewField.QUERY_FIELDS)
+            if not raw_fields:
+                continue
+            key = self.get_entity_stat_key(row)
+            count = row[HistoryViewField.HISTORY_COUNT]
+            for field_name in self._parse_query_fields(raw_fields):
+                per_key_counts[key][field_name] += count
+
+        for key, field_counts in per_key_counts.items():
+            aspect = entity_usage_stat.get(key)
+            if aspect is None:
+                continue
+            aspect.fieldCounts = [
+                DatasetFieldUsageCountsClass(fieldPath=field_name, count=count)
+                for field_name, count in sorted(field_counts.items())
+            ]
+
+    def append_user_stat(
+        self, entity_stat_aspect: Aspect, user: LookerUser, row: Dict
+    ) -> None:
+        explore_stat_aspect: DatasetUsageStatisticsClass = cast(
+            DatasetUsageStatisticsClass, entity_stat_aspect
+        )
+
+        if explore_stat_aspect.userCounts is None:
+            explore_stat_aspect.userCounts = []
+
+        user_urn: Optional[str] = user.get_urn(self.config.strip_user_ids_from_email)
+        if user_urn is None:
+            logger.warning(f"user_urn not found for the user {user}")
+            return
+
+        explore_stat_aspect.userCounts.append(
+            DatasetUserUsageCountsClass(
+                user=user_urn,
+                count=row[HistoryViewField.HISTORY_COUNT],
+                userEmail=user.email,
+            )
+        )
+        explore_stat_aspect.uniqueUserCount = len(explore_stat_aspect.userCounts)
+
+
+def create_dashboard_stat_generator(
+    config: StatGeneratorConfig,
+    report: LookerDashboardSourceReport,
+    urn_builder: Callable[[str], str],
+    looker_dashboards: Sequence[LookerDashboardForUsage],
+) -> DashboardStatGenerator:
+    logger.debug(
+        "Number of dashboard received for stat processing = {}".format(
+            len(looker_dashboards)
+        )
+    )
+    return DashboardStatGenerator(
+        config=config,
+        looker_dashboards=looker_dashboards,
+        report=report,
+        urn_builder=urn_builder,
+    )
+
+
+def create_chart_stat_generator(
+    config: StatGeneratorConfig,
+    report: LookerDashboardSourceReport,
+    urn_builder: Callable[[str], str],
+    looker_looks: Sequence[LookerChartForUsage],
+) -> LookStatGenerator:
+    logger.debug(
+        "Number of looks received for stat processing = {}".format(len(looker_looks))
+    )
+    return LookStatGenerator(
+        config=config, looker_looks=looker_looks, report=report, urn_builder=urn_builder
+    )
+
+
+def create_explore_stat_generator(
+    config: StatGeneratorConfig,
+    report: LookerDashboardSourceReport,
+    source_config: looker_common.LookerCommonConfig,
+    looker_explores: Sequence[LookerExploreForUsage],
+) -> ExploreStatGenerator:
+    logger.debug(
+        "Number of explores received for stat processing = {}".format(
+            len(looker_explores)
+        )
+    )
+    return ExploreStatGenerator(
+        config=config,
+        looker_explores=looker_explores,
+        report=report,
+        source_config=source_config,
+    )

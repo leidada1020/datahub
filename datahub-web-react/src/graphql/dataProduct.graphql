@@ -1,0 +1,159 @@
+query getDataProduct($urn: String!) {
+    dataProduct(urn: $urn) {
+        urn
+        type
+        ...dataProductFields
+        privileges {
+            ...entityPrivileges
+        }
+        autoRenderAspects: aspects(input: { autoRenderOnly: true }) {
+            ...autoRenderAspectFields
+        }
+        structuredProperties {
+            properties {
+                ...structuredPropertiesFields
+            }
+        }
+        deprecation {
+            ...deprecationFields
+        }
+        ...notes
+        settings {
+            ...AssetSettingsFields
+        }
+    }
+}
+
+query getDataProductsList($input: SearchAcrossEntitiesInput!) {
+    searchAcrossEntities(input: $input) {
+        searchResults {
+            entity {
+                ... on DataProduct {
+                    urn
+                    type
+                    properties {
+                        name
+                        description
+                        numAssets
+                    }
+                    domain {
+                        ...entityDomain
+                    }
+                }
+            }
+        }
+    }
+}
+
+fragment dataProductFields on DataProduct {
+    ...dataProductSearchFields
+    properties {
+        customProperties {
+            key
+            value
+        }
+    }
+    institutionalMemory {
+        ...institutionalMemoryFields
+    }
+}
+
+fragment dataProductSearchFields on DataProduct {
+    urn
+    type
+    properties {
+        name
+        description
+        externalUrl
+        createdOn {
+            time
+        }
+        parentDataProduct {
+            urn
+            type
+            properties {
+                name
+            }
+        }
+    }
+    parentDataProducts {
+        urn
+        type
+        properties {
+            name
+        }
+    }
+    ownership {
+        ...ownershipFields
+    }
+    tags {
+        ...globalTagsFields
+    }
+    glossaryTerms {
+        ...glossaryTerms
+    }
+    domain {
+        ...entityDomainWithoutCounts
+    }
+    applications {
+        ...entityApplication
+    }
+    deprecation {
+        ...deprecationFields
+    }
+    privileges {
+        ...entityPrivileges
+    }
+    entities(input: { start: 0, count: 0, query: "*" }) {
+        total
+    }
+}
+
+mutation moveDataProduct($input: MoveDataProductInput!) {
+    moveDataProduct(input: $input)
+}
+
+mutation createDataProduct($input: CreateDataProductInput!) {
+    createDataProduct(input: $input) {
+        ...dataProductSearchFields
+    }
+}
+
+mutation updateDataProduct($urn: String!, $input: UpdateDataProductInput!) {
+    updateDataProduct(urn: $urn, input: $input) {
+        ...dataProductSearchFields
+    }
+}
+
+mutation deleteDataProduct($urn: String!) {
+    deleteDataProduct(urn: $urn)
+}
+
+mutation batchSetDataProduct($input: BatchSetDataProductInput!) {
+    batchSetDataProduct(input: $input)
+}
+
+mutation batchAddToDataProducts($input: BatchSetDataProductsInput!) {
+    batchAddToDataProducts(input: $input)
+}
+
+mutation batchRemoveFromDataProducts($input: BatchSetDataProductsInput!) {
+    batchRemoveFromDataProducts(input: $input)
+}
+
+query getDataProductEntitiesForLineage($urn: String!, $start: Int!, $count: Int!) {
+    dataProduct(urn: $urn) {
+        urn
+        type
+        exists
+        entities(input: { start: $start, count: $count, query: "*" }) {
+            total
+            searchResults {
+                entity {
+                    urn
+                    type
+                }
+            }
+        }
+    }
+}

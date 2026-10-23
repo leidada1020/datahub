@@ -1,0 +1,380 @@
+import { Icon } from '@components';
+import { Clock } from '@phosphor-icons/react/dist/csr/Clock';
+import { TreeStructure } from '@phosphor-icons/react/dist/csr/TreeStructure';
+import { Divider, Typography } from 'antd';
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { PrimaryButton } from '@app/entityV2/shared/tabs/Dataset/Validations/assertion/profile/shared/PrimaryButton';
+import { isExternalAssertion } from '@app/entityV2/shared/tabs/Dataset/Validations/assertion/profile/shared/isExternalAssertion';
+import { toReadableLocalDateTimeString } from '@app/entityV2/shared/tabs/Dataset/Validations/assertion/profile/shared/utils';
+import { ProviderSummarySection } from '@app/entityV2/shared/tabs/Dataset/Validations/assertion/profile/summary/schedule/ProviderSummarySection';
+import { AssertionResultPill } from '@app/entityV2/shared/tabs/Dataset/Validations/assertion/profile/summary/shared/AssertionResultPill';
+import { getAssertionResultSeverityDisplay } from '@app/entityV2/shared/tabs/Dataset/Validations/assertion/profile/summary/shared/assertionResultSeverityUtils';
+import {
+    ResultStatusType,
+    getDetailedErrorMessage,
+    getFormattedExpectedResultText,
+    getFormattedReasonText,
+} from '@app/entityV2/shared/tabs/Dataset/Validations/assertion/profile/summary/shared/resultMessageUtils';
+import { sortNativeResults } from '@app/entityV2/shared/tabs/Dataset/Validations/assertionUtils';
+import { safeUrl } from '@app/sharedV2/urlUtils';
+
+import { Assertion, AssertionResult, AssertionResultErrorType, AssertionResultType, AssertionRunEvent } from '@types';
+
+const EXPAND_SYMBOL = 'more';
+const UNKNOWN_PLATFORM_NAME = 'unknown';
+
+const HeaderRow = styled.div`
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 4px;
+`;
+
+// NOTE: removed the title for now as the assertion's current title may not accurately describe the assertion that ran at this point in history
+// const Title = styled.div`
+//     flex: 1;
+//     font-size: 16px;
+//     font-weight: 600;
+//     overflow: hidden;
+//     > div {
+//         overflow: hidden;
+//         white-space: nowrap;
+//         text-overflow: ellipsis;
+//     }
+//     margin-right: 20px;
+// `;
+
+const Actions = styled.div`
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+`;
+
+const TimestampContainer = styled.div`
+    gap: 5px;
+    display: flex;
+    flex-direction: column;
+`;
+
+const LastResultsRow = styled.div`
+    font-size: 14px;
+    display: flex;
+    align-items: center;
+    font-weight: 500;
+`;
+const LastRunRow = styled.div`
+    font-size: 10px;
+    display: flex;
+    align-items: center;
+    font-weight: 500;
+    color: ${(props) => props.theme.colors.textTertiary};
+    .anticon-clock-circle {
+        font-size: 10px;
+    }
+`;
+
+const ReasonRow = styled.div``;
+
+const SecondaryHeader = styled.div`
+    font-size: 10px;
+    color: ${(props) => props.theme.colors.textTertiary};
+`;
+
+const ReasonText = styled.div``;
+
+const ContextRow = styled.div``;
+
+const ExpectedText = styled.div``;
+
+const PlatformRow = styled.div``;
+
+const StyledClockCircleOutlined = styled(Clock)`
+    margin-right: 4px;
+    font-size: 12px;
+`;
+
+const PartitionRow = styled.div`
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    color: ${(props) => props.theme.colors.textSecondary};
+`;
+
+const ThinDivider = styled(Divider)`
+    margin: 12px 0px;
+    padding: 0px;
+`;
+
+type Props = {
+    assertion: Assertion;
+    run?: AssertionRunEvent;
+    showProfileButton?: boolean;
+    onClickProfileButton?: () => void;
+    resultStatusType?: ResultStatusType;
+};
+
+type PopoverHeaderProps = {
+    timestamp?: Date;
+    reportedTimestamp?: number;
+    result?: AssertionResult;
+    resultStatusType?: ResultStatusType;
+    showProfileButton?: boolean;
+    onClickProfileButton?: () => void;
+};
+
+const PopoverHeader = ({
+    timestamp,
+    reportedTimestamp,
+    result,
+    resultStatusType,
+    showProfileButton,
+    onClickProfileButton,
+}: PopoverHeaderProps) => {
+    const { t } = useTranslation('entity.profile.validations');
+    const { t: tl } = useTranslation('common.labels');
+    return (
+        <HeaderRow>
+            <TimestampContainer>
+                {/* NOTE: we don't show the assertion title in the header because the assertion's current title may not accurately represent the assertion that actually ran at this point in time. */}
+                <LastResultsRow>
+                    {(timestamp && (
+                        <>
+                            <StyledClockCircleOutlined />{' '}
+                            {t('resultPopover.ran', { date: toReadableLocalDateTimeString(timestamp.getTime()) })}
+                        </>
+                    )) || <>{t('resultPopover.noResultsYet')}</>}
+                </LastResultsRow>
+                {reportedTimestamp && (
+                    <LastRunRow>
+                        {t('resultPopover.reported', { date: toReadableLocalDateTimeString(reportedTimestamp) })}
+                    </LastRunRow>
+                )}
+            </TimestampContainer>
+            <Actions>
+                <AssertionResultPill result={result} type={resultStatusType} />
+                {(showProfileButton && onClickProfileButton && (
+                    <PrimaryButton title={tl('details')} onClick={onClickProfileButton} />
+                )) ||
+                    undefined}
+            </Actions>
+        </HeaderRow>
+    );
+};
+
+const ReasonSection = ({ reasonText }: { reasonText?: string }) => {
+    const { t } = useTranslation('entity.profile.validations');
+    if (!reasonText) return null;
+    return (
+        <>
+            <ThinDivider />
+            <ReasonRow>
+                <SecondaryHeader>{t('resultPopover.reason')}</SecondaryHeader>
+                <ReasonText>{reasonText}</ReasonText>
+            </ReasonRow>
+        </>
+    );
+};
+
+const ExpectedSection = ({ expectedText }: { expectedText?: string }) => {
+    const { t } = useTranslation('entity.profile.validations');
+    if (!expectedText) return null;
+    return (
+        <>
+            <ThinDivider />
+            <ContextRow>
+                <SecondaryHeader>{t('resultPopover.expected')}</SecondaryHeader>
+                <ExpectedText>{expectedText}</ExpectedText>
+            </ContextRow>
+        </>
+    );
+};
+
+const SeveritySection = ({ result }: { result?: AssertionResult }) => {
+    const { t } = useTranslation('entity.profile.validations');
+    const severityDisplay = getAssertionResultSeverityDisplay(result);
+    if (!severityDisplay) return null;
+
+    return (
+        <>
+            <ThinDivider />
+            <ContextRow>
+                <SecondaryHeader>{t('resultPopover.severity')}</SecondaryHeader>
+                <ExpectedText>{severityDisplay.label}</ExpectedText>
+            </ContextRow>
+        </>
+    );
+};
+
+const PartitionSection = ({ partition }: { partition?: string | null }) => {
+    const { t } = useTranslation('entity.profile.validations');
+    if (!partition) return null;
+
+    return (
+        <>
+            <ThinDivider />
+            <PartitionRow>
+                <Icon icon={TreeStructure} size="md" />
+                <span>
+                    <strong>{t('resultPopover.partition')}:</strong> {partition}
+                </span>
+            </PartitionRow>
+        </>
+    );
+};
+
+const getRecommendedAction = (errorType?: AssertionResultErrorType) => {
+    switch (errorType) {
+        case AssertionResultErrorType.SourceConnectionError:
+        case AssertionResultErrorType.SourceQueryFailed:
+            return 'Check the source connection, credentials, and query permissions.';
+        case AssertionResultErrorType.InvalidParameters:
+            return 'Review the assertion configuration and required parameters.';
+        case AssertionResultErrorType.UnsupportedPlatform:
+        case AssertionResultErrorType.InvalidSourceType:
+            return 'Choose a supported platform and assertion source.';
+        default:
+            return 'Review the error details and update the assertion before running it again.';
+    }
+};
+
+const MessageSection = ({
+    errorMessage,
+    recommendedAction,
+    show,
+}: {
+    errorMessage?: string;
+    recommendedAction?: string;
+    show: boolean;
+}) => {
+    const { t } = useTranslation('entity.profile.validations');
+    if (!show || !errorMessage) return null;
+    return (
+        <>
+            <ThinDivider />
+            <ContextRow>
+                <SecondaryHeader>{t('resultPopover.message')}</SecondaryHeader>
+                <Typography.Paragraph
+                    ellipsis={{
+                        expandable: true,
+                        symbol: EXPAND_SYMBOL,
+                        rows: 3,
+                        onExpand: (e) => e.stopPropagation(),
+                    }}
+                >
+                    {errorMessage}
+                </Typography.Paragraph>
+            </ContextRow>
+            {recommendedAction && (
+                <ContextRow>
+                    <SecondaryHeader>
+                        {t('resultPopover.recommendedAction', { defaultValue: 'Recommended action' })}
+                    </SecondaryHeader>
+                    <Typography.Paragraph>{recommendedAction}</Typography.Paragraph>
+                </ContextRow>
+            )}
+        </>
+    );
+};
+
+const ExternalResultsSection = ({ assertion, result }: { assertion: Assertion; result?: AssertionResult }) => {
+    const { t } = useTranslation('entity.profile.validations');
+    if (!isExternalAssertion(assertion)) return null;
+
+    const externalResultsSections: React.ReactNode[] = [];
+    if (result?.nativeResults?.length) {
+        externalResultsSections.push(
+            <ThinDivider key="external-results-divider" />,
+            <PlatformRow key="external-results">
+                {sortNativeResults(result.nativeResults).map((entry) => (
+                    <div key={entry.key}>
+                        <Typography.Text strong>{entry.key}</Typography.Text>: {entry.value}
+                    </div>
+                ))}
+            </PlatformRow>,
+        );
+        if (result.externalUrl) {
+            const platform =
+                assertion.platform?.name && assertion.platform?.name?.toLowerCase() !== UNKNOWN_PLATFORM_NAME
+                    ? assertion.platform.name
+                    : undefined;
+            externalResultsSections.push(
+                <ThinDivider key="external-results-link-divider" />,
+                <PlatformRow key="external-results-link">
+                    <a href={safeUrl(result.externalUrl)} target="_blank" rel="noopener noreferrer">
+                        {platform
+                            ? t('resultPopover.viewExternal', { platform })
+                            : t('resultPopover.viewExternalFallback')}
+                    </a>
+                </PlatformRow>,
+            );
+        }
+    }
+
+    return (
+        <>
+            {/* Show the native results if it's an external platform, so customers can see source-emitted values. */}
+            {externalResultsSections.length > 0 && externalResultsSections}
+            {assertion.platform && (
+                <>
+                    <ThinDivider />
+                    <PlatformRow>
+                        <ProviderSummarySection assertion={assertion} showDivider={false} />
+                    </PlatformRow>
+                </>
+            )}
+        </>
+    );
+};
+
+// TODO: Add this in the assertion list, as hover on the timeline as well.
+export const AssertionResultPopoverContent = ({
+    assertion,
+    run,
+    showProfileButton,
+    resultStatusType,
+    onClickProfileButton,
+}: Props) => {
+    // Last run time
+    const timestamp = run?.timestampMillis ? new Date(run.timestampMillis) : undefined;
+    const reportedTimestamp = run?.lastObservedMillis || undefined;
+
+    // Reason
+    const result = run?.result || undefined;
+    const reasonText = run ? getFormattedReasonText(assertion, run) : undefined;
+    const hasReason = !!reasonText;
+
+    // Context
+    const expectedText = run ? getFormattedExpectedResultText(assertion.info, run) : undefined;
+
+    // Error
+    const errorMessage = (run && getDetailedErrorMessage(run)) || undefined;
+    const hasDetailedError = run?.result?.type === AssertionResultType.Error && !!errorMessage;
+    const recommendedAction =
+        run?.result?.type === AssertionResultType.Error
+            ? getRecommendedAction(run.result.error?.type || undefined)
+            : undefined;
+
+    return (
+        <>
+            <PopoverHeader
+                timestamp={timestamp}
+                reportedTimestamp={reportedTimestamp}
+                result={result}
+                resultStatusType={resultStatusType}
+                showProfileButton={showProfileButton}
+                onClickProfileButton={onClickProfileButton}
+            />
+            <PartitionSection partition={run?.partitionSpec?.partition} />
+            {hasReason && <ReasonSection reasonText={reasonText} />}
+            <SeveritySection result={result} />
+            <ExpectedSection expectedText={expectedText} />
+            <MessageSection errorMessage={errorMessage} recommendedAction={recommendedAction} show={hasDetailedError} />
+            <ExternalResultsSection assertion={assertion} result={result} />
+        </>
+    );
+};

@@ -1,0 +1,126 @@
+import play.gradle.Language
+
+plugins {
+  id 'java'
+  id 'scala'
+  id 'org.playframework.play' version '3.1.0-M9'
+  id 'application'
+}
+
+apply from: '../gradle/versioning/versioning.gradle'
+apply from: './play.gradle'
+
+// Gradle 9.5's scala plugin defaults zinc to 1.12.0, which pulls org.jline:jline:4.2.1 and resolves
+// a `jdk8`-classifier jar that was never published (404 on Maven Central). Pin zinc to 1.10.4 — it
+// is supported by Gradle 9.x, matches the existing lockfile, and keeps the working jline chain.
+scala {
+  zincVersion = '1.10.4'
+}
+
+play {
+  getLang().set(Language.JAVA)
+  routes { rs -> rs.getGenerateReverseRouter().set(true) }
+}
+apply from: '../gradle/coverage/java-coverage.gradle'
+apply from: '../gradle/docker/docker.gradle'
+
+ext {
+  docker_repo = 'datahub-frontend-react'
+  docker_dir = 'datahub-frontend'
+}
+
+java {
+  toolchain {
+    languageVersion = JavaLanguageVersion.of(jdkVersion(project))
+  }
+}
+
+application {
+  applicationName = project.ext.playBinaryBaseName
+  mainClass = 'play.core.server.ProdServerStart'
+}
+
+test {
+  jacoco {
+    excludes = ["com/gargoylesoftware/**"]
+  }
+}
+
+// Docker and scripts expect build/stage/main (mirrors old Gradle Play plugin output layout).
+tasks.register('stage', Sync) {
+  group = 'distribution'
+  description = 'Stages installDist to build/stage/main for the frontend Docker image.'
+  dependsOn 'installDist'
+  from layout.buildDirectory.dir("install/${project.ext.playBinaryBaseName}")
+  into layout.buildDirectory.dir('stage/main')
+  duplicatesStrategy = DuplicatesStrategy.INCLUDE
+}
+
+model {
+  tasks.myTar {
+    dependsOn stage
+  }
+}
+
+task myTar(type: Tar) {
+  compression = Compression.NONE
+  from("${buildDir}/stage")
+  into("bin") {
+    from("bin")
+  }
+  into("conf") {
+    from("conf")
+    filePermissions { unix(0600) }
+  }
+}
+
+artifacts {
+  archives myTar
+}
+
+distributions {
+  // Play 3 + application installDist only ships bin/ + lib/; runtime needs conf/ (application.conf, logback, jaas, routes).
+  main {
+    contents {
+      from(layout.projectDirectory.dir("conf")) {
+        into "conf"
+      }
+    }
+  }
+  create("datahub-frontend") {
+    distributionBaseName = project.ext.playBinaryBaseName
+  }
+}
+
+task unversionZip(type: Copy, dependsOn: [':datahub-web-react:distZip', distZip]) {
+  from ("${buildDir}/distributions")
+  include "datahub-frontend-${version}.zip"
+  into "${buildDir}/distributions"
+  rename "datahub-frontend-${version}.zip", "datahub-frontend.zip"
+}
+
+docker {
+  dependsOn stage
+  name "${docker_registry}/${docker_repo}:${versionTag}"
+  dockerfile file("${rootProject.projectDir}/docker/${docker_dir}/Dockerfile")
+  files "${buildDir}/stage"
+  files fileTree(rootProject.projectDir) {
+    include '.dockerignore'
+    include 'docker/monitoring/*'
+    include 'docker/snippets/*'
+    include "docker/${docker_dir}/*"
+  }.exclude {
+    i -> (!i.file.name.endsWith(".dockerignore") && i.file.isHidden())
+  }
+  additionalTag("Debug", "${docker_registry}/${docker_repo}:debug")
+  def dockerBuildArgs = [:]
+  if (project.hasProperty('dockerBaseImage')) {
+    dockerBuildArgs.BASE_IMAGE = project.getProperty('dockerBaseImage')
+  }
+  dockerBuildArgs.APK_REPOSITORY_URL = gradle.ext['datahub.dependencies.apkrepo.url']
+  dockerBuildArgs.GITHUB_REPO_URL = gradle.ext['datahub.dependencies.github.baseURL']
+  dockerBuildArgs.MAVEN_CENTRAL_REPO_URL = gradle.ext['datahub.dependencies.maven.central']
+  if (dockerBuildArgs.size() > 0) {
+    buildArgs(dockerBuildArgs)
+  }
+}

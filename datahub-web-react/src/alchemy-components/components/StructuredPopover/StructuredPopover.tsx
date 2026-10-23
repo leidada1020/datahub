@@ -1,0 +1,62 @@
+import * as React from 'react';
+
+import { Popover, type PopoverProps } from '@components/components/Popover';
+import {
+    Container,
+    Content,
+    Section,
+    SectionHeader,
+    SectionTitle,
+    SectionsContainer,
+    Title,
+    TitleSuffix,
+} from '@components/components/StructuredPopover/components';
+import { StructuredPopoverProps } from '@components/components/StructuredPopover/types';
+
+/**
+ * Note: Depends on styling set in global-overrides-v2.less to remove the base overlay padding.
+ */
+export function StructuredPopover(props: StructuredPopoverProps & PopoverProps) {
+    const { header: Header, width, title, sections, ...otherProps } = props;
+
+    if (!title && !sections?.length) return <>{props.children}</>;
+
+    const content = (
+        <Container>
+            {Header && <Header />}
+            {title && <Title>{title}</Title>}
+            {sections && (
+                <SectionsContainer>
+                    {sections?.map((section, i) => (
+                        // eslint-disable-next-line react/no-array-index-key
+                        <Section key={i}>
+                            <SectionHeader>
+                                <SectionTitle>{section.title}</SectionTitle>
+                                {section.titleSuffix && <TitleSuffix>{section.titleSuffix}</TitleSuffix>}
+                            </SectionHeader>
+                            {section?.content && <Content>{section.content}</Content>}
+                        </Section>
+                    ))}
+                </SectionsContainer>
+            )}
+        </Container>
+    );
+
+    return (
+        <Popover
+            {...otherProps}
+            content={content}
+            overlayClassName="sectioned-tooltip"
+            overlayStyle={{
+                width: `${width}px`,
+            }}
+            overlayInnerStyle={{
+                fontFamily: 'Mulish',
+                padding: '12px',
+                borderRadius: '12px',
+            }}
+        >
+            {props.children}
+        </Popover>
+    );
+}

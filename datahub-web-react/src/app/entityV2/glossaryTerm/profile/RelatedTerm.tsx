@@ -1,0 +1,64 @@
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components/macro';
+
+import { PreviewType } from '@app/entityV2/Entity';
+import useRemoveRelatedTerms from '@app/entityV2/glossaryTerm/profile/useRemoveRelatedTerms';
+import { SearchCardContext } from '@app/entityV2/shared/SearchCardContext';
+import { useEntityRegistry } from '@app/useEntityRegistry';
+
+import { useGetGlossaryTermQuery } from '@graphql/glossaryTerm.generated';
+import { EntityType, TermRelationshipType } from '@types';
+
+const ListItem = styled.div`
+    position: relative;
+    border: 1px solid ${(props) => props.theme.colors.border};
+    border-radius: 11px;
+
+    &:hover {
+        border: 1px solid ${(props) => props.theme.colors.borderBrand};
+    }
+`;
+
+const Profile = styled.div`
+    display: flex;
+    position: relative;
+    overflow: hidden;
+    padding: 16px;
+`;
+
+interface Props {
+    urn: string;
+    relationshipType: TermRelationshipType;
+    isEditable: boolean;
+}
+
+function RelatedTerm(props: Props) {
+    const { urn, relationshipType, isEditable } = props;
+
+    const { t } = useTranslation('entity.types');
+    const entityRegistry = useEntityRegistry();
+    const { data, loading } = useGetGlossaryTermQuery({ variables: { urn } });
+    let displayName = '';
+    if (data) {
+        displayName = entityRegistry.getDisplayName(EntityType.GlossaryTerm, data.glossaryTerm);
+    }
+    const { onRemove, removeConfirmationModal } = useRemoveRelatedTerms(urn, relationshipType, displayName);
+
+    if (loading) return null;
+
+    return (
+        <ListItem>
+            <SearchCardContext.Provider
+                value={{ showRemovalFromList: isEditable, removeText: t('glossaryTerm.removeRelationship'), onRemove }}
+            >
+                <Profile>
+                    {entityRegistry.renderPreview(EntityType.GlossaryTerm, PreviewType.PREVIEW, data?.glossaryTerm)}
+                </Profile>
+            </SearchCardContext.Provider>
+            {removeConfirmationModal}
+        </ListItem>
+    );
+}
+
+export default RelatedTerm;

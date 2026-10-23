@@ -1,0 +1,223 @@
+import { toast } from '@components';
+import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+
+import analytics, { EventType } from '@app/analytics';
+import { PolicyPrivilegesConfig } from '@app/permissions/policy/policyTypes';
+
+import { useCreatePolicyMutation, useDeletePolicyMutation, useUpdatePolicyMutation } from '@graphql/policy.generated';
+import {
+    EntityType,
+    Maybe,
+    Policy,
+    PolicyMatchCriterionInput,
+    PolicyMatchFilter,
+    PolicyMatchFilterInput,
+    PolicyState,
+    PolicyType,
+    PolicyUpdateInput,
+    ResourceFilterInput,
+} from '@types';
+
+type PrivilegeOptionType = {
+    type?: string;
+    name?: Maybe<string>;
+};
+
+export function usePolicy(
+    policyPrivileges: PolicyPrivilegesConfig | undefined,
+    focusPolicyUrn,
+    policiesRefetch,
+    setShowViewPolicyModal,
+    onCancelViewPolicy,
+    onClosePolicyBuilder,
+) {
+    const { t } = useTranslation('settings.permissions');
+
+    // Construct privileges
+    const platformPrivileges = policyPrivileges?.platformPrivileges || [];
+    const resourcePrivileges = policyPrivileges?.resourcePrivileges || [];
+
+    // Any time a policy is removed, edited, or created, refetch the list.
+    const [createPolicy, { error: createPolicyError }] = useCreatePolicyMutation();
+
+    const [updatePolicy, { error: updatePolicyError }] = useUpdatePolicyMutation();
+
+    const [deletePolicy, { error: deletePolicyError }] = useDeletePolicyMutation();
+
+    const [policyToDelete, setPolicyToDelete] = useState<Policy | null>(null);
+
+    const toFilterInput = (filter: PolicyMatchFilter, state?: string | undefined): PolicyMatchFilterInput => {
+        return {
+            criteria: filter.criteria?.map((criterion): PolicyMatchCriterionInput => {
+                const criterionInput: PolicyMatchCriterionInput = {
+                    field: criterion.field,
+                    values: criterion.values.map((criterionValue) =>
+                        criterion.field === 'TAG' && state !== 'TOGGLE'
+                            ? (criterionValue as any)
+                            : criterionValue.value,
+                    ),
+                    condition: criterion.condition,
+                };
+                // Include structuredPropertyValues if present
+                if ((criterion as any).structuredPropertyValues) {
+                    criterionInput.structuredPropertyValues = (criterion as any).structuredPropertyValues.map(
+                        (propValue: any) => ({
+                            propertyUrn: propValue.propertyUrn,
+                            values: propValue.values || [],
+                        }),
+                    );
+                }
+                return criterionInput;
+            }),
+        };
+    };
+
+    const toPolicyInput = (policy: Omit<Policy, 'urn'>, state?: string | undefined): PolicyUpdateInput => {
+        let policyInput: PolicyUpdateInput = {
+            type: policy.type,
+            name: policy.name,
+            state: policy.state,
+            description: policy.description,
+            privileges: policy.privileges,
+            actors: {
+                users: policy.actors.users,
+                groups: policy.actors.groups,
+                allUsers: policy.actors.allUsers,
+                allGroups: policy.actors.allGroups,
+                resourceOwners: policy.actors.resourceOwners,
+                resourceOwnersTypes: policy.actors.resourceOwnersTypes,
+            },
+        };
+        if (policy.resources !== null && policy.resources !== undefined) {
+            let resourceFilter: ResourceFilterInput = {
+                type: policy.resources.type,
+                resources: policy.resources.resources,
+                allResources: policy.resources.allResources,
+            };
+            if (policy.resources.filter) {
+                resourceFilter = { ...resourceFilter, filter: toFilterInput(policy.resources.filter, state) };
+            }
+            // Add the resource filters.
+            policyInput = {
+                ...policyInput,
+                resources: resourceFilter,
+            };
+        }
+        return policyInput;
+    };
+
+    const getPrivilegeNames = (policy: Omit<Policy, 'urn'>) => {
+        let privileges: PrivilegeOptionType[] = [];
+        if (policy?.type === PolicyType.Platform) {
+            privileges = platformPrivileges
+                .filter((platformPrivilege) => policy.privileges.includes(platformPrivilege.type))
+                .map((platformPrivilege) => {
+                    return { type: platformPrivilege.type, name: platformPrivilege.displayName };
+                });
+        } else {
+            const allResourcePriviliges = resourcePrivileges.find(
+                (resourcePrivilege) => resourcePrivilege.resourceType === 'all',
+            );
+            privileges =
+                allResourcePriviliges?.privileges
+                    .filter((resourcePrivilege) => policy.privileges.includes(resourcePrivilege.type))
+                    .map((b) => {
+                        return { type: b.type, name: b.displayName };
+                    }) || [];
+        }
+        return privileges;
+    };
+
+    // On Delete Policy handler
+    const onRemovePolicy = (policy: Policy) => {
+        setPolicyToDelete(policy);
+    };
+
+    const handleDeleteConfirm = () => {
+        if (policyToDelete) {
+            deletePolicy({ variables: { urn: policyToDelete.urn as string } }).then(() => {
+                analytics.event({
+                    type: EventType.DeleteEntityEvent,
+                    entityUrn: policyToDelete.urn,
+                    entityType: EntityType.DatahubPolicy,
+                });
+                toast.success(t('removePolicySuccess'));
+                setTimeout(() => {
+                    policiesRefetch();
+                }, 2000);
+                onCancelViewPolicy();
+                setPolicyToDelete(null);
+            });
+        }
+    };
+
+    const handleDeleteCancel = () => {
+        setPolicyToDelete(null);
+    };
+
+    // On Activate and deactivate Policy handler
+    const onToggleActiveDuplicate = (policy: Policy) => {
+        const newState = policy?.state === PolicyState.Active ? PolicyState.Inactive : PolicyState.Active;
+        const newPolicy = {
+            ...policy,
+            state: newState,
+        };
+        updatePolicy({
+            variables: {
+                urn: policy?.urn as string, // There must be a focus policy urn.
+                input: toPolicyInput(newPolicy, 'TOGGLE'),
+            },
+        }).then(() => {
+            toast.success(newState === PolicyState.Active ? t('activatePolicySuccess') : t('deactivatePolicySuccess'));
+            setTimeout(() => {
+                policiesRefetch();
+            }, 2000);
+        });
+
+        setShowViewPolicyModal(false);
+    };
+
+    // On Add/Update Policy handler
+    const onSavePolicy = (savePolicy: Omit<Policy, 'urn'>) => {
+        if (focusPolicyUrn) {
+            // If there's an URN associated with the focused policy, then we are editing an existing policy.
+            updatePolicy({ variables: { urn: focusPolicyUrn, input: toPolicyInput(savePolicy) } }).then(() => {
+                analytics.event({
+                    type: EventType.UpdatePolicyEvent,
+                    policyUrn: focusPolicyUrn,
+                });
+                toast.success(t('savePolicySuccess'));
+                setTimeout(() => {
+                    policiesRefetch();
+                }, 2000);
+                onClosePolicyBuilder();
+            });
+        } else {
+            // If there's no URN associated with the focused policy, then we are creating.
+            createPolicy({ variables: { input: toPolicyInput(savePolicy) } }).then(() => {
+                analytics.event({
+                    type: EventType.CreatePolicyEvent,
+                });
+                toast.success(t('savePolicySuccess'));
+                setTimeout(() => {
+                    policiesRefetch();
+                }, 2000);
+                onClosePolicyBuilder();
+            });
+        }
+    };
+
+    return {
+        createPolicyError,
+        updatePolicyError,
+        deletePolicyError,
+        onSavePolicy,
+        onToggleActiveDuplicate,
+        onRemovePolicy,
+        getPrivilegeNames,
+        policyToDelete,
+        handleDeleteConfirm,
+        handleDeleteCancel,
+    };
+}

@@ -1,0 +1,103 @@
+fragment childGlossaryTerm on GlossaryTerm {
+    urn
+    type
+    name
+    hierarchicalName
+    properties {
+        name
+        description
+    }
+    displayProperties {
+        ...displayPropertiesFields
+    }
+    domain {
+        ...entityDomain
+    }
+    deprecation {
+        ...deprecationFields
+    }
+}
+
+fragment glossaryNodeFields on GlossaryNode {
+    urn
+    type
+    exists
+    properties {
+        name
+        description
+        customProperties {
+            ...customPropertiesFields
+        }
+        createdOn {
+            time
+        }
+    }
+    ownership {
+        ...ownershipFields
+    }
+    domain {
+        ...entityDomain
+    }
+    applications {
+        ...entityApplication
+    }
+    parentNodes {
+        ...parentNodesFields
+    }
+    privileges {
+        ...entityPrivileges
+    }
+    autoRenderAspects: aspects(input: { autoRenderOnly: true }) {
+        ...autoRenderAspectFields
+    }
+    institutionalMemory {
+        ...institutionalMemoryFields
+    }
+    tags {
+        ...globalTagsFields
+    }
+    structuredProperties {
+        properties {
+            ...structuredPropertiesFields
+        }
+    }
+    childrenCount {
+        termsCount
+        nodesCount
+    }
+    displayProperties {
+        ...displayPropertiesFields
+    }
+    ...notes
+    settings {
+        ...AssetSettingsFields
+    }
+}
+
+query getGlossaryNode($urn: String!) {
+    glossaryNode(urn: $urn) {
+        ...glossaryNodeFields
+    }
+}
+
+query getGlossaryNodeWithChildren($urn: String!) {
+    glossaryNode(urn: $urn) {
+        ...glossaryNodeFields
+        children: relationships(input: { types: ["IsPartOf"], direction: INCOMING, start: 0, count: 1000 }) {
+            total
+            relationships {
+                direction
+                entity {
+                    type
+                    urn
+                    ... on GlossaryNode {
+                        ...glossaryNode
+                    }
+                    ... on GlossaryTerm {
+                        ...childGlossaryTerm
+                    }
+                }
+            }
+        }
+    }
+}

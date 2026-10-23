@@ -1,0 +1,122 @@
+query getQuery($urn: String!, $skipSiblingsSearch: Boolean = false) {
+    entity(urn: $urn) {
+        urn
+        type
+        ... on QueryEntity {
+            ...query
+            privileges {
+                canViewQueries
+            }
+        }
+    }
+}
+
+fragment ActorWithDisplayName on CorpUser {
+    urn
+    type
+    ...entityDisplayNameFields
+    editableProperties {
+        pictureLink
+    }
+    editableInfo {
+        pictureLink
+    }
+}
+
+fragment query on QueryEntity {
+    urn
+    properties {
+        name
+        description
+        source
+        statement {
+            value
+            language
+        }
+        created {
+            time
+            actor
+        }
+        createdOn {
+            time
+            actor {
+                ...ActorWithDisplayName
+            }
+        }
+        lastModified {
+            time
+            actor
+        }
+        origin {
+            ...searchResultFieldsNoLineage
+        }
+    }
+    platform {
+        ...platformFields
+    }
+    subjects {
+        dataset {
+            urn
+            type
+            name
+        }
+        schemaField {
+            urn
+            type
+            fieldPath
+        }
+    }
+}
+
+query listQueries($input: ListQueriesInput!, $skipSiblingsSearch: Boolean = false) {
+    listQueries(input: $input) {
+        start
+        total
+        count
+        queries {
+            ...query
+        }
+    }
+}
+
+mutation createQuery($input: CreateQueryInput!, $skipSiblingsSearch: Boolean = false) {
+    createQuery(input: $input) {
+        ...query
+    }
+}
+
+mutation updateQuery($urn: String!, $input: UpdateQueryInput!, $skipSiblingsSearch: Boolean = false) {
+    updateQuery(urn: $urn, input: $input) {
+        ...query
+    }
+}
+
+mutation deleteQuery($urn: String!) {
+    deleteQuery(urn: $urn)
+}
+
+query searchAcrossLineageForQueries($input: SearchAcrossLineageInput!, $skipSiblingsSearch: Boolean = false) {
+    searchAcrossLineage(input: $input) {
+        start
+        count
+        total
+        searchResults {
+            entity {
+                urn
+                type
+                ...searchResultFieldsNoLineage
+            }
+            paths {
+                path {
+                    urn
+                    type
+                    ... on QueryEntity {
+                        ...query
+                    }
+                }
+            }
+            explored
+            ignoredAsHop
+        }
+    }
+}

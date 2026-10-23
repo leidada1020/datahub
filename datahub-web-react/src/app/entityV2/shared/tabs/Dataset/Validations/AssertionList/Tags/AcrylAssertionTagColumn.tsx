@@ -1,0 +1,238 @@
+import { toast } from '@components';
+import { Plus } from '@phosphor-icons/react/dist/csr/Plus';
+import React, { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { SelectItemPopover } from '@src/alchemy-components/components/SelectItemsPopover';
+import DataHubTooltip from '@src/alchemy-components/components/Tooltip/Tooltip';
+import { handleBatchError } from '@src/app/entityV2/shared/utils';
+import { useGetRecommendations } from '@src/app/sharedV2/recommendation';
+import Tag from '@src/app/sharedV2/tags/tag/Tag';
+import { useBatchAddTagsMutation, useBatchRemoveTagsMutation } from '@src/graphql/mutations.generated';
+import { Entity, EntityType, TagAssociation, Tag as TagType } from '@src/types.generated';
+
+const StyledTagContainer = styled.div`
+    display: flex;
+    align-items: center;
+    justify-content: start;
+    flex-wrap: wrap;
+    cursor: pointer;
+    gap: 4px;
+`;
+
+const StyledPill = styled.div<{ color?: string; backgroundColor?: string }>`
+    display: flex;
+    gap: 4px;
+    align-items: center;
+    justify-content: center;
+    background-color: ${(props) => props.backgroundColor || 'none'};
+    height: 24px;
+    width: 24px;
+    color: ${(props) => props.color || props.theme.colors.icon};
+    border-radius: 100px;
+    transition: all 0.2s;
+    &:hover {
+        color: ${(props) => props.theme.colors.text};
+        background-color: ${(props) => props.theme.colors.bgHover};
+    }
+`;
+
+const AdditionalPillCount = styled.div`
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px;
+    align-items: center;
+    font-size: 12px;
+    font-family: Mulish;
+    color: ${(props) => props.theme.colors.textSecondary};
+`;
+
+const TooltipTitleWrapper = styled.div`
+    cursor: pointer;
+    padding: 8px 4px 0px;
+`;
+
+const TooltipMoreText = styled.div`
+    color: ${(props) => props.theme.colors.textSecondary};
+    font-size: 12px;
+    margin-bottom: 4px;
+`;
+
+const MAX_TAGS_FOR_HOVER = 5;
+
+interface AcrylAssertionTagColumnProps {
+    record: any;
+    refetch?: () => void;
+}
+
+export const AcrylAssertionTagColumn: React.FC<AcrylAssertionTagColumnProps> = ({ record, refetch }) => {
+    const { t } = useTranslation('entity.profile.validations');
+    const [popoverVisible, setPopoverVisible] = useState(false);
+
+    const { recommendedData: allGlobalTags } = useGetRecommendations([EntityType.Tag]);
+    // GraphQL mutations for adding/removing entities
+    const [batchAddTagsMutation] = useBatchAddTagsMutation();
+    const [batchRemoveTagsMutation] = useBatchRemoveTagsMutation();
+
+    const totalTagsLength = record?.tags?.length || 0;
+    // just take first tag if there are more than 1 tag
+    const displayTags = totalTagsLength >= 2 ? [record.tags[0]] : record.tags;
+    const remainingTagsCount = totalTagsLength - displayTags?.length || 0;
+
+    const selectedTags = record?.tags?.map((global) => global.tag) || [];
+
+    const tagsPreview = (
+        <>
+            {displayTags?.map((tag) => (
+                <Tag
+                    tag={tag}
+                    key={tag.tag.urn}
+                    options={{
+                        shouldNotOpenDrawerOnClick: true,
+                        shouldNotAddBottomMargin: true,
+                        shouldShowEllipses: true,
+                    }}
+                    maxWidth={100}
+                />
+            ))}
+            {remainingTagsCount > 0 ? (
+                <DataHubTooltip
+                    overlayInnerStyle={{ backgroundColor: 'white' }}
+                    open={popoverVisible ? false : undefined}
+                    title={
+                        <TooltipTitleWrapper onClick={() => setPopoverVisible(true)}>
+                            {record?.tags
+                                ?.slice(1, MAX_TAGS_FOR_HOVER)
+                                .map((tag) => (
+                                    <Tag
+                                        key={tag.tag.urn}
+                                        tag={{ tag: tag.tag } as TagAssociation}
+                                        options={{ shouldNotOpenDrawerOnClick: true }}
+                                        maxWidth={120}
+                                        tagStyle={{ marginBottom: 4 }}
+                                    />
+                                ))}
+                            {(record?.tags?.length ?? 0) > MAX_TAGS_FOR_HOVER ? (
+                                <TooltipMoreText>
+                                    {t('assertionList.tagsMore', { count: record.tags.length - MAX_TAGS_FOR_HOVER })}
+                                </TooltipMoreText>
+                            ) : null}
+                        </TooltipTitleWrapper>
+                    }
+                >
+                    <AdditionalPillCount>
+                        <Plus />
+                        <span>{remainingTagsCount}</span>
+                    </AdditionalPillCount>
+                </DataHubTooltip>
+            ) : (
+                <StyledPill>
+                    <Plus />
+                </StyledPill>
+            )}
+        </>
+    );
+
+    const addTag = (
+        <StyledPill>
+            <Plus />
+        </StyledPill>
+    );
+
+    const handleTagContainerClick = (e: React.MouseEvent) => {
+        e.stopPropagation();
+    };
+    const handleClosePopover = () => {
+        setPopoverVisible(false);
+    };
+
+    // Adds multiple entities to the resource
+    const batchAddTags = async (newTags: string[]) => {
+        try {
+            await batchAddTagsMutation({
+                variables: {
+                    input: {
+                        tagUrns: newTags,
+                        resources: [{ resourceUrn: record.urn }],
+                    },
+                },
+            });
+        } catch (e) {
+            const { content, duration } = handleBatchError(newTags, e, {
+                content: t('tags.failedToAddEntities'),
+                duration: 3,
+            });
+            toast.error(content, { duration });
+        }
+    };
+
+    // Removes multiple entities from the resource
+    const batchRemoveTags = async (removedTags: string[]) => {
+        try {
+            await batchRemoveTagsMutation({
+                variables: {
+                    input: {
+                        tagUrns: removedTags,
+                        resources: [{ resourceUrn: record.urn }],
+                    },
+                },
+            });
+        } catch (e) {
+            const { content, duration } = handleBatchError(removedTags, e, {
+                content: t('tags.failedToRemoveEntities'),
+                duration: 3,
+            });
+            toast.error(content, { duration });
+        }
+    };
+
+    const handleSelectionChange = async ({ selectedItems, removedItems }) => {
+        if (selectedItems?.length || removedItems?.length) {
+            try {
+                // Add new entities
+                if (selectedItems?.length) {
+                    await batchAddTags(selectedItems as string[]);
+                }
+                // Remove unselected entities
+                if (removedItems?.length) {
+                    await batchRemoveTags(removedItems as string[]);
+                }
+
+                // Notify success and refresh UI
+                toast.success(t('tags.tagsUpdated'), { duration: 2 });
+                setPopoverVisible(false);
+                refetch?.();
+            } catch (e) {
+                console.log(e);
+            }
+        }
+    };
+
+    return (
+        <SelectItemPopover
+            key={`${popoverVisible}`}
+            entities={(allGlobalTags as Entity[]) || []}
+            selectedItems={selectedTags}
+            refetch={refetch}
+            onClose={handleClosePopover}
+            entityTypes={[EntityType.Tag]}
+            handleSelectionChange={handleSelectionChange}
+            visible={popoverVisible}
+            onVisibleChange={setPopoverVisible}
+            renderOption={(option) => {
+                return (
+                    <Tag
+                        tag={{ tag: option.item as TagType, associatedUrn: option.item?.urn }}
+                        options={{ shouldNotOpenDrawerOnClick: true }}
+                        maxWidth={120}
+                    />
+                );
+            }}
+        >
+            <StyledTagContainer onClick={handleTagContainerClick}>
+                {totalTagsLength > 0 ? tagsPreview : addTag}
+            </StyledTagContainer>
+        </SelectItemPopover>
+    );
+};

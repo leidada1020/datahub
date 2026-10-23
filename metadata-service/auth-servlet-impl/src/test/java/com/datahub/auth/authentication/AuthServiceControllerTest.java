@@ -1,0 +1,1237 @@
+package com.datahub.auth.authentication;
+
+import static com.datahub.auth.authentication.AuthServiceTestConfiguration.SYSTEM_CLIENT_ID;
+import static com.linkedin.metadata.Constants.CORP_USER_INFO_ASPECT_NAME;
+import static com.linkedin.metadata.Constants.DATAHUB_LOGIN_SOURCE_HEADER_NAME;
+import static com.linkedin.metadata.Constants.GLOBAL_SETTINGS_INFO_ASPECT_NAME;
+import static com.linkedin.metadata.Constants.GLOBAL_SETTINGS_URN;
+import static com.linkedin.metadata.utils.metrics.MetricUtils.DATAHUB_LOGIN;
+import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.reset;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+import static org.testng.Assert.*;
+
+import com.datahub.authentication.Actor;
+import com.datahub.authentication.ActorType;
+import com.datahub.authentication.Authentication;
+import com.datahub.authentication.AuthenticationConfiguration;
+import com.datahub.authentication.AuthenticationContext;
+import com.datahub.authentication.LoginDenialReason;
+import com.datahub.authentication.invite.InviteTokenService;
+import com.datahub.authentication.session.UserSessionEligibilityChecker;
+import com.datahub.authentication.token.StatelessTokenService;
+import com.datahub.authentication.token.TokenClaims;
+import com.datahub.authentication.token.TokenType;
+import com.datahub.authentication.user.NativeUserService;
+import com.datahub.telemetry.TrackingService;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.linkedin.common.urn.UrnUtils;
+import com.linkedin.data.schema.annotation.PathSpecBasedSchemaAnnotationVisitor;
+import com.linkedin.gms.factory.config.ConfigurationProvider;
+import com.linkedin.identity.CorpUserInfo;
+import com.linkedin.identity.InviteToken;
+import com.linkedin.metadata.datahubusage.event.LoginSource;
+import com.linkedin.metadata.entity.EntityService;
+import com.linkedin.metadata.utils.metrics.MetricUtils;
+import com.linkedin.settings.global.GlobalSettingsInfo;
+import com.linkedin.settings.global.OidcSettings;
+import com.linkedin.settings.global.SsoSettings;
+import io.datahubproject.metadata.context.OperationContext;
+import io.datahubproject.metadata.services.SecretService;
+import io.opentelemetry.api.trace.SpanContext;
+import jakarta.servlet.http.HttpServletRequest;
+import java.io.IOException;
+import java.util.Map;
+import java.util.Optional;
+import org.mockito.ArgumentCaptor;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.context.annotation.ComponentScan;
+import org.springframework.context.annotation.Import;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.test.context.testng.AbstractTestNGSpringContextTests;
+import org.springframework.web.servlet.DispatcherServlet;
+import org.testng.annotations.BeforeMethod;
+import org.testng.annotations.BeforeTest;
+import org.testng.annotations.Test;
+
+@SpringBootTest(classes = {DispatcherServlet.class})
+@ComponentScan(basePackages = {"com.datahub.auth.authentication"})
+@Import({AuthServiceTestConfiguration.class})
+public class AuthServiceControllerTest extends AbstractTestNGSpringContextTests {
+
+  private static final HttpServletRequest request = mock(HttpServletRequest.class);
+
+  @BeforeTest
+  public void disableAssert() {
+    PathSpecBasedSchemaAnnotationVisitor.class
+        .getClassLoader()
+        .setClassAssertionStatus(PathSpecBasedSchemaAnnotationVisitor.class.getName(), false);
+  }
+
+  @BeforeMethod
+  public void stubSessionEligibility() {
+    reset(mockUserSessionEligibilityChecker);
+    reset(mockMetricUtils);
+    reset(mockTokenService);
+    reset(mockEntityService);
+    when(mockUserSessionEligibilityChecker.checkEligibility(
+            any(OperationContext.class), anyString(), anyBoolean()))
+        .thenReturn(Optional.empty());
+    // Provide a default authentication so every test has a valid actor in AuthenticationContext.
+    // Individual tests may override this with AuthenticationContext.setAuthentication(...).
+    Authentication defaultAuth =
+        new Authentication(
+            new Actor(ActorType.USER, AuthServiceTestConfiguration.SYSTEM_CLIENT_ID),
+            String.format(
+                "Basic %s:%s", AuthServiceTestConfiguration.SYSTEM_CLIENT_ID, "systemSecret"));
+    AuthenticationContext.setAuthentication(defaultAuth);
+  }
+
+  @Autowired private AuthServiceController authServiceController;
+  @Autowired private EntityService mockEntityService;
+  @Autowired private SecretService mockSecretService;
+  @Autowired private NativeUserService mockNativeUserService;
+  @Autowired private StatelessTokenService mockTokenService;
+  @Autowired private InviteTokenService mockInviteTokenService;
+  @Autowired private OperationContext systemOperationContext;
+  @Autowired private ConfigurationProvider mockConfigProvider;
+  @Autowired private SpanContext mockSpanContext;
+  @Autowired private ObjectMapper objectMapper;
+  @Autowired private TrackingService mockTrackingService;
+  @Autowired private MetricUtils mockMetricUtils;
+
+  @Autowired private UserSessionEligibilityChecker mockUserSessionEligibilityChecker;
+
+  private final String PREFERRED_JWS_ALGORITHM = "preferredJwsAlgorithm";
+
+  @Test
+  public void initTest() {
+    assertNotNull(authServiceController);
+    assertNotNull(mockEntityService);
+  }
+
+  @Test
+  public void oldPreferredJwsAlgorithmIsNotReturned() throws IOException {
+    OidcSettings mockOidcSettings =
+        new OidcSettings()
+            .setEnabled(true)
+            .setClientId("1")
+            .setClientSecret("2")
+            .setDiscoveryUri("http://localhost")
+            .setPreferredJwsAlgorithm("test");
+    SsoSettings mockSsoSettings =
+        new SsoSettings().setBaseUrl("http://localhost").setOidcSettings(mockOidcSettings);
+    GlobalSettingsInfo mockGlobalSettingsInfo = new GlobalSettingsInfo().setSso(mockSsoSettings);
+
+    when(mockEntityService.getLatestAspect(
+            any(OperationContext.class),
+            eq(GLOBAL_SETTINGS_URN),
+            eq(GLOBAL_SETTINGS_INFO_ASPECT_NAME)))
+        .thenReturn(mockGlobalSettingsInfo);
+
+    ResponseEntity<String> httpResponse =
+        authServiceController.getSsoSettings(request, null).join();
+    assertEquals(httpResponse.getStatusCode(), HttpStatus.OK);
+
+    JsonNode jsonNode = new ObjectMapper().readTree(httpResponse.getBody());
+    assertFalse(jsonNode.has(PREFERRED_JWS_ALGORITHM));
+  }
+
+  @Test
+  public void newPreferredJwsAlgorithmIsReturned() throws IOException {
+    OidcSettings mockOidcSettings =
+        new OidcSettings()
+            .setEnabled(true)
+            .setClientId("1")
+            .setClientSecret("2")
+            .setDiscoveryUri("http://localhost")
+            .setPreferredJwsAlgorithm("jws1")
+            .setPreferredJwsAlgorithm2("jws2");
+    SsoSettings mockSsoSettings =
+        new SsoSettings().setBaseUrl("http://localhost").setOidcSettings(mockOidcSettings);
+    GlobalSettingsInfo mockGlobalSettingsInfo = new GlobalSettingsInfo().setSso(mockSsoSettings);
+
+    when(mockEntityService.getLatestAspect(
+            any(OperationContext.class),
+            eq(GLOBAL_SETTINGS_URN),
+            eq(GLOBAL_SETTINGS_INFO_ASPECT_NAME)))
+        .thenReturn(mockGlobalSettingsInfo);
+
+    ResponseEntity<String> httpResponse =
+        authServiceController.getSsoSettings(request, null).join();
+    assertEquals(httpResponse.getStatusCode(), HttpStatus.OK);
+
+    JsonNode jsonNode = new ObjectMapper().readTree(httpResponse.getBody());
+    assertTrue(jsonNode.has(PREFERRED_JWS_ALGORITHM));
+    assertEquals(jsonNode.get(PREFERRED_JWS_ALGORITHM).asText(), "jws2");
+  }
+
+  @Test
+  public void testGenerateSessionTokenForUserSuccess() throws Exception {
+    // Setup
+    String userId = "testUser";
+    String generatedToken = "test-token-123";
+
+    // Mock authentication as system user
+    Authentication systemAuth = mock(Authentication.class);
+    Actor systemActor = new Actor(ActorType.USER, SYSTEM_CLIENT_ID);
+    when(systemAuth.getActor()).thenReturn(systemActor);
+    when(systemAuth.getCredentials())
+        .thenReturn(String.format("Basic %s:%s", SYSTEM_CLIENT_ID, "systemSecret"));
+    AuthenticationContext.setAuthentication(systemAuth);
+
+    // Mock token service
+    when(mockTokenService.generateAccessToken(eq(TokenType.SESSION), any(Actor.class), anyLong()))
+        .thenReturn(generatedToken);
+
+    // Create request body
+    ObjectNode requestBody = objectMapper.createObjectNode();
+    requestBody.put("userId", userId);
+    HttpEntity<String> httpEntity = new HttpEntity<>(objectMapper.writeValueAsString(requestBody));
+
+    when(mockConfigProvider.getAuthentication()).thenReturn(new AuthenticationConfiguration());
+    // Execute
+    ResponseEntity<String> response =
+        authServiceController.generateSessionTokenForUser(request, httpEntity).join();
+
+    // Verify
+    assertEquals(HttpStatus.OK, response.getStatusCode());
+    JsonNode responseJson = objectMapper.readTree(response.getBody());
+    assertTrue(responseJson.has("accessToken"));
+    assertEquals(generatedToken, responseJson.get("accessToken").asText());
+
+    // Verify token service was called with correct parameters
+    ArgumentCaptor<Actor> actorCaptor = ArgumentCaptor.forClass(Actor.class);
+    verify(mockTokenService)
+        .generateAccessToken(eq(TokenType.SESSION), actorCaptor.capture(), anyLong());
+
+    Actor capturedActor = actorCaptor.getValue();
+    assertEquals(userId, capturedActor.getId());
+    verifyLoginMetric("success", "unknown", "none");
+  }
+
+  @Test
+  public void testGenerateSessionTokenForUserSuccessWithLoginSource() throws Exception {
+    String userId = "ssoUser";
+    String generatedToken = "sso-token";
+
+    Authentication systemAuth = mock(Authentication.class);
+    Actor systemActor = new Actor(ActorType.USER, SYSTEM_CLIENT_ID);
+    when(systemAuth.getActor()).thenReturn(systemActor);
+    when(systemAuth.getCredentials())
+        .thenReturn(String.format("Basic %s:%s", SYSTEM_CLIENT_ID, "systemSecret"));
+    AuthenticationContext.setAuthentication(systemAuth);
+
+    when(mockTokenService.generateAccessToken(eq(TokenType.SESSION), any(Actor.class), anyLong()))
+        .thenReturn(generatedToken);
+    when(mockConfigProvider.getAuthentication()).thenReturn(new AuthenticationConfiguration());
+
+    ObjectNode requestBody = objectMapper.createObjectNode();
+    requestBody.put("userId", userId);
+    HttpHeaders headers = new HttpHeaders();
+    headers.add(DATAHUB_LOGIN_SOURCE_HEADER_NAME, LoginSource.SSO_LOGIN.getSource());
+    HttpEntity<String> httpEntity =
+        new HttpEntity<>(objectMapper.writeValueAsString(requestBody), headers);
+
+    ResponseEntity<String> response =
+        authServiceController.generateSessionTokenForUser(request, httpEntity).join();
+
+    assertEquals(HttpStatus.OK, response.getStatusCode());
+    verifyLoginMetric("success", LoginSource.SSO_LOGIN.getSource(), "none");
+  }
+
+  @Test
+  public void testGenerateSessionTokenForUserUnknownLoginSourceHeader() throws Exception {
+    String userId = "testUser";
+    String generatedToken = "test-token";
+
+    Authentication systemAuth = mock(Authentication.class);
+    Actor systemActor = new Actor(ActorType.USER, SYSTEM_CLIENT_ID);
+    when(systemAuth.getActor()).thenReturn(systemActor);
+    when(systemAuth.getCredentials())
+        .thenReturn(String.format("Basic %s:%s", SYSTEM_CLIENT_ID, "systemSecret"));
+    AuthenticationContext.setAuthentication(systemAuth);
+
+    when(mockTokenService.generateAccessToken(eq(TokenType.SESSION), any(Actor.class), anyLong()))
+        .thenReturn(generatedToken);
+    when(mockConfigProvider.getAuthentication()).thenReturn(new AuthenticationConfiguration());
+
+    ObjectNode requestBody = objectMapper.createObjectNode();
+    requestBody.put("userId", userId);
+    HttpHeaders headers = new HttpHeaders();
+    headers.add(DATAHUB_LOGIN_SOURCE_HEADER_NAME, "not-a-real-source");
+    HttpEntity<String> httpEntity =
+        new HttpEntity<>(objectMapper.writeValueAsString(requestBody), headers);
+
+    ResponseEntity<String> response =
+        authServiceController.generateSessionTokenForUser(request, httpEntity).join();
+
+    assertEquals(HttpStatus.OK, response.getStatusCode());
+    verifyLoginMetric("success", "unknown", "none");
+  }
+
+  @Test
+  public void testGenerateSessionTokenForUserEnumNameLoginSourceHeader() throws Exception {
+    // Some clients send LoginSource.name() (PASSWORD_LOGIN) rather than getSource()
+    // (passwordLogin). Both must resolve so loginSource is retained on the usage event.
+    String userId = "testUser";
+    String generatedToken = "test-token";
+
+    Authentication systemAuth = mock(Authentication.class);
+    Actor systemActor = new Actor(ActorType.USER, SYSTEM_CLIENT_ID);
+    when(systemAuth.getActor()).thenReturn(systemActor);
+    when(systemAuth.getCredentials())
+        .thenReturn(String.format("Basic %s:%s", SYSTEM_CLIENT_ID, "systemSecret"));
+    AuthenticationContext.setAuthentication(systemAuth);
+
+    when(mockTokenService.generateAccessToken(eq(TokenType.SESSION), any(Actor.class), anyLong()))
+        .thenReturn(generatedToken);
+    when(mockConfigProvider.getAuthentication()).thenReturn(new AuthenticationConfiguration());
+
+    ObjectNode requestBody = objectMapper.createObjectNode();
+    requestBody.put("userId", userId);
+    HttpHeaders headers = new HttpHeaders();
+    headers.add(DATAHUB_LOGIN_SOURCE_HEADER_NAME, "PASSWORD_LOGIN");
+    HttpEntity<String> httpEntity =
+        new HttpEntity<>(objectMapper.writeValueAsString(requestBody), headers);
+
+    ResponseEntity<String> response =
+        authServiceController.generateSessionTokenForUser(request, httpEntity).join();
+
+    assertEquals(HttpStatus.OK, response.getStatusCode());
+    verifyLoginMetric("success", LoginSource.PASSWORD_LOGIN.getSource(), "none");
+  }
+
+  @Test
+  public void testGenerateSessionTokenForUserUnauthorized() throws Exception {
+    setNonSystemAuthentication();
+    ObjectNode requestBody = objectMapper.createObjectNode();
+    requestBody.put("userId", "testUser");
+    HttpEntity<String> httpEntity = new HttpEntity<>(objectMapper.writeValueAsString(requestBody));
+
+    ResponseEntity<String> response =
+        authServiceController.generateSessionTokenForUser(request, httpEntity).join();
+
+    assertEquals(HttpStatus.UNAUTHORIZED, response.getStatusCode());
+    verify(mockTokenService, never())
+        .generateAccessToken(eq(TokenType.SESSION), any(Actor.class), anyLong());
+  }
+
+  @Test
+  public void testGenerateSessionTokenRejectsBearerWhenActorIdMatchesSystemClient()
+      throws Exception {
+    setBearerAuthentication(SYSTEM_CLIENT_ID);
+    ObjectNode requestBody = objectMapper.createObjectNode();
+    requestBody.put("userId", "testUser");
+    HttpEntity<String> httpEntity = new HttpEntity<>(objectMapper.writeValueAsString(requestBody));
+
+    ResponseEntity<String> response =
+        authServiceController.generateSessionTokenForUser(request, httpEntity).join();
+
+    assertEquals(HttpStatus.UNAUTHORIZED, response.getStatusCode());
+    verify(mockTokenService, never())
+        .generateAccessToken(eq(TokenType.SESSION), any(Actor.class), anyLong());
+  }
+
+  @Test
+  public void testGenerateSessionTokenAcceptsBasicForOtherSystemActor() throws Exception {
+    AuthenticationContext.setAuthentication(
+        new Authentication(
+            new Actor(ActorType.USER, "other-system"), "Basic other-system:shared-secret"));
+    when(mockEntityService.getLatestAspect(
+            any(OperationContext.class),
+            eq(UrnUtils.getUrn("urn:li:corpuser:other-system")),
+            eq(CORP_USER_INFO_ASPECT_NAME)))
+        .thenReturn(new CorpUserInfo().setSystem(true));
+    when(mockTokenService.generateAccessToken(eq(TokenType.SESSION), any(Actor.class), anyLong()))
+        .thenReturn("test-token-123");
+    when(mockConfigProvider.getAuthentication()).thenReturn(new AuthenticationConfiguration());
+    ObjectNode requestBody = objectMapper.createObjectNode();
+    requestBody.put("userId", "testUser");
+    HttpEntity<String> httpEntity = new HttpEntity<>(objectMapper.writeValueAsString(requestBody));
+
+    ResponseEntity<String> response =
+        authServiceController.generateSessionTokenForUser(request, httpEntity).join();
+
+    assertEquals(HttpStatus.OK, response.getStatusCode());
+  }
+
+  @Test
+  public void testGenerateSessionTokenRejectsSessionEvenWhenCorpUserIsSystem() throws Exception {
+    setBearerAuthentication("other-system");
+    when(mockEntityService.getLatestAspect(
+            any(OperationContext.class),
+            eq(UrnUtils.getUrn("urn:li:corpuser:other-system")),
+            eq(CORP_USER_INFO_ASPECT_NAME)))
+        .thenReturn(new CorpUserInfo().setSystem(true));
+    ObjectNode requestBody = objectMapper.createObjectNode();
+    requestBody.put("userId", "testUser");
+    HttpEntity<String> httpEntity = new HttpEntity<>(objectMapper.writeValueAsString(requestBody));
+
+    ResponseEntity<String> response =
+        authServiceController.generateSessionTokenForUser(request, httpEntity).join();
+
+    assertEquals(HttpStatus.UNAUTHORIZED, response.getStatusCode());
+    verify(mockTokenService, never())
+        .generateAccessToken(eq(TokenType.SESSION), any(Actor.class), anyLong());
+  }
+
+  @Test
+  public void testGenerateSessionTokenForUserBadRequest() throws Exception {
+    // Setup
+    Authentication systemAuth = mock(Authentication.class);
+    Actor systemActor = new Actor(ActorType.USER, SYSTEM_CLIENT_ID);
+    when(systemAuth.getActor()).thenReturn(systemActor);
+    when(systemAuth.getCredentials())
+        .thenReturn(String.format("Basic %s:%s", SYSTEM_CLIENT_ID, "systemSecret"));
+    AuthenticationContext.setAuthentication(systemAuth);
+
+    // Create invalid request body (missing userId)
+    ObjectNode requestBody = objectMapper.createObjectNode();
+    HttpEntity<String> httpEntity = new HttpEntity<>(objectMapper.writeValueAsString(requestBody));
+
+    // Execute
+    ResponseEntity<String> response =
+        authServiceController.generateSessionTokenForUser(request, httpEntity).join();
+
+    // Verify bad request status
+    assertEquals(HttpStatus.BAD_REQUEST, response.getStatusCode());
+  }
+
+  @Test
+  public void testGenerateSessionTokenForUserEligibilityDenied() throws Exception {
+    String userId = "disabledUser";
+    Authentication systemAuth = mock(Authentication.class);
+    Actor systemActor = new Actor(ActorType.USER, SYSTEM_CLIENT_ID);
+    when(systemAuth.getActor()).thenReturn(systemActor);
+    when(systemAuth.getCredentials())
+        .thenReturn(String.format("Basic %s:%s", SYSTEM_CLIENT_ID, "systemSecret"));
+    AuthenticationContext.setAuthentication(systemAuth);
+
+    when(mockUserSessionEligibilityChecker.checkEligibility(
+            any(OperationContext.class), eq(userId), anyBoolean()))
+        .thenReturn(Optional.of(LoginDenialReason.SOFT_DELETED));
+
+    AuthenticationConfiguration authConfig = new AuthenticationConfiguration();
+    authConfig.setVerboseAuthFailureLogging(true);
+    when(mockConfigProvider.getAuthentication()).thenReturn(authConfig);
+
+    ObjectNode requestBody = objectMapper.createObjectNode();
+    requestBody.put("userId", userId);
+    HttpHeaders headers = new HttpHeaders();
+    headers.add(DATAHUB_LOGIN_SOURCE_HEADER_NAME, LoginSource.SSO_LOGIN.getSource());
+    HttpEntity<String> httpEntity =
+        new HttpEntity<>(objectMapper.writeValueAsString(requestBody), headers);
+
+    ResponseEntity<String> response =
+        authServiceController.generateSessionTokenForUser(request, httpEntity).join();
+
+    assertEquals(HttpStatus.FORBIDDEN, response.getStatusCode());
+    JsonNode responseJson = objectMapper.readTree(response.getBody());
+    assertEquals(
+        LoginDenialReason.SOFT_DELETED.name(), responseJson.get("loginDenialReason").asText());
+    verify(mockTokenService, never())
+        .generateAccessToken(eq(TokenType.SESSION), any(Actor.class), anyLong());
+    verifyLoginMetric(
+        "failure", LoginSource.SSO_LOGIN.getSource(), LoginDenialReason.SOFT_DELETED.name());
+  }
+
+  @Test
+  public void testVerifyNativeUserCredentialsEligibleDenied() throws Exception {
+    String userUrn = "urn:li:corpuser:testUser";
+    String password = "correctPassword";
+
+    when(mockNativeUserService.doesPasswordMatch(
+            any(OperationContext.class), eq(userUrn), eq(password)))
+        .thenReturn(true);
+    when(mockUserSessionEligibilityChecker.checkEligibility(
+            any(OperationContext.class), eq(userUrn), anyBoolean()))
+        .thenReturn(Optional.of(LoginDenialReason.SUSPENDED));
+
+    AuthenticationConfiguration authConfig = new AuthenticationConfiguration();
+    when(mockConfigProvider.getAuthentication()).thenReturn(authConfig);
+
+    ObjectNode requestBody = objectMapper.createObjectNode();
+    requestBody.put("userUrn", userUrn);
+    requestBody.put("password", password);
+    HttpEntity<String> httpEntity = new HttpEntity<>(objectMapper.writeValueAsString(requestBody));
+
+    ResponseEntity<String> response =
+        authServiceController.verifyNativeUserCredentials(request, httpEntity).join();
+
+    assertEquals(HttpStatus.OK, response.getStatusCode());
+    JsonNode responseJson = objectMapper.readTree(response.getBody());
+    assertTrue(responseJson.get("doesPasswordMatch").asBoolean());
+    assertEquals(
+        LoginDenialReason.SUSPENDED.name(), responseJson.get("loginDenialReason").asText());
+    verifyLoginMetric(
+        "failure", LoginSource.PASSWORD_LOGIN.getSource(), LoginDenialReason.SUSPENDED.name());
+  }
+
+  @Test
+  public void testGenerateSessionTokenForUserEligibilityHardDeleted() throws Exception {
+    String userId = "missingKeyUser";
+    Authentication systemAuth = mock(Authentication.class);
+    Actor systemActor = new Actor(ActorType.USER, SYSTEM_CLIENT_ID);
+    when(systemAuth.getActor()).thenReturn(systemActor);
+    when(systemAuth.getCredentials())
+        .thenReturn(String.format("Basic %s:%s", SYSTEM_CLIENT_ID, "systemSecret"));
+    AuthenticationContext.setAuthentication(systemAuth);
+
+    when(mockUserSessionEligibilityChecker.checkEligibility(
+            any(OperationContext.class), eq(userId), anyBoolean()))
+        .thenReturn(Optional.of(LoginDenialReason.HARD_DELETED));
+
+    when(mockConfigProvider.getAuthentication()).thenReturn(new AuthenticationConfiguration());
+
+    ObjectNode requestBody = objectMapper.createObjectNode();
+    requestBody.put("userId", userId);
+    HttpEntity<String> httpEntity = new HttpEntity<>(objectMapper.writeValueAsString(requestBody));
+
+    ResponseEntity<String> response =
+        authServiceController.generateSessionTokenForUser(request, httpEntity).join();
+
+    assertEquals(HttpStatus.FORBIDDEN, response.getStatusCode());
+    JsonNode responseJson = objectMapper.readTree(response.getBody());
+    assertEquals(
+        LoginDenialReason.HARD_DELETED.name(), responseJson.get("loginDenialReason").asText());
+    verify(mockTokenService, never())
+        .generateAccessToken(eq(TokenType.SESSION), any(Actor.class), anyLong());
+  }
+
+  @Test
+  public void testGenerateSessionTokenForUserEligibilityNotProvisioned() throws Exception {
+    String userId = "stubUser";
+    Authentication systemAuth = mock(Authentication.class);
+    Actor systemActor = new Actor(ActorType.USER, SYSTEM_CLIENT_ID);
+    when(systemAuth.getActor()).thenReturn(systemActor);
+    when(systemAuth.getCredentials())
+        .thenReturn(String.format("Basic %s:%s", SYSTEM_CLIENT_ID, "systemSecret"));
+    AuthenticationContext.setAuthentication(systemAuth);
+
+    when(mockUserSessionEligibilityChecker.checkEligibility(
+            any(OperationContext.class), eq(userId), anyBoolean()))
+        .thenReturn(Optional.of(LoginDenialReason.NOT_PROVISIONED));
+
+    when(mockConfigProvider.getAuthentication()).thenReturn(new AuthenticationConfiguration());
+
+    ObjectNode requestBody = objectMapper.createObjectNode();
+    requestBody.put("userId", userId);
+    HttpEntity<String> httpEntity = new HttpEntity<>(objectMapper.writeValueAsString(requestBody));
+
+    ResponseEntity<String> response =
+        authServiceController.generateSessionTokenForUser(request, httpEntity).join();
+
+    assertEquals(HttpStatus.FORBIDDEN, response.getStatusCode());
+    JsonNode responseJson = objectMapper.readTree(response.getBody());
+    assertEquals(
+        LoginDenialReason.NOT_PROVISIONED.name(), responseJson.get("loginDenialReason").asText());
+  }
+
+  @Test
+  public void testVerifyNativeUserCredentialsNotProvisioned() throws Exception {
+    String userUrn = "urn:li:corpuser:stub";
+    String password = "correctPassword";
+
+    when(mockNativeUserService.doesPasswordMatch(
+            any(OperationContext.class), eq(userUrn), eq(password)))
+        .thenReturn(true);
+    when(mockUserSessionEligibilityChecker.checkEligibility(
+            any(OperationContext.class), eq(userUrn), anyBoolean()))
+        .thenReturn(Optional.of(LoginDenialReason.NOT_PROVISIONED));
+
+    when(mockConfigProvider.getAuthentication()).thenReturn(new AuthenticationConfiguration());
+
+    ObjectNode requestBody = objectMapper.createObjectNode();
+    requestBody.put("userUrn", userUrn);
+    requestBody.put("password", password);
+    HttpEntity<String> httpEntity = new HttpEntity<>(objectMapper.writeValueAsString(requestBody));
+
+    ResponseEntity<String> response =
+        authServiceController.verifyNativeUserCredentials(request, httpEntity).join();
+
+    assertEquals(HttpStatus.OK, response.getStatusCode());
+    JsonNode responseJson = objectMapper.readTree(response.getBody());
+    assertTrue(responseJson.get("doesPasswordMatch").asBoolean());
+    assertEquals(
+        LoginDenialReason.NOT_PROVISIONED.name(), responseJson.get("loginDenialReason").asText());
+  }
+
+  @Test
+  public void testSignUpSuccess() throws Exception {
+    // Setup
+    String userUrn = "urn:li:corpuser:testUser";
+    String fullName = "Test User";
+    String email = "test@example.com";
+    String title = "Software Engineer";
+    String password = "securePassword123";
+    String inviteToken = "valid-invite-token";
+    // Mock invite token service
+    when(mockInviteTokenService.getVerifiedInviteToken(
+            any(OperationContext.class), eq(inviteToken)))
+        .thenReturn(new InviteToken().setToken("encrypted-invite-token"));
+
+    // Create request body
+    ObjectNode requestBody = objectMapper.createObjectNode();
+    requestBody.put("userUrn", userUrn);
+    requestBody.put("fullName", fullName);
+    requestBody.put("email", email);
+    requestBody.put("title", title);
+    requestBody.put("password", password);
+    requestBody.put("inviteToken", inviteToken);
+    HttpEntity<String> httpEntity = new HttpEntity<>(objectMapper.writeValueAsString(requestBody));
+
+    AuthenticationConfiguration authenticationConfiguration = new AuthenticationConfiguration();
+    authenticationConfiguration.setSystemClientId(SYSTEM_CLIENT_ID);
+    when(mockConfigProvider.getAuthentication()).thenReturn(authenticationConfiguration);
+
+    // Execute
+    ResponseEntity<String> response = authServiceController.signUp(request, httpEntity).join();
+
+    // Verify
+    assertEquals(HttpStatus.OK, response.getStatusCode());
+    JsonNode responseJson = objectMapper.readTree(response.getBody());
+    assertTrue(responseJson.has("isNativeUserCreated"));
+    assertTrue(responseJson.get("isNativeUserCreated").asBoolean());
+
+    // Verify native user service was called with correct parameters
+    verify(mockNativeUserService)
+        .createNativeUser(
+            argThat(
+                ctx ->
+                    ctx.getAuthentication() != null && ctx.getAuthentication().getActor() != null),
+            eq(userUrn),
+            eq(fullName),
+            eq(email),
+            eq(title),
+            eq(password));
+  }
+
+  @Test
+  public void testSignUpWithInvalidInviteToken() throws Exception {
+    // Setup
+    String userUrn = "urn:li:corpuser:testUser";
+    String fullName = "Test User";
+    String email = "test@example.com";
+    String title = "Software Engineer";
+    String password = "securePassword123";
+    String inviteToken = "invalid-invite-token";
+    // Mock invite token service to return invalid token
+    when(mockInviteTokenService.getVerifiedInviteToken(
+            any(OperationContext.class), eq(inviteToken)))
+        .thenReturn(null);
+
+    // Create request body
+    ObjectNode requestBody = objectMapper.createObjectNode();
+    requestBody.put("userUrn", userUrn);
+    requestBody.put("fullName", fullName);
+    requestBody.put("email", email);
+    requestBody.put("title", title);
+    requestBody.put("password", password);
+    requestBody.put("inviteToken", inviteToken);
+    HttpEntity<String> httpEntity = new HttpEntity<>(objectMapper.writeValueAsString(requestBody));
+
+    AuthenticationConfiguration authenticationConfiguration = new AuthenticationConfiguration();
+    authenticationConfiguration.setSystemClientId(SYSTEM_CLIENT_ID);
+    when(mockConfigProvider.getAuthentication()).thenReturn(authenticationConfiguration);
+
+    // Execute
+    ResponseEntity<String> response = authServiceController.signUp(request, httpEntity).join();
+
+    // Verify
+    assertEquals(HttpStatus.BAD_REQUEST, response.getStatusCode());
+  }
+
+  @Test
+  public void testSignUpWithoutTitle() throws Exception {
+    // Setup - no title provided
+    String userUrn = "urn:li:corpuser:testUser";
+    String fullName = "Test User";
+    String email = "test@example.com";
+    String password = "securePassword123";
+    String inviteToken = "valid-invite-token";
+    // Mock invite token service
+    when(mockInviteTokenService.getVerifiedInviteToken(
+            any(OperationContext.class), eq(inviteToken)))
+        .thenReturn(new InviteToken().setToken("encrypted-invite-token"));
+
+    // Create request body without title field
+    ObjectNode requestBody = objectMapper.createObjectNode();
+    requestBody.put("userUrn", userUrn);
+    requestBody.put("fullName", fullName);
+    requestBody.put("email", email);
+    // Note: title is intentionally omitted
+    requestBody.put("password", password);
+    requestBody.put("inviteToken", inviteToken);
+    HttpEntity<String> httpEntity = new HttpEntity<>(objectMapper.writeValueAsString(requestBody));
+
+    AuthenticationConfiguration authenticationConfiguration = new AuthenticationConfiguration();
+    authenticationConfiguration.setSystemClientId(SYSTEM_CLIENT_ID);
+    when(mockConfigProvider.getAuthentication()).thenReturn(authenticationConfiguration);
+
+    // Execute
+    ResponseEntity<String> response = authServiceController.signUp(request, httpEntity).join();
+
+    // Verify
+    assertEquals(HttpStatus.OK, response.getStatusCode());
+    JsonNode responseJson = objectMapper.readTree(response.getBody());
+    assertTrue(responseJson.has("isNativeUserCreated"));
+    assertTrue(responseJson.get("isNativeUserCreated").asBoolean());
+
+    // Verify native user service was called with null title
+    verify(mockNativeUserService)
+        .createNativeUser(
+            argThat(
+                ctx ->
+                    ctx.getAuthentication() != null && ctx.getAuthentication().getActor() != null),
+            eq(userUrn),
+            eq(fullName),
+            eq(email),
+            isNull(),
+            eq(password));
+  }
+
+  @Test
+  public void testVerifyNativeUserCredentialsSuccess() throws Exception {
+    // Setup
+    String userUrn = "urn:li:corpuser:testUser";
+    String password = "correctPassword";
+
+    // Mock password verification
+    when(mockNativeUserService.doesPasswordMatch(
+            any(OperationContext.class), eq(userUrn), eq(password)))
+        .thenReturn(true);
+
+    when(mockConfigProvider.getAuthentication()).thenReturn(new AuthenticationConfiguration());
+
+    // Create request body
+    ObjectNode requestBody = objectMapper.createObjectNode();
+    requestBody.put("userUrn", userUrn);
+    requestBody.put("password", password);
+    HttpEntity<String> httpEntity = new HttpEntity<>(objectMapper.writeValueAsString(requestBody));
+
+    // Execute
+    ResponseEntity<String> response =
+        authServiceController.verifyNativeUserCredentials(request, httpEntity).join();
+
+    // Verify
+    assertEquals(HttpStatus.OK, response.getStatusCode());
+    JsonNode responseJson = objectMapper.readTree(response.getBody());
+    assertTrue(responseJson.has("doesPasswordMatch"));
+    assertTrue(responseJson.get("doesPasswordMatch").asBoolean());
+  }
+
+  @Test
+  public void testVerifyNativeUserCredentialsFailure() throws Exception {
+    // Setup
+    String userUrn = "urn:li:corpuser:testUser";
+    String password = "incorrectPassword";
+
+    // Mock password verification
+    when(mockNativeUserService.doesPasswordMatch(
+            any(OperationContext.class), eq(userUrn), eq(password)))
+        .thenReturn(false);
+
+    // Create request body
+    ObjectNode requestBody = objectMapper.createObjectNode();
+    requestBody.put("userUrn", userUrn);
+    requestBody.put("password", password);
+    HttpEntity<String> httpEntity = new HttpEntity<>(objectMapper.writeValueAsString(requestBody));
+
+    when(mockConfigProvider.getAuthentication()).thenReturn(new AuthenticationConfiguration());
+
+    // Execute
+    ResponseEntity<String> response =
+        authServiceController.verifyNativeUserCredentials(request, httpEntity).join();
+
+    // Verify
+    assertEquals(HttpStatus.OK, response.getStatusCode());
+    JsonNode responseJson = objectMapper.readTree(response.getBody());
+    assertTrue(responseJson.has("doesPasswordMatch"));
+    assertFalse(responseJson.get("doesPasswordMatch").asBoolean());
+    assertTrue(responseJson.has("loginDenialReason"));
+    assertEquals(
+        LoginDenialReason.INVALID_CREDENTIALS.name(),
+        responseJson.get("loginDenialReason").asText());
+    verifyLoginMetric(
+        "failure",
+        LoginSource.PASSWORD_LOGIN.getSource(),
+        LoginDenialReason.INVALID_CREDENTIALS.name());
+  }
+
+  @Test
+  public void testResetNativeUserCredentialsSuccess() throws Exception {
+    // Setup
+    String userUrn = "urn:li:corpuser:testUser";
+    String password = "newPassword123";
+    String resetToken = "valid-reset-token";
+
+    // Create request body
+    ObjectNode requestBody = objectMapper.createObjectNode();
+    requestBody.put("userUrn", userUrn);
+    requestBody.put("password", password);
+    requestBody.put("resetToken", resetToken);
+    HttpEntity<String> httpEntity = new HttpEntity<>(objectMapper.writeValueAsString(requestBody));
+
+    // Execute
+    ResponseEntity<String> response =
+        authServiceController.resetNativeUserCredentials(request, httpEntity).join();
+
+    // Verify
+    assertEquals(HttpStatus.OK, response.getStatusCode());
+    JsonNode responseJson = objectMapper.readTree(response.getBody());
+    assertTrue(responseJson.has("areNativeUserCredentialsReset"));
+    assertTrue(responseJson.get("areNativeUserCredentialsReset").asBoolean());
+
+    // Verify native user service was called with correct parameters
+    verify(mockNativeUserService)
+        .resetCorpUserCredentials(
+            any(OperationContext.class), eq(userUrn), eq(password), eq(resetToken));
+  }
+
+  @Test
+  public void testGetSsoSettingsNotFound() throws Exception {
+    // Mock entity service to return null (no SSO settings available)
+    when(mockEntityService.getLatestAspect(
+            any(OperationContext.class),
+            eq(GLOBAL_SETTINGS_URN),
+            eq(GLOBAL_SETTINGS_INFO_ASPECT_NAME)))
+        .thenReturn(null);
+
+    // Execute
+    ResponseEntity<String> response = authServiceController.getSsoSettings(request, null).join();
+
+    // Verify
+    assertEquals(HttpStatus.NOT_FOUND, response.getStatusCode());
+  }
+
+  @Test
+  public void testGetSsoSettingsWithoutOidc() throws IOException {
+    // Setup SSO settings without OIDC
+    SsoSettings mockSsoSettings = new SsoSettings().setBaseUrl("http://localhost");
+    GlobalSettingsInfo mockGlobalSettingsInfo = new GlobalSettingsInfo().setSso(mockSsoSettings);
+
+    when(mockEntityService.getLatestAspect(
+            any(OperationContext.class),
+            eq(GLOBAL_SETTINGS_URN),
+            eq(GLOBAL_SETTINGS_INFO_ASPECT_NAME)))
+        .thenReturn(mockGlobalSettingsInfo);
+
+    when(mockSecretService.decrypt(any(), any())).thenReturn("decrypted-secret");
+
+    // Execute
+    ResponseEntity<String> httpResponse =
+        authServiceController.getSsoSettings(request, null).join();
+
+    // Verify
+    assertEquals(httpResponse.getStatusCode(), HttpStatus.OK);
+    JsonNode jsonNode = new ObjectMapper().readTree(httpResponse.getBody());
+    assertTrue(jsonNode.has("baseUrl"));
+    assertEquals("http://localhost", jsonNode.get("baseUrl").asText());
+    assertFalse(jsonNode.has("oidcEnabled"));
+  }
+
+  @Test
+  public void testGetSsoSettingsWithFullOidcConfiguration() throws IOException {
+    // Setup complete OIDC settings
+    OidcSettings mockOidcSettings =
+        new OidcSettings()
+            .setEnabled(true)
+            .setClientId("client123")
+            .setClientSecret("encrypted-secret")
+            .setDiscoveryUri("http://auth.example.com")
+            .setUserNameClaim("preferred_username")
+            .setUserNameClaimRegex(".*")
+            .setScope("openid profile email")
+            .setClientAuthenticationMethod("client_secret_basic")
+            .setJitProvisioningEnabled(true)
+            .setPreProvisioningRequired(false)
+            .setExtractGroupsEnabled(true)
+            .setGroupsClaim("groups")
+            .setResponseType("code")
+            .setResponseMode("query")
+            .setUseNonce(true)
+            .setReadTimeout(30000)
+            .setExtractJwtAccessTokenClaims(true)
+            .setPreferredJwsAlgorithm2("RS256");
+
+    SsoSettings mockSsoSettings =
+        new SsoSettings().setBaseUrl("http://localhost").setOidcSettings(mockOidcSettings);
+
+    GlobalSettingsInfo mockGlobalSettingsInfo = new GlobalSettingsInfo().setSso(mockSsoSettings);
+
+    when(mockEntityService.getLatestAspect(
+            any(OperationContext.class),
+            eq(GLOBAL_SETTINGS_URN),
+            eq(GLOBAL_SETTINGS_INFO_ASPECT_NAME)))
+        .thenReturn(mockGlobalSettingsInfo);
+
+    when(mockSecretService.decrypt(any(), eq("encrypted-secret"))).thenReturn("decrypted-secret");
+
+    // Execute
+    ResponseEntity<String> httpResponse =
+        authServiceController.getSsoSettings(request, null).join();
+
+    // Verify
+    assertEquals(httpResponse.getStatusCode(), HttpStatus.OK);
+    JsonNode jsonNode = new ObjectMapper().readTree(httpResponse.getBody());
+
+    // Check all fields are present and have correct values
+    assertEquals("http://localhost", jsonNode.get("baseUrl").asText());
+    assertTrue(jsonNode.get("oidcEnabled").asBoolean());
+    assertEquals("client123", jsonNode.get("clientId").asText());
+    assertEquals("decrypted-secret", jsonNode.get("clientSecret").asText());
+    assertEquals("http://auth.example.com", jsonNode.get("discoveryUri").asText());
+    assertEquals("preferred_username", jsonNode.get("userNameClaim").asText());
+    assertEquals(".*", jsonNode.get("userNameClaimRegex").asText());
+    assertEquals("openid profile email", jsonNode.get("scope").asText());
+    assertEquals("client_secret_basic", jsonNode.get("clientAuthenticationMethod").asText());
+    assertTrue(jsonNode.get("jitProvisioningEnabled").asBoolean());
+    assertFalse(jsonNode.get("preProvisioningRequired").asBoolean());
+    assertTrue(jsonNode.get("extractGroupsEnabled").asBoolean());
+    assertEquals("groups", jsonNode.get("groupsClaim").asText());
+    assertEquals("code", jsonNode.get("responseType").asText());
+    assertEquals("query", jsonNode.get("responseMode").asText());
+    assertTrue(jsonNode.get("useNonce").asBoolean());
+    assertEquals(30000, jsonNode.get("readTimeout").asInt());
+    assertTrue(jsonNode.get("extractJwtAccessTokenClaims").asBoolean());
+    assertEquals("RS256", jsonNode.get("preferredJwsAlgorithm").asText());
+  }
+
+  @Test
+  public void testGenerateSessionTokenForUserMissingAuthReturnsUnauthorized() throws Exception {
+    AuthenticationContext.remove();
+    ObjectNode requestBody = objectMapper.createObjectNode();
+    requestBody.put("userId", "testUser");
+    HttpEntity<String> httpEntity = new HttpEntity<>(objectMapper.writeValueAsString(requestBody));
+
+    ResponseEntity<String> response =
+        authServiceController.generateSessionTokenForUser(request, httpEntity).join();
+
+    assertEquals(HttpStatus.UNAUTHORIZED, response.getStatusCode());
+  }
+
+  @Test
+  public void testSignUpMissingAuthReturnsUnauthorized() throws Exception {
+    AuthenticationContext.remove();
+    ObjectNode requestBody = objectMapper.createObjectNode();
+    requestBody.put("userUrn", "urn:li:corpuser:testUser");
+    requestBody.put("fullName", "Test User");
+    requestBody.put("email", "test@example.com");
+    requestBody.put("title", "Engineer");
+    requestBody.put("password", "password");
+    requestBody.put("inviteToken", "token");
+    HttpEntity<String> httpEntity = new HttpEntity<>(objectMapper.writeValueAsString(requestBody));
+
+    ResponseEntity<String> response = authServiceController.signUp(request, httpEntity).join();
+
+    assertEquals(HttpStatus.UNAUTHORIZED, response.getStatusCode());
+  }
+
+  @Test
+  public void testResetNativeUserCredentialsMissingAuthReturnsUnauthorized() throws Exception {
+    AuthenticationContext.remove();
+    ObjectNode requestBody = objectMapper.createObjectNode();
+    requestBody.put("userUrn", "urn:li:corpuser:testUser");
+    requestBody.put("password", "password");
+    requestBody.put("resetToken", "token");
+    HttpEntity<String> httpEntity = new HttpEntity<>(objectMapper.writeValueAsString(requestBody));
+
+    ResponseEntity<String> response =
+        authServiceController.resetNativeUserCredentials(request, httpEntity).join();
+
+    assertEquals(HttpStatus.UNAUTHORIZED, response.getStatusCode());
+  }
+
+  @Test
+  public void testVerifyNativeUserCredentialsMissingAuthReturnsUnauthorized() throws Exception {
+    AuthenticationContext.remove();
+    ObjectNode requestBody = objectMapper.createObjectNode();
+    requestBody.put("userUrn", "urn:li:corpuser:testUser");
+    requestBody.put("password", "password");
+    HttpEntity<String> httpEntity = new HttpEntity<>(objectMapper.writeValueAsString(requestBody));
+
+    ResponseEntity<String> response =
+        authServiceController.verifyNativeUserCredentials(request, httpEntity).join();
+
+    assertEquals(HttpStatus.UNAUTHORIZED, response.getStatusCode());
+  }
+
+  @Test
+  public void testGetSsoSettingsMissingAuthReturnsUnauthorized() throws Exception {
+    AuthenticationContext.remove();
+
+    ResponseEntity<String> response = authServiceController.getSsoSettings(request, null).join();
+
+    assertEquals(HttpStatus.UNAUTHORIZED, response.getStatusCode());
+  }
+
+  @Test
+  public void testSignUpNonSystemClientReturnsUnauthorized() throws Exception {
+    setNonSystemAuthentication();
+    ObjectNode requestBody = objectMapper.createObjectNode();
+    requestBody.put("userUrn", "urn:li:corpuser:testUser");
+    requestBody.put("fullName", "Test User");
+    requestBody.put("email", "test@example.com");
+    requestBody.put("title", "Engineer");
+    requestBody.put("password", "password");
+    requestBody.put("inviteToken", "token");
+    HttpEntity<String> httpEntity = new HttpEntity<>(objectMapper.writeValueAsString(requestBody));
+
+    ResponseEntity<String> response = authServiceController.signUp(request, httpEntity).join();
+
+    assertEquals(HttpStatus.UNAUTHORIZED, response.getStatusCode());
+    verify(mockNativeUserService, never())
+        .createNativeUser(any(), anyString(), anyString(), anyString(), any(), anyString());
+    verify(mockInviteTokenService, never()).getVerifiedInviteToken(any(), any());
+  }
+
+  @Test
+  public void testSignUpRejectsBearerWhenActorIdMatchesSystemClient() throws Exception {
+    setBearerAuthentication(SYSTEM_CLIENT_ID);
+    ObjectNode requestBody = objectMapper.createObjectNode();
+    requestBody.put("userUrn", "urn:li:corpuser:spawned");
+    requestBody.put("fullName", "Spawned User");
+    requestBody.put("email", "spawned@example.com");
+    requestBody.put("title", "Engineer");
+    requestBody.put("password", "password");
+    requestBody.put("inviteToken", "token");
+    HttpEntity<String> httpEntity = new HttpEntity<>(objectMapper.writeValueAsString(requestBody));
+
+    ResponseEntity<String> response = authServiceController.signUp(request, httpEntity).join();
+
+    assertEquals(HttpStatus.UNAUTHORIZED, response.getStatusCode());
+    verify(mockNativeUserService, never())
+        .createNativeUser(any(), anyString(), anyString(), anyString(), any(), anyString());
+  }
+
+  @Test
+  public void testResetNativeUserCredentialsNonSystemClientReturnsUnauthorized() throws Exception {
+    setNonSystemAuthentication();
+    ObjectNode requestBody = objectMapper.createObjectNode();
+    requestBody.put("userUrn", "urn:li:corpuser:testUser");
+    requestBody.put("password", "password");
+    requestBody.put("resetToken", "token");
+    HttpEntity<String> httpEntity = new HttpEntity<>(objectMapper.writeValueAsString(requestBody));
+
+    ResponseEntity<String> response =
+        authServiceController.resetNativeUserCredentials(request, httpEntity).join();
+
+    assertEquals(HttpStatus.UNAUTHORIZED, response.getStatusCode());
+    verify(mockNativeUserService, never())
+        .resetCorpUserCredentials(any(), anyString(), anyString(), anyString());
+  }
+
+  @Test
+  public void testVerifyNativeUserCredentialsNonSystemClientReturnsUnauthorized() throws Exception {
+    setNonSystemAuthentication();
+    ObjectNode requestBody = objectMapper.createObjectNode();
+    requestBody.put("userUrn", "urn:li:corpuser:testUser");
+    requestBody.put("password", "password");
+    HttpEntity<String> httpEntity = new HttpEntity<>(objectMapper.writeValueAsString(requestBody));
+
+    ResponseEntity<String> response =
+        authServiceController.verifyNativeUserCredentials(request, httpEntity).join();
+
+    assertEquals(HttpStatus.UNAUTHORIZED, response.getStatusCode());
+    verify(mockNativeUserService, never()).doesPasswordMatch(any(), anyString(), anyString());
+  }
+
+  @Test
+  public void testGetSsoSettingsNonSystemClientReturnsUnauthorized() {
+    setNonSystemAuthentication();
+
+    ResponseEntity<String> response = authServiceController.getSsoSettings(request, null).join();
+
+    assertEquals(HttpStatus.UNAUTHORIZED, response.getStatusCode());
+    verify(mockEntityService, never()).getLatestAspect(any(), any(), anyString());
+  }
+
+  private void setNonSystemAuthentication() {
+    setBearerAuthentication("regularActor");
+  }
+
+  private void setBearerAuthentication(String actorId) {
+    reset(mockTokenService, mockNativeUserService, mockInviteTokenService, mockEntityService);
+    AuthenticationContext.setAuthentication(
+        new Authentication(
+            new Actor(ActorType.USER, actorId),
+            "Bearer user-token",
+            Map.of(TokenClaims.TOKEN_TYPE_CLAIM_NAME, TokenType.SESSION.name())));
+  }
+
+  private void verifyLoginMetric(String outcome, String loginSource, String denialReason) {
+    verify(mockMetricUtils)
+        .incrementMicrometer(
+            eq(DATAHUB_LOGIN),
+            eq(1.0),
+            eq("outcome"),
+            eq(outcome),
+            eq("login_source"),
+            eq(loginSource),
+            eq("denial_reason"),
+            eq(denialReason));
+  }
+
+  /*
+  @Test
+  public void testTrackSuccess() throws Exception {
+    // Setup
+    String eventPayload = "{\"type\":\"page_view\",\"properties\":{\"page\":\"dashboard\"}}";
+    HttpEntity<String> httpEntity = new HttpEntity<>(eventPayload);
+
+    // Mock tracking service (already @Autowired in the test class)
+    // No need to configure behavior as the method doesn't return anything
+
+    // Execute
+    ResponseEntity<String> response = authServiceController.track(request, httpEntity).join();
+
+    // Verify
+    assertEquals(HttpStatus.OK, response.getStatusCode());
+
+    // Verify tracking service was called with correct parameters
+    ArgumentCaptor<JsonNode> jsonCaptor = ArgumentCaptor.forClass(JsonNode.class);
+    verify(mockTrackingService)
+        .track(
+            eq("page_view"),
+            eq(systemOperationContext),
+            isNull(),
+            isNull(),
+            jsonCaptor.capture(),
+            any());
+
+    JsonNode capturedJson = jsonCaptor.getValue();
+    assertTrue(capturedJson.has("type"));
+    assertEquals("page_view", capturedJson.get("type").asText());
+    assertTrue(capturedJson.has("properties"));
+    assertTrue(capturedJson.get("properties").has("page"));
+    assertEquals("dashboard", capturedJson.get("properties").get("page").asText());
+  }
+
+  @Test
+  public void testTrackBadRequest() throws Exception {
+    // Setup - invalid JSON
+    String invalidJson = "{malformed json";
+    HttpEntity<String> httpEntity = new HttpEntity<>(invalidJson);
+
+    // Execute
+    ResponseEntity<String> response = authServiceController.track(request, httpEntity).join();
+
+    // Verify
+    assertEquals(HttpStatus.BAD_REQUEST, response.getStatusCode());
+
+    // Verify tracking service was not called
+    verify(mockTrackingService, never()).track(any(), any(), any(), any(), any(), any());
+  }
+
+  @Test
+  public void testTrackMissingRequiredFields() throws Exception {
+    // Setup - missing type fields
+    String missingFieldsJson = "{\"user\":\"testUser\"}";
+    HttpEntity<String> httpEntity = new HttpEntity<>(missingFieldsJson);
+
+    // Execute
+    ResponseEntity<String> response = authServiceController.track(request, httpEntity).join();
+
+    // Verify
+    assertEquals(HttpStatus.BAD_REQUEST, response.getStatusCode());
+
+    // Verify tracking service was not called
+    verify(mockTrackingService, never()).track(any(), any(), any(), any(), any(), any());
+  }
+
+  @Test
+  public void testTrackServiceException() throws Exception {
+    // Setup
+    String eventPayload = "{\"type\":\"error_event\"}";
+    HttpEntity<String> httpEntity = new HttpEntity<>(eventPayload);
+
+    // Mock tracking service to throw exception
+    doThrow(new RuntimeException("Test exception"))
+        .when(mockTrackingService)
+        .track(
+            eq("error_event"),
+            eq(systemOperationContext),
+            any(),
+            any(),
+            any(JsonNode.class),
+            any());
+
+    // Execute
+    ResponseEntity<String> response = authServiceController.track(request, httpEntity).join();
+
+    // Verify
+    assertEquals(HttpStatus.INTERNAL_SERVER_ERROR, response.getStatusCode());
+  }
+
+  @Test
+  public void testTrackWithComplexPageViewEventPayload() throws Exception {
+    // Setup
+    String complexPayload =
+        "{\n"
+            + "  \"title\" : \"DataHub\",\n"
+            + "  \"url\" : \"http://localhost:9002/\",\n"
+            + "  \"path\" : \"/\",\n"
+            + "  \"hash\" : \"\",\n"
+            + "  \"search\" : \"\",\n"
+            + "  \"width\" : 1785,\n"
+            + "  \"height\" : 857,\n"
+            + "  \"referrer\" : \"http://localhost:9002/\",\n"
+            + "  \"prevPathname\" : \"http://localhost:9002/\",\n"
+            + "  \"type\" : \"PageViewEvent\",\n"
+            + "  \"actorUrn\" : \"urn:li:corpuser:datahub\",\n"
+            + "  \"timestamp\" : 1746475429127,\n"
+            + "  \"date\" : \"Mon May 05 2025 15:03:49 GMT-0500 (Central Daylight Time)\",\n"
+            + "  \"userAgent\" : \"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36\",\n"
+            + "  \"browserId\" : \"xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx\",\n"
+            + "  \"origin\" : \"http://localhost:9002\",\n"
+            + "  \"isThemeV2Enabled\" : true,\n"
+            + "  \"userPersona\" : \"urn:li:dataHubPersona:businessUser\",\n"
+            + "  \"serverVersion\" : \"v1.1.0\"\n"
+            + "}";
+
+    HttpEntity<String> httpEntity = new HttpEntity<>(complexPayload);
+
+    // Execute
+    ResponseEntity<String> response = authServiceController.track(request, httpEntity).join();
+
+    // Verify response status
+    assertEquals(HttpStatus.OK, response.getStatusCode());
+
+    // Verify tracking service was called with correct parameters
+    ArgumentCaptor<JsonNode> jsonCaptor = ArgumentCaptor.forClass(JsonNode.class);
+    verify(mockTrackingService)
+        .track(
+            eq("PageViewEvent"),
+            eq(systemOperationContext),
+            any(),
+            any(),
+            jsonCaptor.capture(),
+            any());
+
+    // Verify the complex JSON structure was correctly parsed and passed to the tracking service
+    JsonNode capturedJson = jsonCaptor.getValue();
+
+    // Verify key fields from the complex payload
+    assertEquals("DataHub", capturedJson.get("title").asText());
+    assertEquals("http://localhost:9002/", capturedJson.get("url").asText());
+    assertEquals("PageViewEvent", capturedJson.get("type").asText());
+    assertEquals("urn:li:corpuser:datahub", capturedJson.get("actorUrn").asText());
+    assertEquals(1746475429127L, capturedJson.get("timestamp").asLong());
+    assertEquals("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", capturedJson.get("browserId").asText());
+    assertEquals("urn:li:dataHubPersona:businessUser", capturedJson.get("userPersona").asText());
+    assertEquals("v1.1.0", capturedJson.get("serverVersion").asText());
+    assertTrue(capturedJson.get("isThemeV2Enabled").asBoolean());
+  }
+
+   */
+}

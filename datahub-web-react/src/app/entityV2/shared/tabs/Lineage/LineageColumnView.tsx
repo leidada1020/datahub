@@ -1,0 +1,219 @@
+import { Tooltip } from '@components';
+import { ArrowDown } from '@phosphor-icons/react/dist/csr/ArrowDown';
+import { ArrowUp } from '@phosphor-icons/react/dist/csr/ArrowUp';
+import { ArrowsClockwise } from '@phosphor-icons/react/dist/csr/ArrowsClockwise';
+import { CaretDown } from '@phosphor-icons/react/dist/csr/CaretDown';
+import { CircleNotch } from '@phosphor-icons/react/dist/csr/CircleNotch';
+import { Graph } from '@phosphor-icons/react/dist/csr/Graph';
+import { Button, Select, Typography } from 'antd';
+import * as QueryString from 'query-string';
+import React, { useMemo, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useLocation } from 'react-router';
+import styled, { keyframes, useTheme } from 'styled-components';
+
+import { useEntityData } from '@app/entity/shared/EntityContext';
+import { useIsSeparateSiblingsMode } from '@app/entity/shared/siblingUtils';
+import TabToolbar from '@app/entityV2/shared/components/styled/TabToolbar';
+import ColumnsLineageSelect from '@app/entityV2/shared/tabs/Lineage/ColumnLineageSelect';
+import { ImpactAnalysis } from '@app/entityV2/shared/tabs/Lineage/ImpactAnalysis';
+import { LineageTabContext } from '@app/entityV2/shared/tabs/Lineage/LineageTabContext';
+import LineageTabTimeSelector from '@app/entityV2/shared/tabs/Lineage/LineageTabTimeSelector';
+import { generateSchemaFieldUrn } from '@app/entityV2/shared/tabs/Lineage/utils';
+import { useGetLineageTimeParams } from '@app/lineage/utils/useGetLineageTimeParams';
+import { downgradeV2FieldPath } from '@app/lineageV3/utils/downgradeV2FieldPath';
+import { useEntityRegistry } from '@app/useEntityRegistry';
+import { GenericEntityProperties } from '@src/app/entity/shared/types';
+import ManageLineageMenuForImpactAnalysis from '@src/app/entityV2/shared/tabs/Lineage/ManageLineageMenuFromImpactAnalysis';
+import { Direction } from '@src/app/lineage/types';
+
+import { EntityType, LineageDirection, LineageSearchPath } from '@types';
+
+const spin = keyframes`
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+`;
+
+const SpinningCircleNotch = styled(CircleNotch)`
+    animation: ${spin} 1s linear infinite;
+`;
+const StyledTabToolbar = styled(TabToolbar)`
+    justify-content: space-between;
+    z-index: 2;
+`;
+
+const LeftButtonsWrapper = styled.div`
+    align-items: center;
+    display: flex;
+`;
+
+const RightButtonsWrapper = styled.div`
+    align-items: center;
+    display: flex;
+    gap: 4px;
+`;
+
+const StyledCaretDown = styled(CaretDown).attrs({ size: 12 })``;
+
+const ToolbarActionButton = styled(Button)`
+    && {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        height: auto;
+        padding: 4px 8px;
+        font-size: 12px;
+        font-weight: 700;
+        line-height: 16px;
+    }
+`;
+
+const StyledSelect = styled(Select)`
+    &:hover {
+        background-color: ${(props) => props.theme.colors.bgSurface};
+    }
+`;
+
+const RefreshCacheButton = styled(ToolbarActionButton)``;
+
+interface SchemaFieldEntityData extends GenericEntityProperties {
+    fieldPath?: string;
+}
+
+interface Props {
+    defaultDirection: LineageDirection;
+    setVisualizeViewInEditMode: (view: boolean, direction: Direction) => void;
+}
+
+export function LineageColumnView({ defaultDirection, setVisualizeViewInEditMode }: Props) {
+    const { t } = useTranslation('lineage');
+    const { t: tcAction } = useTranslation('common.actions');
+    const { urn, entityType, entityData } = useEntityData();
+    const location = useLocation();
+    const entityRegistry = useEntityRegistry();
+    const theme = useTheme();
+    const params = QueryString.parse(location.search, { arrayFormat: 'comma' });
+    const [lineageDirection, setLineageDirection] = useState<LineageDirection>(defaultDirection);
+    const [selectedColumn, setSelectedColumn] = useState<string | undefined>(params?.column as string);
+    const [shouldRefetch, setShouldRefetch] = useState(false);
+    const [skipCache, setSkipCache] = useState(false);
+    const [isLoading, setIsLoading] = useState(false);
+    const [lineageSearchPath, setLineageSearchPath] = useState<LineageSearchPath | null>(null);
+    const { startTimeMillis, endTimeMillis } = useGetLineageTimeParams();
+    const entityName = (entityData && entityRegistry.getDisplayName(entityType, entityData)) || '-';
+
+    function resetShouldRefetch() {
+        setShouldRefetch(false);
+    }
+
+    const columnForLineage = useMemo(
+        () =>
+            entityType === EntityType.SchemaField ? (entityData as SchemaFieldEntityData)?.fieldPath : selectedColumn,
+        [entityType, selectedColumn, entityData],
+    );
+    const [isColumnLevelLineage, setIsColumnLevelLineage] = useState(!!columnForLineage);
+
+    const selectedV1FieldPath = downgradeV2FieldPath(selectedColumn);
+    const onIndividualSiblingPage = useIsSeparateSiblingsMode();
+    const lineageUrn = (!onIndividualSiblingPage && entityData?.lineageUrn) || urn;
+    const selectedColumnUrn = generateSchemaFieldUrn(selectedV1FieldPath, lineageUrn);
+    const impactAnalysisUrn = isColumnLevelLineage && selectedColumnUrn ? selectedColumnUrn : lineageUrn;
+    const canEditLineage = !!entityData?.privileges?.canEditLineage;
+
+    const directionOptions = [
+        {
+            label: (
+                <Tooltip placement="right" title={t('direction.downstreamTooltip', { entityName })} showArrow={false}>
+                    <span data-testid="lineage-tab-direction-select-option-downstream">
+                        <ArrowDown style={{ marginRight: 4 }} />
+                        <b>{t('direction.downstreams')}</b>
+                    </span>
+                </Tooltip>
+            ),
+            value: LineageDirection.Downstream,
+        },
+        {
+            label: (
+                <Tooltip placement="right" title={t('direction.upstreamTooltip', { entityName })} showArrow={false}>
+                    <span data-testid="lineage-tab-direction-select-option-upstream">
+                        <ArrowUp style={{ marginRight: 4 }} />
+                        <b>{t('direction.upstreams')}</b>
+                    </span>
+                </Tooltip>
+            ),
+            value: LineageDirection.Upstream,
+        },
+    ];
+
+    return (
+        <>
+            <StyledTabToolbar>
+                <LeftButtonsWrapper>
+                    <StyledSelect
+                        bordered={false}
+                        value={lineageDirection}
+                        options={directionOptions}
+                        onChange={(value) => setLineageDirection(value as LineageDirection)}
+                        suffixIcon={<CaretDown style={{ color: theme.colors.text }} />}
+                        data-testid="lineage-tab-direction-select"
+                    />
+                </LeftButtonsWrapper>
+                <RightButtonsWrapper>
+                    <ManageLineageMenuForImpactAnalysis
+                        setVisualizeViewInEditMode={setVisualizeViewInEditMode}
+                        menuIcon={
+                            <ToolbarActionButton type="text">
+                                <Graph size={16} />
+                                <Typography.Text>
+                                    <b>{tcAction('edit')}</b>
+                                </Typography.Text>
+                                <StyledCaretDown />
+                            </ToolbarActionButton>
+                        }
+                        entityType={entityType}
+                        canEditLineage={canEditLineage}
+                        disableDropdown={!canEditLineage}
+                    />
+                    {entityType !== EntityType.SchemaField && (
+                        <ColumnsLineageSelect
+                            selectedColumn={columnForLineage}
+                            isColumnLevelLineage={isColumnLevelLineage}
+                            setSelectedColumn={setSelectedColumn}
+                            setIsColumnLevelLineage={setIsColumnLevelLineage}
+                        />
+                    )}
+                    <LineageTabTimeSelector />
+                    <Tooltip title={isLoading ? t('refresh.loadingTooltip') : t('refresh.tooltip')} showArrow={false}>
+                        <RefreshCacheButton type="text" onClick={() => setSkipCache(true)} disabled={isLoading}>
+                            {isLoading ? <SpinningCircleNotch size={16} /> : <ArrowsClockwise size={16} />}
+                            <Typography.Text>
+                                <b>{tcAction('refresh')}</b>
+                            </Typography.Text>
+                        </RefreshCacheButton>
+                    </Tooltip>
+                </RightButtonsWrapper>
+            </StyledTabToolbar>
+            <LineageTabContext.Provider
+                value={{
+                    isColumnLevelLineage,
+                    selectedColumn,
+                    lineageDirection,
+                    lineageSearchPath,
+                    setLineageSearchPath,
+                }}
+            >
+                <ImpactAnalysis
+                    urn={impactAnalysisUrn}
+                    direction={lineageDirection as LineageDirection}
+                    startTimeMillis={startTimeMillis}
+                    endTimeMillis={endTimeMillis}
+                    skipCache={skipCache}
+                    setSkipCache={setSkipCache}
+                    shouldRefetch={shouldRefetch}
+                    resetShouldRefetch={resetShouldRefetch}
+                    setIsLoading={setIsLoading}
+                />
+            </LineageTabContext.Provider>
+        </>
+    );
+}

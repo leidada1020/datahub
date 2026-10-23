@@ -1,0 +1,93 @@
+import subprocess
+from typing import List
+
+import pytest
+import time_machine
+
+from datahub.testing import mce_helpers
+from tests.test_helpers.click_helpers import run_datahub_cmd
+from tests.test_helpers.docker_helpers import wait_for_port
+
+pytestmark = [
+    pytest.mark.integration_batch_3,
+    pytest.mark.skip(
+        reason="Skipping Vertica tests due to https://github.com/vertica/vertica-containers/issues/64"
+    ),
+]
+
+FROZEN_TIME = "2020-04-14 07:00:00"
+
+
+@pytest.fixture(scope="module")
+def test_resources_dir(pytestconfig):
+    return pytestconfig.rootpath / "tests/integration/vertica"
+
+
+def is_vertica_responsive(container_name: str) -> bool:
+    cmd = f"docker logs {container_name} 2>&1 | grep 'Vertica is now running' "
+    ret = subprocess.run(
+        cmd,
+        shell=True,
+    )
+    return ret.returncode == 0
+
+
+@pytest.fixture(scope="module")
+def vertica_runner(docker_compose_runner, test_resources_dir, request):
+    with docker_compose_runner(
+        test_resources_dir / "docker-compose.yml", "vertica"
+    ) as docker_services:
+        # The compose file exposes the client port ephemerally, so a leaked
+        # container from a prior run can never hold onto the port a fresh
+        # run needs. vertica_to_file.yml picks it up via ${VERTICA_PORT}.
+        vertica_port = docker_services.port_for("vertica", 5433)
+        mp = pytest.MonkeyPatch()
+        mp.setenv("VERTICA_PORT", str(vertica_port))
+        request.addfinalizer(mp.undo)
+
+        wait_for_port(
+            docker_services,
+            "vertica-ce",
+            5433,
+            timeout=120,
+            checker=lambda: is_vertica_responsive("vertica-ce"),
+        )
+
+        commands = """
+                    docker cp tests/integration/vertica/ddl.sql vertica-ce:/home/dbadmin/ &&
+                    docker exec vertica-ce sh -c "/opt/vertica/bin/vsql -w abc123 -f /home/dbadmin/ddl.sql"
+                """
+
+        ret = subprocess.run(commands, shell=True, stdout=subprocess.DEVNULL)
+
+        assert ret.returncode == 0
+
+        yield docker_services
+
+
+@time_machine.travel(FROZEN_TIME, tick=False)
+@pytest.mark.integration
+def test_vertica_ingest_with_db(vertica_runner, pytestconfig, tmp_path):
+    test_resources_dir = pytestconfig.rootpath / "tests/integration/vertica"
+
+    # Run the metadata ingestion pipeline.
+    config_file = (test_resources_dir / "vertica_to_file.yml").resolve()
+    run_datahub_cmd(
+        ["ingest", "--strict-warnings", "-c", f"{config_file}"], tmp_path=tmp_path
+    )
+
+    ignore_paths: List[str] = [
+        r"root\[\d+\]\['proposedSnapshot'\].+\['aspects'\].+\['customProperties'\]\['create_time'\]",
+        r"root\[\d+\]\['proposedSnapshot'\].+\['aspects'\].+\['customProperties'\]\['table_size'\]",
+        r"root\[\d+\]\['proposedSnapshot'\].+\['aspects'\].+\['customProperties'\]\['Projection_size'\]",
+        r"root\[\d+\]\['proposedSnapshot'\].+\['aspects'\].+\['customProperties'\]\['ROS_Count'\]",
+        r"root\[\d+\]\['aspect'\].+\['customProperties'\]\['cluster_size'\]",
+        r"root\[\d+\]\['aspect'\].+\['customProperties'\]\['udx_language'\]",
+    ]
+    # Verify the output.
+    mce_helpers.check_golden_file(
+        pytestconfig,
+        ignore_paths=ignore_paths,
+        output_path=tmp_path / "vertica.json",
+        golden_path=test_resources_dir / "vertica_mces_with_db_golden.json",
+    )

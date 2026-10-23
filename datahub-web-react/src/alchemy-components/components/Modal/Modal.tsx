@@ -1,0 +1,167 @@
+import { X } from '@phosphor-icons/react/dist/csr/X';
+import { Modal as AntModal, ModalProps as AntModalProps } from 'antd';
+import React from 'react';
+import styled from 'styled-components';
+
+import { Button, type ButtonProps } from '@components/components/Button';
+import { Icon } from '@components/components/Icon';
+import { Text } from '@components/components/Text';
+import { typography } from '@components/theme';
+
+import { ModalContext } from '@app/sharedV2/modals/ModalContext';
+
+const StyledModal = styled(AntModal)<{ hasChildren: boolean; hasFooter: boolean }>`
+    font-family: ${typography.fonts.body};
+
+    &&& .ant-modal-content {
+        box-shadow: ${(props) => props.theme.colors.shadowMd};
+        border-radius: 12px;
+    }
+
+    .ant-modal-header {
+        //margin-bottom: 24px;
+        padding: 12px 20px;
+        border-radius: ${({ hasChildren }) => (hasChildren ? '12px 12px 0 0' : '12px')};
+        border-bottom: ${(props) => (props.hasChildren ? `1px solid ${props.theme.colors.border}` : '0')};
+    }
+
+    .ant-modal-body {
+        padding: ${({ hasChildren }) => (hasChildren ? '24px 20px' : '8px 20px')};
+        /* GlobalThemeStyles gives the body its own opaque background, so when it is the last
+           child it paints a square over the content's rounded bottom corners. */
+        border-radius: ${({ hasFooter }) => (hasFooter ? '0' : '0 0 12px 12px')};
+    }
+
+    .ant-modal-footer {
+        padding: 12px 20px;
+    }
+
+    .ant-modal-close {
+        top: 16px;
+        right: 16px;
+        color: ${(props) => props.theme.colors.icon};
+
+        .ant-modal-close-x {
+            height: 24px;
+            width: 24px;
+        }
+    }
+`;
+
+const ModalTitle = styled.h1`
+    font-size: 20px;
+    font-weight: 700;
+    line-height: 1.3;
+    margin: 0;
+    color: ${(props) => props.theme.colors.text};
+`;
+
+const ModalSubtitle = styled.span`
+    font-size: 14px;
+    font-weight: 500;
+    color: ${(props) => props.theme.colors.textSecondary};
+`;
+
+const ModalHeader = styled.div<{ hasChildren: boolean }>`
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+`;
+
+const TitleRow = styled.div`
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+`;
+
+const ButtonsContainer = styled.div`
+    display: flex;
+    gap: 16px;
+    justify-content: end;
+`;
+
+export interface ModalButton extends ButtonProps {
+    text: string;
+    key?: string;
+    onClick: () => void;
+    buttonDataTestId?: string;
+}
+
+export interface ModalProps {
+    buttons?: ModalButton[];
+    title: React.ReactNode;
+    subtitle?: string;
+    titlePill?: React.ReactNode;
+    children?: React.ReactNode;
+    onCancel?: () => void;
+    dataTestId?: string;
+    titleIcon?: React.ReactNode;
+    closable?: boolean;
+}
+
+export function Modal({
+    buttons,
+    title,
+    subtitle,
+    titlePill,
+    children,
+    onCancel,
+    dataTestId,
+    closable = true,
+    footer,
+    ...props
+}: ModalProps & AntModalProps) {
+    const hasFooter = footer !== undefined ? footer !== null && footer !== false : Boolean(buttons?.length);
+    const resolvedFooter =
+        footer !== undefined
+            ? footer
+            : !!buttons?.length && (
+                  <ButtonsContainer>
+                      {buttons.map(({ text, variant, onClick, key, buttonDataTestId, ...buttonProps }, index) => (
+                          <Button
+                              key={key || text}
+                              data-testid={buttonDataTestId ?? (dataTestId && `${dataTestId}-${variant}-${index}`)}
+                              variant={variant}
+                              onClick={onClick}
+                              {...buttonProps}
+                          >
+                              <Text type="span" weight="bold" lineHeight="none">
+                                  {text}
+                              </Text>
+                          </Button>
+                      ))}
+                  </ButtonsContainer>
+              );
+
+    return (
+        <StyledModal
+            open
+            centered
+            closable={closable}
+            onCancel={onCancel}
+            closeIcon={closable ? <Icon icon={X} data-testid="modal-close-icon" /> : null}
+            hasChildren={!!children}
+            hasFooter={hasFooter}
+            data-testid={dataTestId}
+            title={
+                typeof title === 'string' ? (
+                    <ModalHeader hasChildren={!!children}>
+                        <TitleRow>
+                            <ModalTitle>{title}</ModalTitle>
+                            {titlePill}
+                        </TitleRow>
+                        {!!subtitle && <ModalSubtitle>{subtitle}</ModalSubtitle>}
+                    </ModalHeader>
+                ) : (
+                    <div style={{ marginRight: closable ? '20px' : '0' }}>{title}</div>
+                )
+            }
+            footer={resolvedFooter}
+            {...props}
+        >
+            <ModalContext.Provider value={{ isInsideModal: true }}>{children}</ModalContext.Provider>
+        </StyledModal>
+    );
+}

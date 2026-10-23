@@ -1,0 +1,98 @@
+namespace com.linkedin.policy
+
+/**
+ * Information about a DataHub (UI) access policy.
+ */
+@Aspect = {
+  "name": "dataHubPolicyInfo",
+  "schemaVersion": 2
+}
+record DataHubPolicyInfo {
+
+  /**
+   * Display name of the Policy
+   */
+  @Searchable = {
+    "fieldType": "TEXT_PARTIAL",
+    "boostScore": 10.0,
+    "v3": {
+      "searchLabel": "name",
+      "mappings": [
+        { "type": "KEYWORD" },
+        { "subfield": "text", "type": "TEXT" },
+        { "subfield": "stemmed", "type": "STEMMED" }
+      ]
+    }
+  }
+  displayName: string
+
+  /**
+   * Description of the Policy
+   */
+  @Searchable = {
+    "fieldType": "TEXT",
+    "hasValuesFieldName": "hasDescription",
+    "v3": {
+      "searchLabel": "description",
+      "mappings": [
+        { "type": "KEYWORD", "index": false, "docValues": false },
+        { "subfield": "text", "type": "TEXT" },
+        { "subfield": "stemmed", "type": "STEMMED" }
+      ]
+    }
+  }
+  description: string
+
+  /**
+   * The type of policy
+   */
+   @Searchable = {
+    "fieldType": "KEYWORD"
+  }
+  type: string
+
+  /**
+   * The state of policy, ACTIVE or INACTIVE
+   */
+  @Searchable = {
+    "fieldType": "KEYWORD"
+  }
+  state: string
+
+  /**
+   * The resource that the policy applies to. Not required for some 'Platform' privileges.
+   */
+  resources: optional DataHubResourceFilter
+
+  /**
+   * The privileges that the policy grants.
+   */
+  @Searchable = {
+    "/*": {
+      "fieldType": "KEYWORD",
+      "addToFilters": true
+    }
+  }
+  privileges: array[string]
+
+  /**
+   * The actors that the policy applies to.
+   */
+  actors: DataHubActorFilter
+
+  /**
+   * Whether the policy should be editable via the UI
+   */
+  @Searchable = {
+    "fieldType": "BOOLEAN"
+  }
+  editable: boolean = true
+
+  /**
+   * Timestamp when the policy was last updated
+   */
+  @Searchable = {
+    "fieldType": "DATETIME"
+  }
+  lastUpdatedTimestamp: optional long
+}

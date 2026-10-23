@@ -1,0 +1,227 @@
+package com.linkedin.metadata.entity.ebean;
+
+import com.linkedin.metadata.aspect.EntityAspect;
+import com.linkedin.metadata.entity.EntityAspectIdentifier;
+import io.ebean.Model;
+import io.ebean.annotation.Index;
+import jakarta.persistence.Column;
+import jakarta.persistence.Embeddable;
+import jakarta.persistence.EmbeddedId;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Lob;
+import jakarta.persistence.Table;
+import java.io.Serializable;
+import java.sql.Timestamp;
+import java.util.Objects;
+import javax.annotation.Nonnull;
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.Setter;
+
+/** Schema definition for the new aspect table. */
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Entity
+@Table(name = "metadata_aspect_v2")
+public class EbeanAspectV2 extends Model {
+
+  // Intentionally duplicated with @Table(name = ...) above: Java forbids referencing a class's
+  // own constant in a class-level annotation, so the literal cannot be wired to TABLE_NAME.
+  public static final String TABLE_NAME = "metadata_aspect_v2";
+
+  public static final String ALL_COLUMNS = "*";
+  public static final String KEY_ID = "key";
+  public static final String URN_COLUMN = "urn";
+  public static final String ASPECT_COLUMN = "aspect";
+  public static final String VERSION_COLUMN = "version";
+  public static final String METADATA_COLUMN = "metadata";
+  public static final String CREATED_ON_COLUMN = "createdOn";
+  public static final String CREATED_BY_COLUMN = "createdBy";
+  public static final String CREATED_FOR_COLUMN = "createdFor";
+
+  public static final String SYSTEM_METADATA_COLUMN = "systemmetadata";
+
+  /**
+   * Canonical primary-key ordering used to acquire {@code FOR UPDATE} row locks in a consistent
+   * order across every write path (upsert, next-version, delete). Concurrent writers that lock
+   * overlapping rows in different orders deadlock; locking in this single canonical order prevents
+   * that. Two forms are provided and MUST stay in sync: an Ebean property path for {@code
+   * Query.orderBy(...)} on {@link EbeanAspectV2} queries, and a raw-SQL column list for hand-built
+   * statements. Composed from the column constants so there is one source of truth (no scattered
+   * order-by literals).
+   */
+  public static final String KEY_ORDER_BY_PROPERTY_PATH =
+      KEY_ID
+          + "."
+          + URN_COLUMN
+          + ", "
+          + KEY_ID
+          + "."
+          + ASPECT_COLUMN
+          + ", "
+          + KEY_ID
+          + "."
+          + VERSION_COLUMN;
+
+  public static final String KEY_ORDER_BY_SQL =
+      URN_COLUMN + ", " + ASPECT_COLUMN + ", " + VERSION_COLUMN;
+
+  /** Key for an aspect in the table. */
+  @Embeddable
+  @Getter
+  @NoArgsConstructor
+  public static class PrimaryKey implements Serializable, Comparable<PrimaryKey> {
+
+    private static final long serialVersionUID = 1L;
+
+    public PrimaryKey(@Nonnull String urn, @Nonnull String aspect, long version) {
+      this.urn = urn.stripTrailing();
+      this.aspect = aspect.stripTrailing();
+      this.version = version;
+    }
+
+    @Nonnull
+    @Index
+    @Column(name = URN_COLUMN, length = 500, nullable = false)
+    private String urn;
+
+    @Nonnull
+    @Index
+    @Column(name = ASPECT_COLUMN, length = 200, nullable = false)
+    private String aspect;
+
+    @Index
+    @Column(name = VERSION_COLUMN, nullable = false)
+    private long version;
+
+    public static PrimaryKey fromAspectIdentifier(EntityAspectIdentifier key) {
+      return new PrimaryKey(key.getUrn(), key.getAspect(), key.getVersion());
+    }
+
+    public EntityAspectIdentifier toAspectIdentifier() {
+      return new EntityAspectIdentifier(getUrn(), getAspect(), getVersion());
+    }
+
+    // Custom Equals and Hash code that trims to handle MySQL PAD SPACE:
+    // https://dev.mysql.com/doc/refman/8.4/en/charset-binary-collations.html#charset-binary-collations-trailing-space-comparisons
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) {
+        return true;
+      }
+      if (o == null || getClass() != o.getClass()) {
+        return false;
+      }
+      PrimaryKey that = (PrimaryKey) o;
+      return version == that.version
+          && Objects.equals(urn.stripTrailing(), that.urn.stripTrailing())
+          && Objects.equals(aspect.stripTrailing(), that.aspect.stripTrailing());
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(urn.stripTrailing(), aspect.stripTrailing(), version);
+    }
+
+    @Override
+    public int compareTo(EbeanAspectV2.PrimaryKey other) {
+      final String thisUrn = this.urn.stripTrailing();
+      final String otherUrn = other.urn.stripTrailing();
+      int urnComparison = thisUrn.compareTo(otherUrn);
+      if (urnComparison != 0) {
+        return urnComparison;
+      }
+
+      final String thisAspect = this.aspect.stripTrailing();
+      final String otherAspect = other.aspect.stripTrailing();
+      int aspectComparison = thisAspect.compareTo(otherAspect);
+      if (aspectComparison != 0) {
+        return aspectComparison;
+      }
+
+      return Long.compare(this.version, other.version);
+    }
+  }
+
+  @Nonnull @EmbeddedId @Index protected PrimaryKey key;
+
+  @Nonnull
+  @Column(name = URN_COLUMN, length = 500, nullable = false)
+  private String urn;
+
+  @Nonnull
+  @Column(name = ASPECT_COLUMN, length = 200, nullable = false)
+  private String aspect;
+
+  @Column(name = VERSION_COLUMN, nullable = false)
+  private long version;
+
+  @Nonnull
+  @Lob
+  @Column(name = METADATA_COLUMN, nullable = false)
+  protected String metadata;
+
+  @Nonnull
+  @Column(name = CREATED_ON_COLUMN, nullable = false)
+  private Timestamp createdOn;
+
+  @Nonnull
+  @Column(name = CREATED_BY_COLUMN, nullable = false)
+  private String createdBy;
+
+  @Column(name = CREATED_FOR_COLUMN, nullable = true)
+  private String createdFor;
+
+  @Column(name = SYSTEM_METADATA_COLUMN, nullable = true)
+  @Lob
+  protected String systemMetadata;
+
+  public EbeanAspectV2(
+      String urn,
+      String aspect,
+      long version,
+      String metadata,
+      Timestamp createdOn,
+      String createdBy,
+      String createdFor,
+      String systemMetadata) {
+    this(
+        new PrimaryKey(urn, aspect, version),
+        urn,
+        aspect,
+        version,
+        metadata,
+        createdOn,
+        createdBy,
+        createdFor,
+        systemMetadata);
+  }
+
+  @Nonnull
+  public EntityAspect toEntityAspect() {
+    return new EntityAspect(
+        getKey().getUrn(),
+        getKey().getAspect(),
+        getKey().getVersion(),
+        getMetadata(),
+        getSystemMetadata(),
+        getCreatedOn(),
+        getCreatedBy(),
+        getCreatedFor());
+  }
+
+  public static EbeanAspectV2 fromEntityAspect(EntityAspect aspect) {
+    return new EbeanAspectV2(
+        aspect.getUrn(),
+        aspect.getAspect(),
+        aspect.getVersion(),
+        aspect.getMetadata(),
+        aspect.getCreatedOn(),
+        aspect.getCreatedBy(),
+        aspect.getCreatedFor(),
+        aspect.getSystemMetadata());
+  }
+}

@@ -1,0 +1,161 @@
+import { Code } from '@phosphor-icons/react/dist/csr/Code';
+import { CodeBlock } from '@phosphor-icons/react/dist/csr/CodeBlock';
+import { ListBullets } from '@phosphor-icons/react/dist/csr/ListBullets';
+import { ListNumbers } from '@phosphor-icons/react/dist/csr/ListNumbers';
+import { Table } from '@phosphor-icons/react/dist/csr/Table';
+import { TextB } from '@phosphor-icons/react/dist/csr/TextB';
+import { TextItalic } from '@phosphor-icons/react/dist/csr/TextItalic';
+import { TextStrikethrough } from '@phosphor-icons/react/dist/csr/TextStrikethrough';
+import { TextUnderline } from '@phosphor-icons/react/dist/csr/TextUnderline';
+import { useActive, useCommands, useRemirrorContext } from '@remirror/react';
+import { Divider } from 'antd';
+import React from 'react';
+import styled, { useTheme } from 'styled-components';
+
+import { FileDragDropExtension } from '@components/components/Editor/extensions/fileDragDrop';
+import { AddImageButton } from '@components/components/Editor/toolbar/AddImageButton';
+import { AddImageButtonV2 } from '@components/components/Editor/toolbar/AddImageButtonV2';
+import { AddLinkButton } from '@components/components/Editor/toolbar/AddLinkButton';
+import { CommandButton } from '@components/components/Editor/toolbar/CommandButton';
+import { FileUploadButton } from '@components/components/Editor/toolbar/FileUploadButton';
+import { FontSizeSelect } from '@components/components/Editor/toolbar/FontSizeSelect';
+import { HeadingMenu } from '@components/components/Editor/toolbar/HeadingMenu';
+
+import { useAppConfig } from '@app/useAppConfig';
+
+const Container = styled.div<{ $fixedBottom?: boolean }>`
+    position: ${(props) => (props.$fixedBottom ? 'fixed' : 'sticky')};
+    ${(props) => (props.$fixedBottom ? 'bottom: 48px;' : 'top: 0;')}
+    ${(props) =>
+        props.$fixedBottom
+            ? 'left: 50%; transform: translateX(-50%); max-width: 800px; width: max-content;'
+            : 'width: 100%;'}
+    z-index: ${(props) => (props.$fixedBottom ? '1000' : '99')};
+    background-color: ${(props) => props.theme.colors.bg};
+    ${(props) =>
+        props.$fixedBottom
+            ? `border-radius: 12px; border: 1px solid ${props.theme.colors.border};`
+            : 'border-top-left-radius: 12px; border-top-right-radius: 12px;'}
+    padding: 8px !important;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    box-shadow: ${(props) => (props.$fixedBottom ? props.theme.colors.shadowLg : props.theme.colors.shadowSm)};
+`;
+
+const BelowToolbarRow = styled.div`
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 4px 0 4px;
+    margin-top: 4px;
+    border-top: 1px solid ${(props) => props.theme.colors.border};
+`;
+
+const InnerContainer = styled.div`
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    & button {
+        line-height: 0;
+    }
+`;
+
+const CustomDivider = styled(Divider)`
+    height: 36px;
+    margin: 0;
+`;
+
+interface Props {
+    styles?: React.CSSProperties;
+    fixedBottom?: boolean;
+    /** Optional content rendered below the formatting buttons inside the toolbar card. */
+    belowToolbar?: React.ReactNode;
+}
+
+export const Toolbar = ({ styles, fixedBottom, belowToolbar }: Props) => {
+    const commands = useCommands();
+    const active = useActive(true);
+    const theme = useTheme();
+    const { config } = useAppConfig();
+    const { documentationFileUploadV1 } = config.featureFlags;
+    const remirrorContext = useRemirrorContext();
+    const fileExtension = remirrorContext.getExtension(FileDragDropExtension);
+
+    const shouldShowImageButtonV2 = documentationFileUploadV1 && fileExtension.options.uploadFileProps?.onFileUpload;
+
+    return (
+        <Container style={styles} $fixedBottom={fixedBottom}>
+            <InnerContainer>
+                <FontSizeSelect />
+                <HeadingMenu />
+                <CustomDivider type="vertical" />
+                <CommandButton
+                    icon={<TextB size={20} color={theme.colors.icon} />}
+                    style={{ marginRight: 2 }}
+                    commandName="toggleBold"
+                    active={active.bold()}
+                    onClick={() => commands.toggleBold()}
+                />
+                <CommandButton
+                    icon={<TextItalic size={20} color={theme.colors.icon} />}
+                    style={{ marginRight: 2 }}
+                    commandName="toggleItalic"
+                    active={active.italic()}
+                    onClick={() => commands.toggleItalic()}
+                />
+                <CommandButton
+                    icon={<TextUnderline size={20} color={theme.colors.icon} />}
+                    style={{ marginRight: 2 }}
+                    commandName="toggleUnderline"
+                    active={active.underline()}
+                    onClick={() => commands.toggleUnderline()}
+                />
+                <CommandButton
+                    icon={<TextStrikethrough size={20} color={theme.colors.icon} />}
+                    commandName="toggleStrike"
+                    active={active.strike()}
+                    onClick={() => commands.toggleStrike()}
+                />
+                <CustomDivider type="vertical" />
+                <CommandButton
+                    icon={<ListBullets size={20} color={theme.colors.icon} />}
+                    commandName="toggleBulletList"
+                    active={active.bulletList()}
+                    onClick={() => commands.toggleBulletList()}
+                />
+                <CommandButton
+                    icon={<ListNumbers size={20} color={theme.colors.icon} />}
+                    commandName="toggleOrderedList"
+                    active={active.orderedList()}
+                    onClick={() => commands.toggleOrderedList()}
+                />
+                <CustomDivider type="vertical" />
+                <CommandButton
+                    icon={<Code size={20} color={theme.colors.icon} />}
+                    commandName="toggleCode"
+                    active={active.code()}
+                    onClick={() => commands.toggleCode()}
+                />
+                <CommandButton
+                    icon={<CodeBlock size={20} color={theme.colors.icon} />}
+                    commandName="toggleCodeBlock"
+                    active={active.codeBlock()}
+                    onClick={() => commands.toggleCodeBlock()}
+                />
+                <CustomDivider type="vertical" />
+                {shouldShowImageButtonV2 ? <AddImageButtonV2 /> : <AddImageButton />}
+                <AddLinkButton />
+                <CommandButton
+                    icon={<Table size={20} color={theme.colors.icon} />}
+                    commandName="createTable"
+                    onClick={() => commands.createTable()}
+                    disabled={active.table()} /* Disables nested tables */
+                />
+                <FileUploadButton />
+            </InnerContainer>
+            {belowToolbar && <BelowToolbarRow>{belowToolbar}</BelowToolbarRow>}
+        </Container>
+    );
+};

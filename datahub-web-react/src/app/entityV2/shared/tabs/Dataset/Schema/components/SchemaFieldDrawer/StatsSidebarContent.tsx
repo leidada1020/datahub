@@ -1,0 +1,206 @@
+import { TrendDown } from '@phosphor-icons/react/dist/csr/TrendDown';
+import { TrendUp } from '@phosphor-icons/react/dist/csr/TrendUp';
+import { Typography } from 'antd';
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { decimalToPercentStr } from '@app/entityV2/shared/tabs/Dataset/Schema/utils/statsUtil';
+import SampleValueTag from '@app/entityV2/shared/tabs/Dataset/Stats/snapshot/SampleValueTag';
+import { extractChartValuesFromFieldProfiles } from '@app/entityV2/shared/utils';
+import { formatNumberWithoutAbbreviation } from '@app/sharedV2/formatNumber';
+
+import { DatasetFieldProfile, SchemaField } from '@types';
+
+import NoStatsAvailble from '@images/no-stats-available.svg?react';
+
+const maxLabelWidth = 150;
+
+const StatsWrapper = styled.div`
+    padding: 0px 24px;
+    display: flex;
+    flex-direction: column;
+    height: fit-content; // to prevent unnecessary scrolling
+    margin-bottom: 50px;
+`;
+
+const StatRow = styled.div`
+    display: flex;
+    flex-direction: column;
+    padding-top: 12px;
+    padding-bottom: 12px;
+`;
+
+const StatLabel = styled.div`
+    display: flex;
+    align-items: center;
+    padding-top: 12px;
+    padding-bottom: 12px;
+    :not(:last-child) {
+        border-bottom: 1px solid ${(props) => props.theme.colors.border};
+    }
+`;
+
+const LabelText = styled(Typography.Text)`
+    color: ${(props) => props.theme.colors.textSecondary};
+    font-size: 12px;
+    font-weight: 400;
+    line-height: 24px;
+    width: ${maxLabelWidth}px;
+    margin-right: 8px;
+`;
+
+const StatValue = styled.div<{ isDecreasing: boolean }>`
+    color: ${(props) => (props.isDecreasing ? props.theme.colors.borderError : props.theme.colors.textSecondary)};
+    font-size: 12px;
+    font-weight: 800;
+    line-height: 24px;
+`;
+
+const TrendLines = styled.div`
+    margin-left: 5px;
+    margin-top: 4px;
+`;
+
+const NoDataContainer = styled.div`
+    margin: 40px auto;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+`;
+
+const Section = styled.div`
+    color: ${(props) => props.theme.colors.textSecondary};
+    font-weight: 700;
+    font-size: 12px;
+    line-height: 24px;
+`;
+
+const NoStatsIcon = styled(NoStatsAvailble)`
+    width: 80px;
+    height: 80px;
+    margin-bottom: 6px;
+    color: ${(props) => props.theme.colors.bg};
+`;
+
+const StyledTrendUp = styled(TrendUp).attrs({ size: 14 })`
+    color: ${(props) => props.theme.colors.iconSuccess};
+`;
+
+const StyledTrendDown = styled(TrendDown).attrs({ size: 14 })`
+    color: ${(props) => props.theme.colors.iconError};
+`;
+interface Props {
+    properties: {
+        expandedField: SchemaField;
+        fieldProfile: DatasetFieldProfile | undefined;
+        profiles: any[];
+    };
+}
+
+export function StatsSidebarContent({ properties }: Props) {
+    const { t } = useTranslation('entity.profile.schema');
+    const { expandedField, fieldProfile, profiles } = properties;
+
+    const getFieldStatTrendComponent = (statName: string) => {
+        const statValues = extractChartValuesFromFieldProfiles(profiles, expandedField.fieldPath, statName);
+
+        if (!fieldProfile || !statValues[1]) return null;
+
+        const currentValue = fieldProfile[statName];
+        const lastValue = statValues[1].value;
+
+        let trendLine: any = null;
+        if (currentValue === null || currentValue === undefined || lastValue === null || lastValue === undefined)
+            return null;
+        if (currentValue > lastValue) {
+            trendLine = <StyledTrendUp />;
+        } else if (currentValue < lastValue) {
+            trendLine = <StyledTrendDown />;
+        }
+        const isDecreasing = currentValue < lastValue;
+
+        return trendLine ? [trendLine, isDecreasing] : null;
+    };
+
+    if (!fieldProfile) {
+        return (
+            <NoDataContainer>
+                <NoStatsIcon />
+                <Section>{t('statsSidebar.noColumnStatsFound')}</Section>
+            </NoDataContainer>
+        );
+    }
+
+    const statsData = {
+        stats: [
+            {
+                name: t('statsSummary.nullCount'),
+                value: fieldProfile.nullCount ? formatNumberWithoutAbbreviation(fieldProfile.nullCount) : null,
+                trend: getFieldStatTrendComponent('nullCount'),
+            },
+            {
+                name: t('statsSummary.nullPercent'),
+                value: decimalToPercentStr(fieldProfile.nullProportion, 2),
+                trend: getFieldStatTrendComponent('nullProportion'),
+            },
+            {
+                name: t('statsSummary.distinctCount'),
+                value: fieldProfile.uniqueCount ? formatNumberWithoutAbbreviation(fieldProfile.uniqueCount) : null,
+                trend: getFieldStatTrendComponent('uniqueCount'),
+            },
+            {
+                name: t('statsSummary.distinctPercent'),
+                value: decimalToPercentStr(fieldProfile.uniqueProportion, 2),
+                trend: getFieldStatTrendComponent('uniqueProportion'),
+            },
+            {
+                name: t('statsSummary.min'),
+                value: fieldProfile.min ? formatNumberWithoutAbbreviation(fieldProfile.min) : null,
+                trend: getFieldStatTrendComponent('min'),
+            },
+            {
+                name: t('statsSummary.max'),
+                value: fieldProfile.max ? formatNumberWithoutAbbreviation(fieldProfile.max) : null,
+                trend: getFieldStatTrendComponent('max'),
+            },
+            {
+                name: t('statsSummary.median'),
+                value: fieldProfile.median ? formatNumberWithoutAbbreviation(fieldProfile.median) : null,
+                trend: getFieldStatTrendComponent('median'),
+            },
+            {
+                name: t('statsSummary.stdDev'),
+                value: fieldProfile.stdev ? formatNumberWithoutAbbreviation(fieldProfile.stdev) : null,
+                trend: getFieldStatTrendComponent('stdev'),
+            },
+            {
+                name: t('statsSummary.sampleValues'),
+                value: fieldProfile.sampleValues
+                    ?.filter((value) => value !== undefined)
+                    .slice(0, 3)
+                    .map((value) => <SampleValueTag value={value} />),
+                trend: null,
+            },
+        ],
+    };
+
+    return (
+        <StatsWrapper>
+            {fieldProfile && (
+                <StatRow>
+                    {statsData.stats.map((stat) => {
+                        if (stat.value === undefined || stat.value === null) return null;
+                        return (
+                            <StatLabel key={stat.name}>
+                                <LabelText>{stat.name}</LabelText>
+                                <StatValue isDecreasing={stat.trend?.[1] || false}>{stat.value}</StatValue>
+                                <TrendLines>{stat.trend?.[0]}</TrendLines>
+                            </StatLabel>
+                        );
+                    })}
+                </StatRow>
+            )}
+        </StatsWrapper>
+    );
+}

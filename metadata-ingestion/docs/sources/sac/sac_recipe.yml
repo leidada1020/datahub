@@ -1,0 +1,69 @@
+source:
+    type: sac
+    config:
+        stateful_ingestion:
+            enabled: true
+
+        tenant_url: # Your SAP Analytics Cloud tenant URL, e.g. https://company.eu10.sapanalytics.cloud or https://company.eu10.hcs.cloud.sap
+        token_url: # The Token URL of your SAP Analytics Cloud tenant, e.g. https://company.eu10.hana.ondemand.com/oauth/token.
+
+        # Add secret in Secrets Tab with relevant names for each variable
+        client_id: "${SAC_CLIENT_ID}" # Your SAP Analytics Cloud client id
+        client_secret: "${SAC_CLIENT_SECRET}" # Your SAP Analytics Cloud client secret
+
+        # ingest stories
+        ingest_stories: true
+
+        # ingest applications
+        ingest_applications: true
+
+        resource_id_pattern:
+            allow:
+                - .*
+
+        resource_name_pattern:
+            allow:
+                - .*
+
+        # SAC returns its built-in public root folder in each resource's browse path
+        # localized to the resource language (e.g. "Public" / "Öffentlich"). The connector
+        # rewrites that first segment to this canonical label so all public content shares
+        # one browse tree; set to null to keep the raw localized name.
+        public_root_folder_name: Public
+
+        # Only a first browse-path segment matching one of these labels (case-insensitive)
+        # is treated as the public root and rewritten. Other shared roots that SAC can also
+        # return (e.g. a team/workspace root like "Default") are left untouched. Add your
+        # tenant language's public-root label if it is not already listed.
+        public_root_folder_aliases:
+            - Public
+            - Öffentlich
+
+        # folder_pattern is matched against the canonicalized browse path, so write rules
+        # against public_root_folder_name (e.g. Public/...) rather than a localized root.
+        folder_pattern:
+            allow:
+                - .*
+
+        connection_mapping:
+            MY_BW_CONNECTION:
+                platform: bw
+                platform_instance: PROD_BW
+                env: PROD
+            MY_HANA_CONNECTION:
+                platform: hana
+                platform_instance: PROD_HANA
+                env: PROD
+            # SAP Datasphere (DWC) connection: SAC does not expose the Datasphere space,
+            # so set it here to build the upstream sap-datasphere lineage (<space>.<model_name>).
+            MY_DATASPHERE_CONNECTION:
+                datasphere_space: my_space
+                # platform_instance / env / convert_urns_to_lowercase must match how the
+                # SAP Datasphere connector ingested the assets so the urns stitch.
+                env: PROD
+                convert_urns_to_lowercase: true
+
+        # Emit column-level lineage to SAP Datasphere by mirroring the upstream dataset's
+        # schema from DataHub (requires a datahub_api/graph connection and SAP Datasphere
+        # to be ingested first). Falls back to table-level lineage when unavailable.
+        resolve_datasphere_column_lineage: true

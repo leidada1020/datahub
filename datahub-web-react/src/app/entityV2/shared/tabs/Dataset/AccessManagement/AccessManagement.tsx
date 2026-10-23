@@ -1,0 +1,91 @@
+import { Table } from 'antd';
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { useEntityData } from '@app/entity/shared/EntityContext';
+import { renderAccessButton } from '@app/entityV2/shared/tabs/Dataset/AccessManagement/AccessButtonHelpers';
+import AccessManagerDescription from '@app/entityV2/shared/tabs/Dataset/AccessManagement/AccessManagerDescription';
+import { handleAccessRoles } from '@app/entityV2/shared/tabs/Dataset/AccessManagement/utils';
+
+import { useGetExternalRolesQuery } from '@graphql/dataset.generated';
+
+const SCROLL_X = 'max-content';
+
+const StyledTable = styled(Table)`
+    overflow: inherit;
+    height: inherit;
+
+    &&& .ant-table-cell {
+        background-color: ${(props) => props.theme.colors.bg};
+    }
+    &&& .ant-table-thead .ant-table-cell {
+        font-weight: 600;
+        font-size: 12px;
+        color: ${(props) => props.theme.colors.textTertiary};
+    }
+    &&
+        .ant-table-thead
+        > tr
+        > th:not(:last-child):not(.ant-table-selection-column):not(.ant-table-row-expand-icon-cell):not(
+            [colspan]
+        )::before {
+        border: 1px solid ${(props) => props.theme.colors.border};
+    }
+` as typeof Table;
+
+/**
+ * AccessManagement component displays a table of roles with access request functionality.
+ * Shows "Granted" (disabled) buttons for roles the user already has access to,
+ * "Not Granted" (disabled) buttons for roles the user has no access to and cannot request access to (no request link)
+ * and "Request" (enabled) buttons for roles they can request access to.
+ */
+export default function AccessManagement() {
+    const { t } = useTranslation('entity.profile.access');
+    const { t: tl } = useTranslation('common.labels');
+    const { urn: entityUrn } = useEntityData();
+
+    const { data: externalRoles } = useGetExternalRolesQuery({
+        variables: { urn: entityUrn },
+        skip: !entityUrn,
+    });
+
+    const columns = [
+        {
+            title: t('accessManagement.columnRoleName'),
+            dataIndex: 'name',
+            key: 'name',
+        },
+        {
+            title: tl('description'),
+            dataIndex: 'description',
+            key: 'description',
+            render: (roleDescription) => {
+                return <AccessManagerDescription description={roleDescription} />;
+            },
+        },
+        {
+            title: t('accessManagement.columnAccessType'),
+            dataIndex: 'accessType',
+            key: 'accessType',
+        },
+        {
+            title: t('accessManagement.columnAccess'),
+            dataIndex: 'hasAccess',
+            key: 'hasAccess',
+            render: (hasAccess, record) => renderAccessButton({ hasAccess, url: record.url, name: record.name }),
+        },
+    ];
+
+    const tableData = handleAccessRoles(externalRoles);
+
+    return (
+        <StyledTable
+            dataSource={tableData}
+            columns={columns}
+            pagination={false}
+            scroll={{ x: SCROLL_X }}
+            aria-label={t('accessManagement.tableAriaLabel')}
+        />
+    );
+}

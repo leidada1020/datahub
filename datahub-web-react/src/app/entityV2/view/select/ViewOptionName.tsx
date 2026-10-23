@@ -1,0 +1,222 @@
+import { Icon, Tooltip } from '@components';
+import { Crosshair } from '@phosphor-icons/react/dist/csr/Crosshair';
+import { GlobeHemisphereEast } from '@phosphor-icons/react/dist/csr/GlobeHemisphereEast';
+import { Lock } from '@phosphor-icons/react/dist/csr/Lock';
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { ViewDropdownMenu } from '@app/entityV2/view/menu/ViewDropdownMenu';
+import { ViewOptionTooltipTitle } from '@app/entityV2/view/select/ViewOptionTooltipTitle';
+import { useViewsSelectContext } from '@app/entityV2/view/select/ViewSelectContext';
+import {
+    CardViewLabel,
+    ViewContainer,
+    ViewContent,
+    ViewDescription,
+    ViewIcon,
+    ViewIconNavBarRedesign,
+} from '@app/entityV2/view/select/styledComponents';
+import { GlobalDefaultViewIcon } from '@app/entityV2/view/shared/GlobalDefaultViewIcon';
+import { UserDefaultViewIcon } from '@app/entityV2/view/shared/UserDefaultViewIcon';
+import { useShowNavBarRedesign } from '@src/app/useShowNavBarRedesign';
+import { useCustomTheme } from '@src/customThemeContext';
+
+import { DataHubView } from '@types';
+
+const ICON_WIDTH = 30;
+
+const IconPlaceholder = styled.div<{ $isShowNavBarRedesign?: boolean }>`
+    width: ${ICON_WIDTH}px;
+    display: flex;
+    align-items: center;
+    justify-content: end;
+    position: absolute;
+    right: 5px;
+    top: ${(props) => (props.$isShowNavBarRedesign ? '0px' : '-5px')};
+    gap: 0.2rem;
+`;
+
+const ViewType = styled.span`
+    position: absolute;
+    bottom: 0px;
+    right: 0px;
+    background-color: ${(props) => props.theme.colors.bg};
+    color: ${(props) => props.theme.colors.text};
+    display: flex;
+    align-items: center;
+    border-radius: 8px 1px;
+    padding: 5px 4px;
+`;
+
+const DefaultViewIconContainer = styled.div<{ selected?: boolean; $isShowNavBarRedesign?: boolean }>`
+    border: 1px solid
+        ${(props) => {
+            if (props.$isShowNavBarRedesign) {
+                return props.selected ? props.theme.colors.borderBrand : 'transparent';
+            }
+            return props.selected ? props.theme.colors.borderBrand : props.theme.colors.border;
+        }};
+    border-radius: 100%;
+`;
+
+const ViewDropdownMenuContainer = styled.div`
+    display: flex;
+    justify-content: end;
+    align-items: center;
+`;
+
+const FilterCenterFocusOutlinedIconStyle = styled(Crosshair).attrs({ size: 18 })``;
+
+type Props = {
+    name: string;
+    type: string;
+    isGlobalDefault: boolean;
+    isUserDefault: boolean;
+    description?: string | null;
+    view: DataHubView;
+    visible?: boolean;
+    isOwnedByUser?: boolean;
+    selected?: boolean;
+    fixedWidth?: boolean;
+    // Custom Action Handlers - useful if you do NOT want the Menu to handle Modal rendering.
+    onClickEdit?: () => void;
+    onClickPreview?: () => void;
+    selectView: () => void;
+};
+
+const ViewIconContainerNavBarRedesign = styled.div`
+    display: flex;
+    position: relative;
+`;
+
+export const ViewOptionName = ({
+    name,
+    description,
+    type,
+    isGlobalDefault,
+    isUserDefault,
+    view,
+    visible,
+    isOwnedByUser,
+    selected,
+    fixedWidth,
+    onClickEdit,
+    onClickPreview,
+    selectView,
+}: Props) => {
+    const { t } = useTranslation('entity.views');
+    const isShowNavBarRedesign = useShowNavBarRedesign();
+    const { updateOpenState } = useViewsSelectContext();
+    const { theme } = useCustomTheme();
+
+    const renderViewIcon = () => {
+        if (isShowNavBarRedesign) {
+            return (
+                <ViewIconContainerNavBarRedesign>
+                    {(isUserDefault || isGlobalDefault) && (
+                        <IconPlaceholder $isShowNavBarRedesign={isShowNavBarRedesign}>
+                            {isGlobalDefault && (
+                                <DefaultViewIconContainer
+                                    selected={selected}
+                                    $isShowNavBarRedesign={isShowNavBarRedesign}
+                                >
+                                    <GlobalDefaultViewIcon
+                                        title={t('orgDefaultTooltip')}
+                                        color={theme?.colors?.icon}
+                                        size={5}
+                                    />
+                                </DefaultViewIconContainer>
+                            )}
+                            {isUserDefault && (
+                                <DefaultViewIconContainer
+                                    selected={selected}
+                                    $isShowNavBarRedesign={isShowNavBarRedesign}
+                                >
+                                    <UserDefaultViewIcon
+                                        title={t('userDefaultTooltip')}
+                                        color={theme?.colors?.iconBrand}
+                                        size={5}
+                                    />
+                                </DefaultViewIconContainer>
+                            )}
+                        </IconPlaceholder>
+                    )}
+                    <Tooltip
+                        placement="bottom"
+                        showArrow
+                        title={type === 'GLOBAL' ? t('typePublic') : t('typePrivate')}
+                    >
+                        <ViewIconNavBarRedesign $selected={selected}>
+                            {type === 'GLOBAL' && <GlobeHemisphereEast size={22} />}
+                            {type === 'PERSONAL' && <Lock size={22} />}
+                        </ViewIconNavBarRedesign>
+                    </Tooltip>
+                </ViewIconContainerNavBarRedesign>
+            );
+        }
+
+        return (
+            <ViewIcon className="create-view-icon" $selected={selected}>
+                <FilterCenterFocusOutlinedIconStyle />
+                {(isUserDefault || isGlobalDefault) && (
+                    <IconPlaceholder>
+                        {isGlobalDefault && (
+                            <DefaultViewIconContainer selected={selected}>
+                                <GlobalDefaultViewIcon title={t('orgDefaultTooltip')} size={10} />
+                            </DefaultViewIconContainer>
+                        )}
+                        {isUserDefault && (
+                            <DefaultViewIconContainer selected={selected}>
+                                <UserDefaultViewIcon
+                                    title={t('userDefaultTooltip')}
+                                    color={theme?.colors?.textSuccess}
+                                    size={10}
+                                />
+                            </DefaultViewIconContainer>
+                        )}
+                    </IconPlaceholder>
+                )}
+                <Tooltip placement="bottom" showArrow title={type === 'GLOBAL' ? t('typePublic') : t('typePrivate')}>
+                    <ViewType>
+                        {type === 'GLOBAL' && <Icon icon={GlobeHemisphereEast} size="lg" />}
+                        {type === 'PERSONAL' && <Icon icon={Lock} size="lg" />}
+                    </ViewType>
+                </Tooltip>
+            </ViewIcon>
+        );
+    };
+
+    return (
+        <ViewContainer
+            role="row"
+            $selected={selected}
+            $isShowNavBarRedesign={isShowNavBarRedesign}
+            $fixedWidth={fixedWidth}
+        >
+            {renderViewIcon()}
+            <Tooltip
+                placement="bottom"
+                showArrow
+                title={<ViewOptionTooltipTitle name={name} description={description} />}
+            >
+                <ViewContent $isShowNavBarRedesign={isShowNavBarRedesign} $fixedWidth={fixedWidth}>
+                    <CardViewLabel $isShowNavBarRedesign={isShowNavBarRedesign}>{name}</CardViewLabel>
+                    <ViewDescription $isShowNavBarRedesign={isShowNavBarRedesign}>{description}</ViewDescription>
+                </ViewContent>
+            </Tooltip>
+            {/* Menu actions (and the modals they open) must not bubble up to the row and select the view. */}
+            <ViewDropdownMenuContainer onClick={(e) => e.stopPropagation()}>
+                <ViewDropdownMenu
+                    view={view}
+                    isOwnedByUser={isOwnedByUser}
+                    visible={visible}
+                    onClickEdit={onClickEdit}
+                    onClickPreview={onClickPreview}
+                    selectView={selectView}
+                    onActionComplete={() => updateOpenState(false)}
+                />
+            </ViewDropdownMenuContainer>
+        </ViewContainer>
+    );
+};

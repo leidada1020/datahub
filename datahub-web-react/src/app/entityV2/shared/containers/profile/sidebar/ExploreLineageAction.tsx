@@ -1,0 +1,35 @@
+import { Button, Tooltip } from '@components';
+import { TreeStructure } from '@phosphor-icons/react/dist/csr/TreeStructure';
+import React, { useContext } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useHistory } from 'react-router-dom';
+
+import { useEntityData } from '@app/entity/shared/EntityContext';
+import { EntityTabPath } from '@app/entityV2/shared/constants';
+import { getEntityPath } from '@app/entityV2/shared/containers/profile/entityData';
+import { useEntityRegistry } from '@app/useEntityRegistry';
+import CompactContext from '@src/app/sharedV2/CompactContext';
+
+export const ExploreLineageAction = () => {
+    const { t } = useTranslation('entity.shared.containers');
+    const entityRegistry = useEntityRegistry();
+    const history = useHistory();
+    const isCompact = useContext(CompactContext);
+    const { urn, entityType, entityData } = useEntityData();
+    const entityName = (entityData && entityRegistry.getDisplayName(entityType, entityData)) || '-';
+    const lineagePath = getEntityPath(entityType, urn, entityRegistry, false, false, EntityTabPath.LINEAGE);
+
+    const handleClick = () => {
+        if (isCompact) {
+            window.open(lineagePath, '_blank');
+        } else {
+            history.push(lineagePath);
+        }
+    };
+
+    return (
+        <Tooltip placement="left" showArrow={false} title={t('sidebar.lineage.exploreTooltip', { entityName })}>
+            <Button variant="text" color="primary" size="md" icon={{ icon: TreeStructure }} onClick={handleClick} />
+        </Tooltip>
+    );
+};

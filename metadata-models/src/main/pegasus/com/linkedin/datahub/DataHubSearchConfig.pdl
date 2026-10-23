@@ -1,0 +1,120 @@
+namespace com.linkedin.datahub
+
+/**
+* Configuration for how any given field should be indexed and matched in the DataHub search index.
+**/
+record DataHubSearchConfig {
+
+    /**
+    * Name of the field in the search index. Defaults to the field name otherwise
+    **/
+    fieldName: optional string
+
+    /**
+    * Type of the field. Defines how the field is indexed and matched
+    **/
+    fieldType: optional enum SearchFieldType {
+        KEYWORD,
+        TEXT,
+        TEXT_PARTIAL,
+        BROWSE_PATH,
+        URN,
+        URN_PARTIAL,
+        BOOLEAN,
+        COUNT,
+        DATETIME,
+        OBJECT,
+        BROWSE_PATH_V2,
+        WORD_GRAM 
+    }
+
+    /**
+    * Whether we should match the field for the default search query
+    **/
+    queryByDefault: boolean = false
+
+    /**
+    * Whether to exclude this field's values from Search V2 and V2.5 full-text search.
+    * Search V3 ignores this field: a string, rich_text, or urn property is full-text
+    * indexed when searchConfiguration is present. Unset means not excluded.
+    **/
+    excludeFromFullTextSearch: optional boolean
+
+    /** 
+    * Whether we should use the field for default autocomplete
+    **/
+    enableAutocomplete: boolean = false
+  
+    /** 
+    * Whether or not to add field to filters.
+    **/
+    addToFilters: boolean = false
+
+    /**
+    * Whether or not to add the "has values" to filters.
+    * check if this is conditional on addToFilters being true
+    **/
+    addHasValuesToFilters: boolean = true
+
+    /**
+    * Display name of the filter
+    **/
+    filterNameOverride: optional string
+
+    /**
+    * Display name of the has values filter
+    **/
+    hasValuesFilterNameOverride: optional string
+
+    /**
+    * Boost multiplier to the match score. Matches on fields with higher boost score ranks higher.
+    * On Search V3 this is the weight of a structured property's `.text` subfield. When the key is
+    * absent, V3 uses 0.8; the default of 1.0 stays so V2 is unchanged.
+    **/
+    boostScore: double = 1.0
+
+    /**
+    * Weight of each analyzed subfield other than `.text`, which `boostScore` controls.
+    * Search V3 reads `stemmed`. When `stemmed` is absent its weight is half of the `.text`
+    * weight, before the partial factor scales both. Search V2 ignores this map.
+    **/
+    subfieldBoostScores: optional map[string, double]
+
+    /**
+    * If set, add a index field of the given name that checks whether the field exists
+    **/
+    hasValuesFieldName: optional string
+  
+    /**
+    * If set, add a index field of the given name that checks the number of elements
+    **/
+    numValuesFieldName: optional string
+
+    /**
+    * (Optional) Weights to apply to score for a given value
+    **/
+    weightsPerFieldValue: optional map[string, double]
+
+    /**
+    * (Optional) Aliases for this given field that can be used for sorting etc.
+    **/
+    fieldNameAliases: optional array[string]
+
+    /**
+    * Shared search fields this property's values are copied into, on Search V3.
+    * Each entry names a shared field (entityName, qualifiedName, description,
+    * columns, other) or a root field that feeds one (name, description).
+    * For a URN property this copies the parsed name. The complete URN is
+    * copyUrnTo. The property's own field is unchanged, and the stored name is
+    * unchanged. Unset copies nowhere. A number or date property ignores this list.
+    **/
+    copyTo: optional array[string]
+
+    /**
+    * Shared search fields the complete URN is copied into, on Search V3.
+    * Same names as copyTo. Ignored unless the value type is URN. A destination
+    * listed here and in copyTo receives both the complete URN and the parsed name.
+    **/
+    copyUrnTo: optional array[string]
+
+}

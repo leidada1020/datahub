@@ -1,0 +1,326 @@
+import { BookOpen } from '@phosphor-icons/react/dist/csr/BookOpen';
+import { ChartBar } from '@phosphor-icons/react/dist/csr/ChartBar';
+import { Code } from '@phosphor-icons/react/dist/csr/Code';
+import { ListBullets } from '@phosphor-icons/react/dist/csr/ListBullets';
+import { Drawer, Typography } from 'antd';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { useBaseEntity } from '@app/entity/shared/EntityContext';
+import { ExtendedSchemaFields } from '@app/entityV2/dataset/profile/schema/utils/types';
+import { pathMatchesInsensitiveToV2 } from '@app/entityV2/dataset/profile/schema/utils/utils';
+import { lazyProfileComponent } from '@app/entityV2/shared/lazyEntityProfile';
+import { AboutFieldTab } from '@app/entityV2/shared/tabs/Dataset/Schema/components/SchemaFieldDrawer/AboutFieldTab';
+import DrawerFooter from '@app/entityV2/shared/tabs/Dataset/Schema/components/SchemaFieldDrawer/DrawerFooter';
+import FieldHeader from '@app/entityV2/shared/tabs/Dataset/Schema/components/SchemaFieldDrawer/FieldHeader';
+import {
+    SchemaFieldDrawerTabs,
+    TABS_WIDTH,
+} from '@app/entityV2/shared/tabs/Dataset/Schema/components/SchemaFieldDrawer/SchemaFieldDrawerTabs';
+import StatsTabWrapper from '@app/entityV2/shared/tabs/Dataset/Schema/components/SchemaFieldDrawer/StatsTabWrapper';
+import { SchemaTimelineSection } from '@app/entityV2/shared/tabs/Dataset/Timeline/SchemaTimelineSection';
+import { generateSchemaFieldUrn } from '@app/entityV2/shared/tabs/Lineage/utils';
+import { PropertiesTab } from '@app/entityV2/shared/tabs/Properties/PropertiesTab';
+import { TabRenderType } from '@app/entityV2/shared/types';
+
+import { GetDatasetQuery, useGetDataProfilesLazyQuery } from '@graphql/dataset.generated';
+import { useGetEntitiesNotesQuery } from '@graphql/relationships.generated';
+import { EditableSchemaMetadata, Post, SchemaField, TimeWindow, UsageQueryResult } from '@types';
+
+// Query cards and the query editor sit behind this tab. The schema drawer itself
+// should not download the syntax highlighter or Monaco.
+const SchemaFieldQueriesSidebarTab = lazyProfileComponent(
+    'SchemaFieldQueriesSidebarTab',
+    () => import('@app/entityV2/shared/tabs/Dataset/Schema/components/SchemaFieldDrawer/SchemaFieldQueriesSidebarTab'),
+);
+
+const DEFAULT_SELECTED_TAB_KEY = 'About';
+
+const StyledDrawer = styled(Drawer)`
+    &&& .ant-drawer-body {
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        height: 100%;
+    }
+
+    &&& .ant-drawer-content-wrapper {
+        box-shadow: ${(props) => props.theme.colors.shadowLg};
+    }
+`;
+
+const DrawerContent = styled.div`
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+`;
+
+const TimelineHeader = styled(Typography.Text)`
+    font-size: 16px;
+    font-weight: 700;
+    line-height: 24px;
+    overflow: hidden;
+    display: block;
+    cursor: pointer;
+`;
+
+const TimelineHeaderWrapper = styled.div`
+    padding: 16px;
+    display: flex;
+    justify-content: space-between;
+`;
+
+const Body = styled.div`
+    display: flex;
+    flex-direction: row;
+    height: 100%;
+`;
+
+const Content = styled.div`
+    flex: 1;
+    border-right: 1px solid ${(props) => props.theme.colors.border};
+    max-width: calc(100% - ${TABS_WIDTH}px);
+`;
+
+const Tabs = styled.div``;
+
+interface Props {
+    schemaFields: SchemaField[];
+    editableSchemaMetadata?: EditableSchemaMetadata | null;
+    expandedDrawerFieldPath: string | null;
+    setExpandedDrawerFieldPath: (fieldPath: string | null) => void;
+    openTimelineDrawer?: boolean;
+    setOpenTimelineDrawer?: (open: boolean) => void;
+    selectPreviousField?: () => void;
+    selectNextField?: () => void;
+    usageStats?: UsageQueryResult | null;
+    displayedRows: ExtendedSchemaFields[];
+    refetch?: () => void;
+    mask?: boolean;
+    defaultSelectedTabKey?: string;
+}
+
+export default function SchemaFieldDrawer({
+    schemaFields,
+    editableSchemaMetadata,
+    expandedDrawerFieldPath,
+    setExpandedDrawerFieldPath,
+    openTimelineDrawer,
+    setOpenTimelineDrawer,
+    selectPreviousField,
+    selectNextField,
+    usageStats,
+    displayedRows,
+    refetch,
+    mask = false,
+    defaultSelectedTabKey = DEFAULT_SELECTED_TAB_KEY,
+}: Props) {
+    const { t } = useTranslation('entity.profile.schema');
+    const expandedFieldIndex = useMemo(
+        () => displayedRows.findIndex((row) => row.fieldPath === expandedDrawerFieldPath),
+        [expandedDrawerFieldPath, displayedRows],
+    );
+    const expandedField =
+        expandedFieldIndex !== undefined && expandedFieldIndex !== -1 ? displayedRows[expandedFieldIndex] : undefined;
+
+    const baseEntity = useBaseEntity<GetDatasetQuery>();
+    const latestFullTableProfile = baseEntity?.dataset?.latestFullTableProfile?.[0];
+    const latestPartitionProfile = baseEntity?.dataset?.latestPartitionProfile?.[0];
+
+    const latestProfile = latestFullTableProfile || latestPartitionProfile;
+
+    const fieldProfile = latestProfile?.fieldProfiles?.find((profile) =>
+        pathMatchesInsensitiveToV2(profile.fieldPath, expandedField?.fieldPath),
+    );
+
+    const urn = (baseEntity && baseEntity.dataset && baseEntity.dataset?.urn) || '';
+    const siblingUrn =
+        (baseEntity && baseEntity.dataset && baseEntity.dataset?.siblingsSearch?.searchResults?.[0]?.entity?.urn) || '';
+    const schemaFieldUrn = generateSchemaFieldUrn(expandedDrawerFieldPath, urn);
+    const schemaFieldSiblingUrn = generateSchemaFieldUrn(expandedDrawerFieldPath, siblingUrn);
+    const notesUrns = [schemaFieldUrn, schemaFieldSiblingUrn].filter((v): v is string => !!v);
+    const { data: notesData, refetch: refetchNotes } = useGetEntitiesNotesQuery({
+        skip: !notesUrns.length,
+        variables: { urns: notesUrns },
+        fetchPolicy: 'cache-first',
+    });
+    const notes: Post[] =
+        notesData?.entities?.flatMap(
+            (entity) =>
+                (entity?.__typename === 'SchemaFieldEntity' &&
+                    entity?.notes?.relationships?.map((r) => r.entity as Post)) ||
+                [],
+        ) || [];
+
+    const [getDataProfiles, { data: profilesData, loading: profilesDataLoading }] = useGetDataProfilesLazyQuery();
+
+    useEffect(() => {
+        if (urn) {
+            getDataProfiles({
+                variables: { urn },
+            });
+        }
+    }, [urn, getDataProfiles]);
+
+    useEffect(() => {
+        if (
+            displayedRows.length > 0 &&
+            expandedDrawerFieldPath &&
+            !displayedRows.find((row) => row.fieldPath === expandedDrawerFieldPath)
+        ) {
+            setExpandedDrawerFieldPath(null);
+        }
+    }, [displayedRows, expandedDrawerFieldPath, setExpandedDrawerFieldPath]);
+
+    const profiles = profilesData?.dataset?.datasetProfiles || [];
+    const [selectedTabKey, setSelectedTabKey] = useState(defaultSelectedTabKey);
+
+    const fetchDataWithLookbackWindow = useCallback(
+        (lookbackWindow: TimeWindow) => {
+            if (urn) {
+                getDataProfiles({
+                    variables: { urn, ...lookbackWindow },
+                });
+            }
+        },
+        [urn, getDataProfiles],
+    );
+
+    const tabs: any = [
+        {
+            key: 'About',
+            name: t('fieldDrawerTabs.about'),
+            icon: BookOpen,
+            component: AboutFieldTab,
+            properties: {
+                schemaFields,
+                editableSchemaMetadata,
+                expandedDrawerFieldPath,
+                usageStats,
+                fieldProfile,
+                profiles,
+                fetchDataWithLookbackWindow,
+                profilesDataLoading,
+                notes,
+                setSelectedTabName: setSelectedTabKey,
+                refetch,
+                refetchNotes,
+                fieldUrn: expandedField?.schemaFieldEntity?.urn,
+                assetUrn: urn,
+            },
+        },
+        {
+            key: 'Statistics',
+            name: t('fieldDrawerTabs.statistics'),
+            icon: ChartBar,
+            component: StatsTabWrapper,
+            properties: {
+                expandedField,
+                fieldProfile,
+                profiles,
+                fetchDataWithLookbackWindow,
+                profilesDataLoading,
+            },
+        },
+        {
+            key: 'Queries',
+            name: t('fieldDrawerTabs.queries'),
+            component: SchemaFieldQueriesSidebarTab,
+            description: t('fieldDrawerTabs.queriesDescription'),
+            icon: Code,
+            properties: { fieldPath: expandedField?.fieldPath },
+        },
+        {
+            key: 'Properties',
+            name: t('fieldDrawerTabs.properties'),
+            component: PropertiesTab,
+            description: t('fieldDrawerTabs.propertiesDescription'),
+            icon: ListBullets,
+            properties: {
+                fieldPath: expandedField?.fieldPath,
+                fieldUrn: expandedField?.schemaFieldEntity?.urn,
+                fieldEntity: expandedField?.schemaFieldEntity,
+                refetch,
+            },
+        },
+    ];
+
+    const selectedTab = tabs.find((tab) => tab.key === selectedTabKey);
+
+    return (
+        <>
+            {!openTimelineDrawer && (
+                <StyledDrawer
+                    push={false}
+                    open={!!expandedDrawerFieldPath}
+                    onClose={() => setExpandedDrawerFieldPath(null)}
+                    getContainer={() => document.getElementById('entity-profile-sidebar') as HTMLElement}
+                    // The minWidth is calculated based on the width of the Chart's displayed in the Historical stats view
+                    // And Insight Stats View Table to ensure consistent container width across various screen sizes.
+                    contentWrapperStyle={{ width: `fit-content`, minWidth: '560px', maxWidth: '560px' }}
+                    mask={mask}
+                    maskClosable={mask}
+                    placement="right"
+                    closable={false}
+                >
+                    {expandedField && (
+                        <DrawerContent data-testid="schema-field-drawer-content">
+                            <FieldHeader
+                                setExpandedDrawerFieldPath={setExpandedDrawerFieldPath}
+                                expandedField={expandedField}
+                            />
+                            <Body onKeyDown={(e) => e.stopPropagation()}>
+                                {selectedTab && (
+                                    <Content>
+                                        <selectedTab.component
+                                            properties={selectedTab.properties}
+                                            renderType={TabRenderType.COMPACT}
+                                        />
+                                    </Content>
+                                )}
+
+                                <Tabs>
+                                    <SchemaFieldDrawerTabs
+                                        tabs={tabs}
+                                        selectedTab={selectedTab}
+                                        onSelectTab={(key) => setSelectedTabKey(key)}
+                                    />
+                                </Tabs>
+                            </Body>
+                            {selectNextField && selectPreviousField && (
+                                <DrawerFooter
+                                    expandedFieldIndex={expandedFieldIndex}
+                                    selectPreviousField={selectPreviousField}
+                                    selectNextField={selectNextField}
+                                    displayedRows={displayedRows}
+                                />
+                            )}
+                        </DrawerContent>
+                    )}
+                </StyledDrawer>
+            )}
+            {!!openTimelineDrawer && (
+                <StyledDrawer
+                    open={!!openTimelineDrawer}
+                    onClose={() => setOpenTimelineDrawer?.(false)}
+                    getContainer={() => document.getElementById('entity-profile-sidebar') as HTMLElement}
+                    contentWrapperStyle={{ width: '33%' }}
+                    mask={false}
+                    maskClosable={false}
+                    placement="right"
+                    closable={false}
+                    autoFocus={false}
+                >
+                    <DrawerContent>
+                        <TimelineHeaderWrapper>
+                            <TimelineHeader>{t('fieldDrawer.timelineForTable')}</TimelineHeader>
+                        </TimelineHeaderWrapper>
+                        <SchemaTimelineSection />
+                    </DrawerContent>
+                </StyledDrawer>
+            )}
+        </>
+    );
+}

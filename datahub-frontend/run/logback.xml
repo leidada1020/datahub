@@ -1,0 +1,122 @@
+<configuration>
+  <property name="LOG_DIR" value="${LOG_DIR:- /tmp/datahub/logs/datahub-frontend}"/>
+  <timestamp key="bySecond" datePattern="yyyy-MM-dd'_'HH-mm-ss"/>
+  <timestamp key="byDate" datePattern="yyyy-MM-dd"/>
+
+  <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+    <layout class="ch.qos.logback.classic.PatternLayout">
+      <pattern>%date{ISO8601} [%thread] %-5level %logger{36} - %msg%n</pattern>
+    </layout>
+    <filter class="ch.qos.logback.classic.filter.ThresholdFilter">
+      <level>INFO</level>
+    </filter>
+    <filter class="com.linkedin.metadata.utils.log.LogMessageFilter">
+      <excluded>Unable to renew the session. The session store may not support this feature</excluded>
+      <excluded>Preferred JWS algorithm: null not available. Using all metadata algorithms:</excluded>
+      <excluded>Config does not exist: file:///etc/datahub/plugins/frontend/auth/user.props</excluded>
+    </filter>
+  </appender>
+
+  <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+    <file>${LOG_DIR}/datahub-frontend.log</file>
+    <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+      <FileNamePattern>${LOG_DIR}/datahub-frontend.%d{yyyy-dd-MM}-%i.log</FileNamePattern>
+      <!-- each archived file, size max 10MB -->
+      <maxFileSize>100MB</maxFileSize>
+      <!-- total size of all archive files, if total size > 10GB, it will delete old archived file -->
+      <totalSizeCap>10GB</totalSizeCap>
+      <!-- 30 days to keep -->
+      <maxHistory>30</maxHistory>
+    </rollingPolicy>
+    <filter class="ch.qos.logback.classic.filter.ThresholdFilter">
+      <level>INFO</level>
+    </filter>
+    <encoder>
+      <pattern>%date{ISO8601} [%thread] %-5level %logger{36} - %msg%n</pattern>
+    </encoder>
+  </appender>
+
+  <appender name="DEBUG_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+    <file>${LOG_DIR}/datahub-frontend.debug.log</file>
+    <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+      <FileNamePattern>${LOG_DIR}/datahub-frontend.debug.%d{yyyy-dd-MM}-%i.log</FileNamePattern>
+      <!-- each archived file, size max 100MB -->
+      <maxFileSize>100MB</maxFileSize>
+      <!-- total size of all archive files, if total size > 2GB, it will delete old archived file -->
+      <totalSizeCap>2GB</totalSizeCap>
+      <!-- 1 days to keep -->
+      <maxHistory>1</maxHistory>
+    </rollingPolicy>
+    <filter class="ch.qos.logback.classic.filter.LevelFilter">
+      <level>DEBUG</level>
+      <onMatch>ACCEPT</onMatch>
+      <onMismatch>DENY</onMismatch>
+    </filter>
+    <encoder>
+      <pattern>%date{ISO8601} [%thread] %-5level %logger{36} - %msg%n</pattern>
+    </encoder>
+  </appender>
+
+  <!-- Change this to disable logging debug -->
+  <logger name="com.linkedin" level="DEBUG">
+    <appender-ref ref="DEBUG_FILE"/>
+  </logger>
+  <logger name="controller" level="DEBUG">
+    <appender-ref ref="DEBUG_FILE"/>
+  </logger>
+  <logger name="auth" level="DEBUG">
+    <appender-ref ref="DEBUG_FILE"/>
+  </logger>
+  <logger name="org.pac4j" level="DEBUG">
+    <appender-ref ref="DEBUG_FILE"/>
+  </logger>
+  <logger name="graphql" level="DEBUG">
+    <appender-ref ref="DEBUG_FILE"/>
+  </logger>
+  <logger name="react" level="DEBUG">
+    <appender-ref ref="DEBUG_FILE"/>
+  </logger>
+
+  <root level="INFO">
+    <appender-ref ref="STDOUT"/>
+    <appender-ref ref="FILE"/>
+  </root>
+
+  <!-- Optional shipping of logs to a Loki-push-compatible aggregator (e.g. Grafana Loki,
+       VictoriaLogs). Dormant unless LOG_AGGREGATOR_ENDPOINT is set. Async with a bounded
+       queue; drops batches rather than ever blocking the service. Uses the standard Loki
+       push path; VictoriaLogs users should set LOG_AGGREGATOR_ENDPOINT to their base URL
+       plus "/insert" (e.g. http://<host>:9428/insert), since VictoriaLogs serves the Loki
+       push API under that prefix rather than at the bare path. -->
+  <if condition='!property("LOG_AGGREGATOR_ENDPOINT").isEmpty()'>
+    <then>
+      <appender name="AGGREGATOR" class="com.github.loki4j.logback.Loki4jAppender">
+        <http>
+          <url>${LOG_AGGREGATOR_ENDPOINT}/loki/api/v1/push</url>
+        </http>
+        <format>
+          <label>
+            <pattern>service=datahub-frontend,pod=${HOSTNAME:-unknown},level=%level</pattern>
+          </label>
+          <message>
+            <pattern>%date{ISO8601} [%thread] %-5level %logger{36} - %msg%n</pattern>
+          </message>
+        </format>
+        <batchMaxItems>1000</batchMaxItems>
+        <batchTimeoutMs>5000</batchTimeoutMs>
+        <drainOnStop>true</drainOnStop>
+        <filter class="ch.qos.logback.classic.filter.ThresholdFilter">
+          <level>INFO</level>
+        </filter>
+        <filter class="com.linkedin.metadata.utils.log.LogMessageFilter">
+          <excluded>Unable to renew the session. The session store may not support this feature</excluded>
+          <excluded>Preferred JWS algorithm: null not available. Using all metadata algorithms:</excluded>
+          <excluded>Config does not exist: file:///etc/datahub/plugins/frontend/auth/user.props</excluded>
+        </filter>
+      </appender>
+      <root level="INFO">
+        <appender-ref ref="AGGREGATOR"/>
+      </root>
+    </then>
+  </if>
+</configuration>

@@ -1,0 +1,112 @@
+query listPolicies($input: ListPoliciesInput!, $skipSiblingsSearch: Boolean = false, $skipLineage: Boolean = false) {
+    listPolicies(input: $input) {
+        start
+        count
+        total
+        policies {
+            urn
+            type
+            name
+            description
+            state
+            resources {
+                type
+                allResources
+                resources
+                filter {
+                    criteria {
+                        field
+                        values {
+                            value
+                            entity {
+                                ...searchResultFields
+                            }
+                        }
+                        condition
+                        structuredPropertyValues {
+                            propertyUrn
+                            values
+                        }
+                    }
+                }
+            }
+            privileges
+            actors {
+                users
+                groups
+                roles
+                allUsers
+                allGroups
+                resourceOwners
+                resourceOwnersTypes
+                resolvedOwnershipTypes {
+                    urn
+                    info {
+                        name
+                    }
+                }
+                resolvedUsers {
+                    username
+                    urn
+                    type
+                    properties {
+                        active
+                        displayName
+                        title
+                        firstName
+                        lastName
+                        fullName
+                        email
+                    }
+                    editableProperties {
+                        displayName
+                        pictureLink
+                        teams
+                        title
+                        skills
+                    }
+                }
+                resolvedGroups {
+                    name
+                    urn
+                    type
+                    properties {
+                        displayName
+                        description
+                        email
+                    }
+                    editableProperties {
+                        description
+                        slack
+                        email
+                    }
+                }
+                resolvedRoles {
+                    urn
+                    type
+                    name
+                    description
+                }
+            }
+            editable
+        }
+    }
+}
+
+query getGrantedPrivileges($input: GetGrantedPrivilegesInput!) {
+    getGrantedPrivileges(input: $input) {
+        privileges
+    }
+}
+
+mutation createPolicy($input: PolicyUpdateInput!) {
+    createPolicy(input: $input)
+}
+
+mutation updatePolicy($urn: String!, $input: PolicyUpdateInput!) {
+    updatePolicy(urn: $urn, input: $input)
+}
+
+mutation deletePolicy($urn: String!) {
+    deletePolicy(urn: $urn)
+}

@@ -1,0 +1,4899 @@
+import json
+import logging
+import re
+import tempfile
+import time
+from collections import OrderedDict, defaultdict
+from copy import deepcopy
+from dataclasses import dataclass, field as dataclass_field
+from datetime import datetime, timedelta, timezone
+from functools import cached_property, lru_cache
+from pathlib import Path
+from typing import (
+    Annotated,
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Type,
+    Union,
+    cast,
+)
+from urllib.parse import quote, urlparse
+
+import dateutil.parser as dp
+import tableauserverclient as TSC
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic.fields import Field
+from requests.adapters import HTTPAdapter
+from tableauserverclient import (
+    GroupItem,
+    PermissionsRule,
+    PersonalAccessTokenAuth,
+    Server,
+    ServerResponseError,
+    SiteItem,
+    TableauAuth,
+)
+from tableauserverclient.server.endpoint.exceptions import (
+    InternalServerError,
+    NonXMLResponseError,
+)
+from urllib3 import Retry
+
+import datahub.emitter.mce_builder as builder
+from datahub.configuration.common import (
+    AllowDenyPattern,
+    ConfigModel,
+    ConfigurationError,
+    Filters,
+    TransparentSecretStr,
+)
+from datahub.configuration.source_common import (
+    DatasetLineageProviderConfigBase,
+    DatasetSourceConfigMixin,
+)
+from datahub.configuration.validate_field_deprecation import pydantic_field_deprecated
+from datahub.configuration.validate_field_removal import pydantic_removed_field
+from datahub.emitter.mcp import MetadataChangeProposalWrapper
+from datahub.emitter.mcp_builder import (
+    ContainerKey,
+    add_entity_to_container,
+    gen_containers,
+)
+from datahub.ingestion.agent.verdicts import (
+    ClassifyContext,
+    Verdict,
+    VerdictContext,
+)
+from datahub.ingestion.api.common import PipelineContext
+from datahub.ingestion.api.decorators import (
+    SourceCapability,
+    SupportStatus,
+    capability,
+    config_class,
+    platform_name,
+    support_status,
+)
+from datahub.ingestion.api.source import (
+    CapabilityReport,
+    StructuredLogLevel,
+    TestableSource,
+    TestConnectionReport,
+)
+from datahub.ingestion.api.workunit import MetadataWorkUnit
+from datahub.ingestion.source.common.subtypes import (
+    BIContainerSubTypes,
+    DatasetSubTypes,
+    SourceCapabilityModifier,
+)
+from datahub.ingestion.source.state.stale_entity_removal_handler import (
+    StaleEntityRemovalSourceReport,
+    StatefulStaleMetadataRemovalConfig,
+)
+from datahub.ingestion.source.state.stateful_ingestion_base import (
+    StatefulIngestionConfigBase,
+    StatefulIngestionSourceBase,
+)
+from datahub.ingestion.source.tableau import tableau_constant as c
+from datahub.ingestion.source.tableau.tableau_common import (
+    FIELD_TYPE_MAPPING,
+    DatasourceType,
+    LineageResult,
+    MetadataQueryException,
+    OverriddenInfoFn,
+    TableauLineageOverrides,
+    TableauUpstreamReference,
+    clean_query,
+    clean_table_name,
+    custom_sql_graphql_query,
+    dashboard_graphql_query,
+    database_servers_graphql_query,
+    database_tables_graphql_query,
+    datasource_upstream_fields_graphql_query,
+    embedded_datasource_graphql_query,
+    get_filter_pages,
+    get_fully_qualified_table_name,
+    get_overridden_info,
+    get_platform,
+    get_unique_custom_sql,
+    make_filter,
+    make_fine_grained_lineage_class,
+    make_upstream_class,
+    optimize_query_filter,
+    published_datasource_graphql_query,
+    query_metadata_cursor_based_pagination,
+    sheet_graphql_query,
+    tableau_field_to_schema_field,
+    workbook_graphql_query,
+)
+from datahub.ingestion.source.tableau.tableau_initial_sql import (
+    InitialSqlConnection,
+    extract_definition_bytes,
+    extract_initial_sql_by_datasource,
+    extract_initial_sql_connections,
+    extract_tds_bytes,
+)
+from datahub.ingestion.source.tableau.tableau_selection import (
+    SiteFacts,
+    is_project_allowed,
+    is_readmitted,
+    probe_project_verdict,
+    probe_site_verdict,
+    project_segments,
+    site_verdict,
+)
+from datahub.ingestion.source.tableau.tableau_server_wrapper import UserInfo
+from datahub.ingestion.source.tableau.tableau_validation import check_user_role
+from datahub.ingestion.source.tableau.tableau_virtual_connections import (
+    VirtualConnectionProcessor,
+)
+from datahub.metadata.com.linkedin.pegasus2avro.common import (
+    AuditStamp,
+    ChangeAuditStamps,
+    InputField,
+    InputFields,
+)
+from datahub.metadata.com.linkedin.pegasus2avro.dataset import (
+    DatasetLineageType,
+    FineGrainedLineage,
+    FineGrainedLineageDownstreamType,
+    FineGrainedLineageUpstreamType,
+    Upstream,
+    UpstreamLineage,
+)
+from datahub.metadata.com.linkedin.pegasus2avro.metadata.snapshot import (
+    ChartSnapshot,
+    DashboardSnapshot,
+    DatasetSnapshot,
+)
+from datahub.metadata.com.linkedin.pegasus2avro.mxe import MetadataChangeEvent
+from datahub.metadata.com.linkedin.pegasus2avro.schema import (
+    NullTypeClass,
+    OtherSchema,
+    SchemaField,
+    SchemaFieldDataType,
+    SchemaMetadata,
+)
+from datahub.metadata.schema_classes import (
+    BrowsePathsClass,
+    ChartInfoClass,
+    ChartUsageStatisticsClass,
+    DashboardInfoClass,
+    DashboardUsageStatisticsClass,
+    DataPlatformInstanceClass,
+    DatasetPropertiesClass,
+    EmbedClass,
+    OwnerClass,
+    OwnershipClass,
+    OwnershipTypeClass,
+    SubTypesClass,
+    ViewPropertiesClass,
+)
+from datahub.sql_parsing.schema_resolver import (
+    SchemaInfo,
+    SchemaResolver,
+)
+from datahub.sql_parsing.split_statements import split_statements
+from datahub.sql_parsing.sql_parsing_common import get_dialect_str
+from datahub.sql_parsing.sql_parsing_result_utils import (
+    transform_parsing_result_to_in_tables_schemas,
+)
+from datahub.sql_parsing.sqlglot_lineage import (
+    ColumnLineageInfo,
+    SqlParsingResult,
+    create_and_cache_schema_resolver,
+    create_lineage_sql_parsed_result,
+)
+from datahub.utilities import config_clean
+from datahub.utilities.lossy_collections import LossyList
+from datahub.utilities.perf_timer import PerfTimer
+from datahub.utilities.stats_collections import TopKDict
+from datahub.utilities.urns.dataset_urn import DatasetUrn
+
+DEFAULT_PAGE_SIZE = 10
+
+try:
+    # On earlier versions of the tableauserverclient, the NonXMLResponseError
+    # was thrown when reauthentication was necessary. We'll keep both exceptions
+    # around for now, but can remove this in the future.
+    from tableauserverclient.server.endpoint.exceptions import (  # type: ignore
+        NotSignedInError,
+    )
+
+    REAUTHENTICATE_ERRORS: Tuple[Type[Exception], ...] = (
+        NotSignedInError,
+        NonXMLResponseError,
+    )
+except ImportError:
+    REAUTHENTICATE_ERRORS = (NonXMLResponseError,)
+
+RETRIABLE_ERROR_CODES = [
+    408,  # Request Timeout
+    429,  # Too Many Requests
+    500,  # Internal Server Error
+    502,  # Bad Gateway
+    503,  # Service Unavailable
+    504,  # Gateway Timeout
+]
+
+
+class UpstreamTablesResult(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    upstream_tables: List[Upstream]
+    table_id_to_urn: Dict[str, str]
+
+
+# From experience, this expiry time typically ranges from 50 minutes
+# to 2 hours but might as well be configurable. We will allow upto
+# 10 minutes of such expiry time
+REGULAR_AUTH_EXPIRY_PERIOD = timedelta(minutes=10)
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+# Replace / with |
+REPLACE_SLASH_CHAR = "|"
+
+
+class TableauConnectionConfig(ConfigModel):
+    connect_uri: str = Field(description="Tableau host URL.")
+    username: Optional[str] = Field(
+        default=None,
+        description="Tableau username, must be set if authenticating using username/password.",
+    )
+    password: Optional[TransparentSecretStr] = Field(
+        default=None,
+        description="Tableau password, must be set if authenticating using username/password.",
+    )
+    token_name: Optional[str] = Field(
+        default=None,
+        description="Tableau token name, must be set if authenticating using a personal access token.",
+    )
+    token_value: Optional[TransparentSecretStr] = Field(
+        default=None,
+        description="Tableau token value, must be set if authenticating using a personal access token.",
+    )
+
+    site: str = Field(
+        default="",
+        description="Tableau Site. Always required for Tableau Online. Use emptystring to connect with Default site on Tableau Server.",
+    )
+    platform_instance: Optional[str] = Field(
+        default=None,
+        description="Unique relationship between the Tableau Server and site",
+    )
+
+    max_retries: int = Field(3, description="Number of retries for failed requests.")
+    ssl_verify: Union[bool, str] = Field(
+        default=True,
+        description="Whether to verify SSL certificates. If using self-signed certificates, set to false or provide the path to the .pem certificate bundle.",
+    )
+
+    session_trust_env: bool = Field(
+        False,
+        description="Configures the trust_env property in the requests session. If set to false (default value) it will bypass proxy settings. See https://requests.readthedocs.io/en/latest/api/#requests.Session.trust_env for more information.",
+    )
+
+    extract_column_level_lineage: bool = Field(
+        True,
+        description="When enabled, extracts column-level lineage from Tableau Datasources",
+    )
+
+    @field_validator("connect_uri", mode="after")
+    @classmethod
+    def remove_trailing_slash(cls, v: str) -> str:
+        return config_clean.remove_trailing_slashes(v)
+
+    def get_tableau_auth(
+        self, site: str
+    ) -> Union[TableauAuth, PersonalAccessTokenAuth]:
+        # https://tableau.github.io/server-client-python/docs/api-ref#authentication
+        authentication: Union[TableauAuth, PersonalAccessTokenAuth]
+        if self.username and self.password:
+            authentication = TableauAuth(
+                username=self.username,
+                password=self.password.get_secret_value(),
+                site_id=site,
+            )
+        elif self.token_name and self.token_value:
+            authentication = PersonalAccessTokenAuth(
+                self.token_name, self.token_value.get_secret_value(), site
+            )
+        else:
+            raise ConfigurationError(
+                "Tableau Source: Either username/password or token_name/token_value must be set"
+            )
+        return authentication
+
+    def make_tableau_client(self, site: str) -> Server:
+        authentication: Union[TableauAuth, PersonalAccessTokenAuth] = (
+            self.get_tableau_auth(site)
+        )
+        try:
+            server = Server(
+                self.connect_uri,
+                use_server_version=True,
+                http_options={
+                    "verify": self.ssl_verify,
+                },
+            )
+
+            server._session.trust_env = self.session_trust_env
+
+            # Setup request retries.
+            adapter = HTTPAdapter(
+                max_retries=Retry(
+                    total=self.max_retries,
+                    backoff_factor=1,
+                    status_forcelist=RETRIABLE_ERROR_CODES,
+                )
+            )
+            server._session.mount("http://", adapter)
+            server._session.mount("https://", adapter)
+
+            server.auth.sign_in(authentication)
+            return server
+        except ServerResponseError as e:
+            message = f"Unable to login (invalid/expired credentials or missing permissions): {str(e)}"
+            if isinstance(authentication, PersonalAccessTokenAuth):
+                # Docs on token expiry in Tableau:
+                # https://help.tableau.com/current/server/en-us/security_personal_access_tokens.htm#token-expiry
+                message = f"Error authenticating with Tableau. Note that Tableau personal access tokens expire if not used for 15 days or if over 1 year old: {str(e)}"
+            raise ValueError(message) from e
+        except Exception as e:
+            raise ValueError(
+                f"Unable to login (check your Tableau connection and credentials): {str(e)}"
+            ) from e
+
+
+class PermissionIngestionConfig(ConfigModel):
+    enable_workbooks: bool = Field(
+        default=True,
+        description="Whether or not to enable group permission ingestion for workbooks. "
+        "Default: True",
+    )
+
+    group_name_pattern: AllowDenyPattern = Field(
+        default=AllowDenyPattern.allow_all(),
+        description="Filter for Tableau group names when ingesting group permissions. "
+        "For example, you could filter for groups that include the term 'Consumer' in their name by adding '^.*Consumer$' to the allow list."
+        "By default, all groups will be ingested. "
+        "You can both allow and deny groups based on their name using their name, or a Regex pattern. "
+        "Deny patterns always take precedence over allow patterns. ",
+    )
+
+
+class TableauPageSizeConfig(ConfigModel):
+    """
+    Configuration for setting page sizes for different Tableau metadata objects.
+
+    Some considerations:
+    - All have default values, so no setting is mandatory.
+    - In general, with the `effective_` methods, if not specifically set fine-grained metrics fallback to `page_size`
+    or correlate with `page_size`.
+
+    Measuring the impact of changing these values can be done by looking at the
+    `num_(filter_|paginated_)?queries_by_connection_type` metrics in the report.
+    """
+
+    page_size: int = Field(
+        default=DEFAULT_PAGE_SIZE,
+        description="[advanced] Number of metadata objects (e.g. CustomSQLTable, PublishedDatasource, etc) to query at a time using the Tableau API.",
+    )
+
+    database_server_page_size: Optional[int] = Field(
+        default=None,
+        description="[advanced] Number of database servers to query at a time using the Tableau API; fallbacks to `page_size` if not set.",
+    )
+
+    @property
+    def effective_database_server_page_size(self) -> int:
+        return self.database_server_page_size or self.page_size
+
+    # We've found that even with a small workbook page size (e.g. 10), the Tableau API often
+    # returns warnings like this:
+    # {
+    # 	'message': 'Showing partial results. The request exceeded the 20000 node limit. Use pagination, additional filtering, or both in the query to adjust results.',
+    # 	'extensions': {
+    # 		'severity': 'WARNING',
+    # 		'code': 'NODE_LIMIT_EXCEEDED',
+    # 		'properties': {
+    # 			'nodeLimit': 20000
+    # 		}
+    # 	}
+    # }
+    # Reducing the page size for the workbook queries helps to avoid this.
+    workbook_page_size: Optional[int] = Field(
+        default=1,
+        description="[advanced] Number of workbooks to query at a time using the Tableau API; defaults to `1` and fallbacks to `page_size` if not set.",
+    )
+
+    @property
+    def effective_workbook_page_size(self) -> int:
+        return self.workbook_page_size or self.page_size
+
+    sheet_page_size: Optional[int] = Field(
+        default=None,
+        description="[advanced] Number of sheets to query at a time using the Tableau API; fallbacks to `page_size` if not set.",
+    )
+
+    @property
+    def effective_sheet_page_size(self) -> int:
+        return self.sheet_page_size or self.page_size
+
+    dashboard_page_size: Optional[int] = Field(
+        default=None,
+        description="[advanced] Number of dashboards to query at a time using the Tableau API; fallbacks to `page_size` if not set.",
+    )
+
+    @property
+    def effective_dashboard_page_size(self) -> int:
+        return self.dashboard_page_size or self.page_size
+
+    embedded_datasource_page_size: Optional[int] = Field(
+        default=None,
+        description="[advanced] Number of embedded datasources to query at a time using the Tableau API; fallbacks to `page_size` if not set.",
+    )
+
+    @property
+    def effective_embedded_datasource_page_size(self) -> int:
+        return self.embedded_datasource_page_size or self.page_size
+
+    # Since the field upstream query was separated from the embedded datasource queries into an independent query,
+    # the number of queries increased significantly and so the execution time.
+    # To increase the batching and so reduce the number of queries, we can increase the page size for that
+    # particular case.
+    #
+    # That's why unless specifically set, we will effectively use 10 times the page size as the default page size.
+    embedded_datasource_field_upstream_page_size: Optional[int] = Field(
+        default=None,
+        description="[advanced] Number of upstream fields to query at a time for embedded datasources using the Tableau API; fallbacks to `page_size` * 10 if not set.",
+    )
+
+    @property
+    def effective_embedded_datasource_field_upstream_page_size(self) -> int:
+        return self.embedded_datasource_field_upstream_page_size or self.page_size * 10
+
+    published_datasource_page_size: Optional[int] = Field(
+        default=None,
+        description="[advanced] Number of published datasources to query at a time using the Tableau API; fallbacks to `page_size` if not set.",
+    )
+
+    @property
+    def effective_published_datasource_page_size(self) -> int:
+        return self.published_datasource_page_size or self.page_size
+
+    published_datasource_field_upstream_page_size: Optional[int] = Field(
+        default=None,
+        description="[advanced] Number of upstream fields to query at a time for published datasources using the Tableau API; fallbacks to `page_size` * 10 if not set.",
+    )
+
+    @property
+    def effective_published_datasource_field_upstream_page_size(self) -> int:
+        return self.published_datasource_field_upstream_page_size or self.page_size * 10
+
+    virtual_connection_page_size: Optional[int] = Field(
+        default=None,
+        description="[advanced] Number of virtual connections to query at a time using the Tableau API; fallbacks to `page_size` if not set.",
+    )
+
+    @property
+    def effective_virtual_connection_page_size(self) -> int:
+        return self.virtual_connection_page_size or self.page_size
+
+    custom_sql_table_page_size: Optional[int] = Field(
+        default=None,
+        description="[advanced] Number of custom sql datasources to query at a time using the Tableau API; fallbacks to `page_size` if not set.",
+    )
+
+    @property
+    def effective_custom_sql_table_page_size(self) -> int:
+        return self.custom_sql_table_page_size or self.page_size
+
+    database_table_page_size: Optional[int] = Field(
+        default=None,
+        description="[advanced] Number of database tables to query at a time using the Tableau API; fallbacks to `page_size` if not set.",
+    )
+
+    @property
+    def effective_database_table_page_size(self) -> int:
+        return self.database_table_page_size or self.page_size
+
+
+_IngestHiddenAssetsOptionsType = Literal["worksheet", "dashboard"]
+_IngestHiddenAssetsOptions: List[_IngestHiddenAssetsOptionsType] = [
+    "worksheet",
+    "dashboard",
+]
+
+
+class TableauConfig(
+    DatasetLineageProviderConfigBase,
+    StatefulIngestionConfigBase,
+    DatasetSourceConfigMixin,
+    TableauConnectionConfig,
+    TableauPageSizeConfig,
+):
+    projects: Optional[List[str]] = Field(
+        default=["default"],
+        description="[deprecated] Use project_pattern instead. List of tableau "
+        "projects ",
+    )
+    _deprecate_projects = pydantic_field_deprecated("projects")
+    # Tableau project pattern
+    project_pattern: AllowDenyPattern = Field(
+        default=AllowDenyPattern.allow_all(),
+        description="[deprecated] Use project_path_pattern instead. Filter for specific Tableau projects. For example, use 'My Project' to ingest a root-level Project with name 'My Project', or 'My Project/Nested Project' to ingest a nested Project with name 'Nested Project'. "
+        "By default, all Projects nested inside a matching Project will be included in ingestion. "
+        "You can both allow and deny projects based on their name using their name, or a Regex pattern. "
+        "Deny patterns always take precedence over allow patterns. "
+        "By default, all projects will be ingested.",
+    )
+    _deprecate_projects_pattern = pydantic_field_deprecated("project_pattern")
+
+    project_path_pattern: Annotated[
+        AllowDenyPattern, Filters(BIContainerSubTypes.TABLEAU_PROJECT)
+    ] = Field(
+        default=AllowDenyPattern.allow_all(),
+        description="Filters Tableau projects by their full path. For instance, 'My Project/Nested Project' targets a specific nested project named 'Nested Project'."
+        " This is also useful when you need to exclude all nested projects under a particular project."
+        " You can allow or deny projects by specifying their path or a regular expression pattern."
+        " Deny patterns always override allow patterns."
+        " By default, all projects are ingested.",
+    )
+
+    project_path_separator: str = Field(
+        default="/",
+        description="The separator used for the project_path_pattern field between project names. By default, we use a slash. "
+        "You can change this if your Tableau projects contain slashes in their names, and you'd like to filter by project.",
+    )
+
+    default_schema_map: Dict[str, str] = Field(
+        default={}, description="Default schema to use when schema is not found."
+    )
+    ingest_tags: Optional[bool] = Field(
+        default=False,
+        description="Ingest Tags from source. This will override Tags entered from UI",
+    )
+    ingest_owner: Optional[bool] = Field(
+        default=False,
+        description="Ingest Owner from source. This will override Owner info entered from UI",
+    )
+    use_email_as_username: bool = Field(
+        default=False,
+        description="Use email address instead of username for entity owners. Requires ingest_owner to be True.",
+    )
+    ingest_tables_external: bool = Field(
+        default=False,
+        description="Ingest details for tables external to (not embedded in) tableau as entities.",
+    )
+    ingest_virtual_connections: bool = Field(
+        default=True,
+        description="Ingest details for virtual connections as entities.",
+    )
+    emit_all_published_datasources: bool = Field(
+        default=False,
+        description="Ingest all published data sources. When False (default), only ingest published data sources that belong to an ingested workbook.",
+    )
+    emit_all_embedded_datasources: bool = Field(
+        default=False,
+        description="Ingest all embedded data sources. When False (default), only ingest embedded data sources that belong to an ingested workbook.",
+    )
+
+    env: str = Field(
+        default=builder.DEFAULT_ENV,
+        description="Environment to use in namespace when constructing URNs.",
+    )
+
+    lineage_overrides: Optional[TableauLineageOverrides] = Field(
+        default=None,
+        description="Mappings to change generated dataset urns. Use only if you really know what you are doing.",
+    )
+
+    database_hostname_to_platform_instance_map: Optional[Dict[str, str]] = Field(
+        default=None,
+        description="Mappings to change platform instance in generated dataset urns based on database. Use only if you really know what you are doing.",
+    )
+
+    database_id_to_platform_instance_map: Optional[Dict[str, str]] = Field(
+        default=None,
+        description=(
+            "Mappings from Tableau database id to DataHub platform_instance. "
+            "Use when distinct connections share a hostname so "
+            "`database_hostname_to_platform_instance_map` cannot tell them "
+            "apart (e.g. AWS Athena workgroups behind a regional endpoint, "
+            "or multiple Snowflake accounts behind a single proxy). Takes "
+            "precedence over hostname-based routing when both match."
+        ),
+    )
+
+    extract_usage_stats: bool = Field(
+        default=False,
+        description="[experimental] Extract usage statistics for dashboards and charts.",
+    )
+
+    stateful_ingestion: Optional[StatefulStaleMetadataRemovalConfig] = Field(
+        default=None, description=""
+    )
+
+    ingest_embed_url: Optional[bool] = Field(
+        default=False,
+        description="Ingest a URL to render an embedded Preview of assets within Tableau.",
+    )
+
+    ingest_external_links_for_dashboards: Optional[bool] = Field(
+        default=True,
+        description="Ingest a URL to link out to from dashboards.",
+    )
+
+    ingest_external_links_for_charts: Optional[bool] = Field(
+        default=True,
+        description="Ingest a URL to link out to from charts.",
+    )
+
+    extract_project_hierarchy: bool = Field(
+        default=True,
+        description="Whether to extract entire project hierarchy for nested projects.",
+    )
+
+    extract_lineage_from_unsupported_custom_sql_queries: bool = Field(
+        default=True,
+        description="[Experimental] Extract lineage from Custom SQL queries using DataHub's SQL parser in cases where the Tableau Catalog API fails to return lineage for the query.",
+    )
+
+    force_extraction_of_lineage_from_custom_sql_queries: bool = Field(
+        default=False,
+        description="[Experimental] Force extraction of lineage from Custom SQL queries using DataHub's SQL parser, even when the Tableau Catalog API returns lineage already.",
+    )
+
+    ingest_initial_sql: bool = Field(
+        default=False,
+        description="[Experimental] When enabled, downloads published data sources and the "
+        "workbooks that contain embedded data sources to extract their Initial SQL and emit "
+        "lineage and/or a custom property from it. Disabled by default because the extra "
+        "downloads can be slow on large sites.",
+    )
+
+    initial_sql_as_lineage: bool = Field(
+        default=True,
+        description="When ingest_initial_sql is enabled, parse the Initial SQL with DataHub's "
+        "SQL parser and emit the referenced tables as upstream lineage of the data source.",
+    )
+
+    initial_sql_as_custom_property: bool = Field(
+        default=True,
+        description="When ingest_initial_sql is enabled, store the raw Initial SQL text as the "
+        "`initialSql` custom property on the data source dataset.",
+    )
+
+    sql_parsing_disable_schema_awareness: bool = Field(
+        default=False,
+        description="[Experimental] Ignore pre ingested tables schemas during parsing of SQL queries "
+        "(allows to workaround ingestion errors when pre ingested schema and queries are out of sync)",
+    )
+
+    ingest_multiple_sites: bool = Field(
+        False,
+        description="When enabled, ingests multiple sites the user has access to. If the user doesn't have access to the default site, specify an initial site to query in the site property. By default all sites the user has access to will be ingested. You can filter sites with the site_name_pattern property. This flag is currently only supported for Tableau Server. Tableau Cloud is not supported.",
+    )
+
+    site_name_pattern: Annotated[
+        AllowDenyPattern, Filters(BIContainerSubTypes.TABLEAU_SITE)
+    ] = Field(
+        default=AllowDenyPattern.allow_all(),
+        description="Filter for specific Tableau sites. "
+        "By default, all sites will be included in the ingestion. "
+        "You can both allow and deny sites based on their name using their name, or a Regex pattern. "
+        "Deny patterns always take precedence over allow patterns. "
+        "This property is currently only supported for Tableau Server. Tableau Cloud is not supported. ",
+    )
+
+    add_site_container: bool = Field(
+        False,
+        description="When enabled, sites are added as containers and therefore visible in the folder structure within Datahub.",
+    )
+
+    permission_ingestion: Optional[PermissionIngestionConfig] = Field(
+        default=None,
+        description="Configuration settings for ingesting Tableau groups and their capabilities as custom properties.",
+    )
+
+    ingest_hidden_assets: Union[List[_IngestHiddenAssetsOptionsType], bool] = Field(
+        _IngestHiddenAssetsOptions,
+        description=(
+            "When enabled, hidden worksheets and dashboards are ingested into Datahub."
+            " If a dashboard or worksheet is hidden in Tableau the luid is blank."
+            " A list of asset types can also be specified, to only ingest those hidden assets."
+            " Current options supported are 'worksheet' and 'dashboard'."
+        ),
+    )
+
+    tags_for_hidden_assets: List[str] = Field(
+        default=[],
+        description="Tags to be added to hidden dashboards and views. If a dashboard or view is hidden in Tableau the luid is blank. "
+        "This can only be used with ingest_tags enabled as it will overwrite tags entered from the UI.",
+    )
+
+    _fetch_size = pydantic_removed_field(
+        "fetch_size",
+        month="December",
+        year=2024,
+    )
+
+    @classmethod
+    def probe_provider_class(cls) -> type:
+        # Late import: tableau_probe imports this module, so a top-level import
+        # would be circular.
+        from datahub.ingestion.source.tableau.tableau_probe import (
+            TableauMetadataProbe,
+        )
+
+        return TableauMetadataProbe
+
+    @classmethod
+    def probe_unfiltered_kinds(cls) -> Set[str]:
+        """Workbooks have no name filter: emit_workbooks takes every workbook
+        whose project is selected, so the Project verdict decides."""
+        return {str(BIContainerSubTypes.TABLEAU_WORKBOOK)}
+
+    def probe_ancestor_kinds(self, kind: str) -> Optional[Sequence[str]]:
+        """Projects list no ancestor on purpose: _init_tableau_project_registry
+        includes an allowed project under an excluded parent, so exclusion must
+        not propagate between projects. A workbook is dropped with its project."""
+        project = str(BIContainerSubTypes.TABLEAU_PROJECT)
+        ancestors: Dict[str, Tuple[str, ...]] = {
+            str(BIContainerSubTypes.TABLEAU_SITE): (),
+            project: (),
+            str(BIContainerSubTypes.TABLEAU_WORKBOOK): (project,),
+        }
+        return ancestors.get(kind)
+
+    def probe_match_target(self, ctx: ClassifyContext) -> Optional[str]:
+        """A project's path, which project_path_pattern is matched on
+        (_get_project_path); sites and workbooks keep their bare name. A
+        separator inside a name is warned about in probe_project_verdict, and
+        only where the two readings of it disagree."""
+        if ctx.kind != BIContainerSubTypes.TABLEAU_PROJECT:
+            return None
+        return self.project_path_separator.join(
+            project_segments(self, ctx.name, ctx.parent_path)
+        )
+
+    def probe_verdict_override(self, ctx: VerdictContext) -> Optional[Verdict]:
+        """Project: both project patterns plus extract_project_hierarchy
+        re-admission (tableau_selection.project_selection, over the same
+        is_project_allowed and is_readmitted ingestion's registry calls).
+        Site: site_verdict, which ingestion also calls, applies only with
+        ingest_multiple_sites (get_workunits_internal)."""
+        if ctx.kind == BIContainerSubTypes.TABLEAU_PROJECT:
+            return probe_project_verdict(self, ctx.name, ctx.parent_path, ctx.warn)
+        if ctx.kind == BIContainerSubTypes.TABLEAU_SITE:
+            return probe_site_verdict(self, ctx)
+        if (
+            ctx.kind == BIContainerSubTypes.TABLEAU_WORKBOOK
+            and not ctx.parent_path
+            and ctx.structural is None
+        ):
+            # No pattern names a workbook, so without its project the include
+            # the framework returns decides nothing.
+            ctx.warn(
+                "no --parent project given, so this workbook was judged without "
+                "its project: ingestion keeps a workbook exactly when its "
+                "project is kept. Pass --parent <project path>, or judge a "
+                "`probe run workbooks` listing with --from-run"
+            )
+        return None
+
+    # mode = "before" because we want to take some decision before pydantic initialize the configuration to default values
+    @model_validator(mode="before")
+    @classmethod
+    def projects_backward_compatibility(cls, values: Dict) -> Dict:
+        # In-place update of the input dict would cause state contamination. This was discovered through test failures
+        # in test_hex.py where the same dict is reused.
+        # So a copy is performed first.
+        values = deepcopy(values)
+
+        projects = values.get("projects")
+        project_pattern = values.get("project_pattern")
+        project_path_pattern = values.get("project_path_pattern")
+        if project_pattern is None and project_path_pattern is None and projects:
+            logger.warning(
+                "projects is deprecated, please use project_path_pattern instead."
+            )
+            logger.info("Initializing project_pattern from projects")
+            values["project_pattern"] = AllowDenyPattern(
+                allow=[f"^{prj}$" for prj in projects]
+            )
+            values.pop("projects")
+        elif (project_pattern or project_path_pattern) and projects:
+            raise ValueError(
+                "projects is deprecated. Please use project_path_pattern only."
+            )
+        elif project_path_pattern and project_pattern:
+            raise ValueError(
+                "project_pattern is deprecated. Please use project_path_pattern only."
+            )
+
+        return values
+
+    @model_validator(mode="after")
+    def validate_config_values(self) -> "TableauConfig":
+        if (
+            not self.ingest_tags
+            and self.tags_for_hidden_assets
+            and len(self.tags_for_hidden_assets) > 0
+        ):
+            raise ValueError(
+                "tags_for_hidden_assets is only allowed with ingest_tags enabled. Be aware that this will overwrite tags entered from the UI."
+            )
+
+        if self.use_email_as_username and not self.ingest_owner:
+            raise ValueError(
+                "use_email_as_username requires ingest_owner to be enabled."
+            )
+
+        if self.ingest_initial_sql and not (
+            self.initial_sql_as_lineage or self.initial_sql_as_custom_property
+        ):
+            raise ValueError(
+                "ingest_initial_sql is enabled but both initial_sql_as_lineage and "
+                "initial_sql_as_custom_property are disabled. Enable at least one, or "
+                "disable ingest_initial_sql to avoid downloading every datasource for nothing."
+            )
+
+        return self
+
+
+class WorkbookKey(ContainerKey):
+    workbook_id: str
+
+
+class ProjectKey(ContainerKey):
+    project_id: str
+
+
+class SiteKey(ContainerKey):
+    site_id: str
+
+
+@dataclass
+class UsageStat:
+    view_count: int
+
+
+@dataclass(frozen=True)
+class InitialSqlLineage:
+    """Result of extracting a datasource's Initial SQL."""
+
+    upstreams: List[Upstream]
+    raw_sql: Optional[str]
+
+    @classmethod
+    def empty(cls) -> "InitialSqlLineage":
+        """The 'no Initial SQL' result (no upstreams, no raw SQL)."""
+        return cls(upstreams=[], raw_sql=None)
+
+
+@dataclass(frozen=True)
+class CustomSqlParseResult:
+    """A parsed custom SQL result plus the (possibly overridden) platform instance used
+    to build its upstream URNs -- needed to normalize those URNs instance-aware."""
+
+    result: "SqlParsingResult"
+    platform_instance: Optional[str]
+
+
+@dataclass
+class TableauProject:
+    id: str
+    name: str
+    description: Optional[str]
+    parent_id: Optional[str]
+    parent_name: Optional[str]  # Name of a parent project
+    path: List[str]
+    owner_username: Optional[str] = None
+    owner_email: Optional[str] = None
+
+
+@dataclass
+class DatabaseTable:
+    """
+    Corresponds to unique database table identified by DataHub.
+
+    It is possible for logically table to be represented by different instances of [databaseTable]
+    (https://help.tableau.com/current/api/metadata_api/en-us/reference/databasetable.doc.html)
+    if Tableau can not identify them as same table (e.g. in Custom SQLs). Assuming that, all such
+    instances will generate same URN in DataHub, this class captures group all databaseTable instances,
+    that the URN represents - all browse paths and id of most informative (with columns) instance.
+
+    """
+
+    urn: str
+    id: Optional[str] = (
+        None  # is not None only for tables that came from Tableau metadata
+    )
+    num_cols: Optional[int] = None
+
+    paths: Optional[Set[str]] = (
+        None  # maintains all browse paths encountered for this table
+    )
+
+    parsed_columns: Optional[Set[str]] = (
+        None  # maintains all columns encountered for this table during parsing SQL queries
+    )
+
+    def update_table(
+        self,
+        id: Optional[str] = None,
+        num_tbl_cols: Optional[int] = None,
+        path: Optional[str] = None,
+        parsed_columns: Optional[Set[str]] = None,
+    ) -> None:
+        if path:
+            if self.paths:
+                self.paths.add(path)
+            else:
+                self.paths = {path}
+
+        # the new instance of table has columns information, prefer its id.
+        if not self.num_cols and num_tbl_cols:
+            self.id = id
+            self.num_cols = num_tbl_cols
+
+        if parsed_columns:
+            if self.parsed_columns:
+                self.parsed_columns.update(parsed_columns)
+            else:
+                self.parsed_columns = parsed_columns
+
+
+@dataclass
+class SiteIdContentUrl:
+    site_id: str
+    site_content_url: str
+
+
+@dataclass
+class TableauSourceReport(
+    StaleEntityRemovalSourceReport,
+):
+    get_all_datasources_query_failed: bool = False
+    num_get_datasource_query_failures: int = 0
+    num_workbook_project_lookups: int = 0
+    num_get_workbook_query_failures: int = 0
+    num_datasource_field_skipped_no_name: int = 0
+    num_csql_field_skipped_no_name: int = 0
+    num_table_field_skipped_no_name: int = 0
+    # timers
+    extract_usage_stats_timer: Dict[str, float] = dataclass_field(
+        default_factory=TopKDict
+    )
+    fetch_groups_timer: Dict[str, float] = dataclass_field(default_factory=TopKDict)
+    populate_database_server_hostname_map_timer: Dict[str, float] = dataclass_field(
+        default_factory=TopKDict
+    )
+    populate_projects_registry_timer: Dict[str, float] = dataclass_field(
+        default_factory=TopKDict
+    )
+    emit_workbooks_timer: Dict[str, float] = dataclass_field(default_factory=TopKDict)
+    emit_sheets_timer: Dict[str, float] = dataclass_field(default_factory=TopKDict)
+    emit_dashboards_timer: Dict[str, float] = dataclass_field(default_factory=TopKDict)
+    emit_embedded_datasources_timer: Dict[str, float] = dataclass_field(
+        default_factory=TopKDict
+    )
+    emit_published_datasources_timer: Dict[str, float] = dataclass_field(
+        default_factory=TopKDict
+    )
+    emit_custom_sql_datasources_timer: Dict[str, float] = dataclass_field(
+        default_factory=TopKDict
+    )
+    emit_upstream_tables_timer: Dict[str, float] = dataclass_field(
+        default_factory=TopKDict
+    )
+    virtual_connection_processing_timer: Dict[str, float] = dataclass_field(
+        default_factory=TopKDict
+    )
+    emit_virtual_connections_timer: Dict[str, float] = dataclass_field(
+        default_factory=TopKDict
+    )
+    # lineage
+    num_tables_with_upstream_lineage: int = 0
+    num_upstream_table_lineage: int = 0
+    num_upstream_fine_grained_lineage: int = 0
+    num_upstream_table_skipped_no_name: int = 0
+    num_upstream_table_processed_without_columns: int = 0
+    num_upstream_table_failed_generate_reference: int = 0
+    num_upstream_table_lineage_failed_parse_sql: int = 0
+    num_upstream_fine_grained_lineage_failed_parse_sql: int = 0
+    # initial sql
+    num_initial_sql_datasources_processed: int = 0
+    num_initial_sql_connections_found: int = 0
+    num_initial_sql_lineage_upstreams: int = 0
+    num_initial_sql_parse_failures: int = 0
+    num_initial_sql_download_failures: int = 0
+    # Download succeeded but the archive carried no .tds/.twb definition to parse.
+    num_initial_sql_definitions_missing: int = 0
+    num_initial_sql_embedded_datasources_unmatched: int = 0
+    num_hidden_assets_skipped: int = 0
+    logged_in_user: LossyList[UserInfo] = dataclass_field(default_factory=LossyList)
+
+    last_authenticated_at: Optional[datetime] = None
+
+    num_expected_tableau_metadata_queries: int = 0
+    num_actual_tableau_metadata_queries: int = 0
+    num_virtual_connections_processed: int = 0
+    num_virtual_connections_table_references_found: int = 0
+    num_virtual_connections_lineages_created: int = 0
+    num_virtual_connections_lineage_parsing_errors: int = 0
+    num_virtual_connections_upstream_columns_malformed: int = 0
+    num_virtual_connections_tables_malformed: int = 0
+    num_virtual_connections_fields_skipped_invalid: int = 0
+    tableau_server_error_stats: Dict[str, int] = dataclass_field(
+        default_factory=(lambda: defaultdict(int))
+    )
+
+    # Counters for tracking the number of queries made to get_connection_objects method
+    # by connection type (static and short set of keys):
+    # - num_queries_by_connection_type: total number of queries
+    # - num_filter_queries_by_connection_type: number of paginated queries due to splitting query filters
+    # - num_paginated_queries_by_connection_type: total number of queries due to Tableau pagination
+    # These counters are useful to understand the impact of changing the page size.
+
+    num_queries_by_connection_type: Dict[str, int] = dataclass_field(
+        default_factory=(lambda: defaultdict(int))
+    )
+    num_filter_queries_by_connection_type: Dict[str, int] = dataclass_field(
+        default_factory=(lambda: defaultdict(int))
+    )
+    num_paginated_queries_by_connection_type: Dict[str, int] = dataclass_field(
+        default_factory=(lambda: defaultdict(int))
+    )
+
+    # Owner extraction statistics
+    num_email_fallback_to_username: int = 0
+
+
+def parse_database_server_hostname(server_connection: Optional[str]) -> Optional[str]:
+    """A connection string that is a URL is reduced to its host; anything else
+    is returned as is. The key database_hostname_to_platform_instance_map uses."""
+    if server_connection is None:
+        return None
+    return urlparse(server_connection).hostname or server_connection
+
+
+def report_user_role(report: TableauSourceReport, server: Server) -> None:
+    title: str = "Insufficient Permissions"
+    message: str = "The user must have the `Site Administrator Explorer` role to perform metadata ingestion."
+    try:
+        # TableauSiteSource instance is per site, so each time we need to find-out user detail
+        # the site-role might be different on another site
+        logged_in_user: UserInfo = UserInfo.from_server(server=server)
+
+        if not logged_in_user.has_site_administrator_explorer_privileges():
+            report.warning(
+                title=title,
+                message=message,
+                context=f"user-name={logged_in_user.user_name}, role={logged_in_user.site_role}, site_id={logged_in_user.site_id}",
+            )
+
+        report.logged_in_user.append(logged_in_user)
+
+    except Exception as e:
+        report.warning(
+            title=title,
+            message="Failed to verify the user's role. The user must have `Site Administrator Explorer` role.",
+            context=f"{e}",
+            exc=e,
+        )
+
+
+@platform_name("Tableau")
+@config_class(TableauConfig)
+@support_status(SupportStatus.GA)
+@capability(
+    SourceCapability.CONTAINERS,
+    "Enabled by default",
+    subtype_modifier=[
+        SourceCapabilityModifier.TABLEAU_PROJECT,
+        SourceCapabilityModifier.TABLEAU_SITE,
+        SourceCapabilityModifier.TABLEAU_WORKBOOK,
+    ],
+)
+@capability(SourceCapability.PLATFORM_INSTANCE, "Enabled by default")
+@capability(SourceCapability.DOMAINS, "Requires transformer", supported=False)
+@capability(SourceCapability.DESCRIPTIONS, "Enabled by default")
+@capability(
+    SourceCapability.USAGE_STATS,
+    "Dashboard/Chart view counts, enabled using extract_usage_stats config",
+    subtype_modifier=[
+        SourceCapabilityModifier.DASHBOARD,
+        SourceCapabilityModifier.CHART,
+    ],
+)
+@capability(
+    SourceCapability.DELETION_DETECTION,
+    "Enabled by default via stateful ingestion.",
+)
+@capability(SourceCapability.OWNERSHIP, "Requires recipe configuration")
+@capability(SourceCapability.TAGS, "Requires recipe configuration")
+@capability(SourceCapability.LINEAGE_COARSE, "Enabled by default")
+@capability(
+    SourceCapability.LINEAGE_FINE,
+    "Enabled by default, configure using `extract_column_level_lineage`",
+)
+@capability(SourceCapability.TEST_CONNECTION, "Enabled by default")
+@capability(
+    SourceCapability.PROBE,
+    "Check what a recipe would ingest before running it, with `datahub recipe probe`",
+)
+class TableauSource(StatefulIngestionSourceBase, TestableSource):
+    platform = "tableau"
+
+    def __hash__(self):
+        return id(self)
+
+    def __init__(
+        self,
+        config: TableauConfig,
+        ctx: PipelineContext,
+    ):
+        super().__init__(config, ctx)
+        self.config: TableauConfig = config
+        self.report: TableauSourceReport = TableauSourceReport()
+        self.server: Optional[Server] = None
+        self._authenticate(self.config.site)
+
+    def _authenticate(self, site_content_url: str) -> None:
+        try:
+            logger.info(f"Authenticated to Tableau site: '{site_content_url}'")
+            self.server = self.config.make_tableau_client(site_content_url)
+            self.report.last_authenticated_at = datetime.now(timezone.utc)
+            report_user_role(report=self.report, server=self.server)
+        # Note that we're not catching ConfigurationError, since we want that to throw.
+        except ValueError as e:
+            self.report.failure(
+                title="Tableau Login Error",
+                message="Failed to authenticate with Tableau.",
+                exc=e,
+            )
+
+    @staticmethod
+    def test_connection(config_dict: dict) -> TestConnectionReport:
+        test_report = TestConnectionReport()
+        try:
+            source_config = TableauConfig.parse_obj_allow_extras(config_dict)
+
+            server = source_config.make_tableau_client(source_config.site)
+
+            test_report.basic_connectivity = CapabilityReport(capable=True)
+
+            test_report.capability_report = check_user_role(
+                logged_in_user=UserInfo.from_server(server=server)
+            )
+
+        except Exception as e:
+            logger.warning(f"{e}", exc_info=e)
+            test_report.basic_connectivity = CapabilityReport(
+                capable=False, failure_reason=str(e)
+            )
+        return test_report
+
+    def get_report(self) -> TableauSourceReport:
+        return self.report
+
+    def get_workunits_internal(self) -> Iterable[MetadataWorkUnit]:
+        if self.server is None or not self.server.is_signed_in():
+            return
+        try:
+            if self.config.ingest_multiple_sites:
+                for site in list(TSC.Pager(self.server.sites)):
+                    if not site_verdict(
+                        self.config, SiteFacts(site.name, site.state)
+                    ).included:
+                        logger.info(
+                            f"Skip site '{site.name}' as it's excluded in site_name_pattern or inactive."
+                        )
+                        continue
+                    self.server.auth.switch_site(site)
+                    site_source = TableauSiteSource(
+                        config=self.config,
+                        ctx=self.ctx,
+                        site=site,
+                        report=self.report,
+                        server=self.server,
+                        platform=self.platform,
+                    )
+                    logger.info(f"Ingesting assets of site '{site.content_url}'.")
+                    yield from site_source.ingest_tableau_site()
+            else:
+                site = None
+                with self.report.report_exc(
+                    title="Unable to fetch site details. Site hierarchy may be incomplete and external urls may be missing.",
+                    message="This usually indicates missing permissions. Ensure that you have all necessary permissions.",
+                    level=StructuredLogLevel.WARN,
+                ):
+                    site = self.server.sites.get_by_id(self.server.site_id)
+
+                site_source = TableauSiteSource(
+                    config=self.config,
+                    ctx=self.ctx,
+                    site=(
+                        site
+                        if site
+                        else SiteIdContentUrl(
+                            site_id=self.server.site_id,
+                            site_content_url=self.config.site,
+                        )
+                    ),
+                    report=self.report,
+                    server=self.server,
+                    platform=self.platform,
+                )
+                yield from site_source.ingest_tableau_site()
+
+        except MetadataQueryException as md_exception:
+            self.report.failure(
+                title="Failed to Retrieve Tableau Metadata",
+                message="Unable to retrieve metadata from tableau.",
+                context=str(md_exception),
+                exc=md_exception,
+            )
+
+    def close(self) -> None:
+        try:
+            if self.server is not None:
+                self.server.auth.sign_out()
+        except Exception as ex:
+            logger.warning(
+                "During graceful closing of Tableau source a sign-out call was tried but ended up with"
+                " an Exception (%s). Continuing closing of the source",
+                ex,
+            )
+            self.server = None
+        super().close()
+
+
+class TableauSiteSource:
+    def __init__(
+        self,
+        config: TableauConfig,
+        ctx: PipelineContext,
+        site: Union[SiteItem, SiteIdContentUrl],
+        report: TableauSourceReport,
+        server: Server,
+        platform: str,
+    ):
+        self.config: TableauConfig = config
+        self.report = report
+        self.server: Server = server
+        self.ctx: PipelineContext = ctx
+        self.platform = platform
+        # Datasets whose schema lookup raised, so it is attempted once per
+        # dataset rather than once per column (see _ingested_schema).
+        self._failed_schema_lookups: Set[str] = set()
+
+        self.vc_processor: VirtualConnectionProcessor = VirtualConnectionProcessor(self)
+
+        self.site: Optional[SiteItem] = None
+        if isinstance(site, SiteItem):
+            self.site = site
+            assert site.id is not None, "Site ID is required"
+            self.site_id = site.id
+            self.site_content_url = site.content_url
+        elif isinstance(site, SiteIdContentUrl):
+            self.site = None
+            self.site_id = site.site_id
+            self.site_content_url = site.site_content_url
+        else:
+            raise AssertionError("site or site id+content_url pair is required")
+
+        self.database_tables: Dict[str, DatabaseTable] = {}
+        self.tableau_stat_registry: Dict[str, UsageStat] = {}
+        self.tableau_project_registry: Dict[str, TableauProject] = {}
+        self.workbook_project_map: Dict[str, Optional[str]] = {}
+        self.datasource_project_map: Dict[str, str] = {}
+        self.db_tables_lookup: Dict[str, dict] = {}
+
+        self.group_map: Dict[str, GroupItem] = {}
+
+        # This map keeps track of the database server connection hostnames.
+        self.database_server_hostname_map: Dict[str, str] = {}
+        # This list keeps track of sheets in workbooks so that we retrieve those
+        # when emitting sheets.
+        self.sheet_ids: List[str] = []
+        # This list keeps track of dashboards in workbooks so that we retrieve those
+        # when emitting dashboards.
+        self.dashboard_ids: List[str] = []
+        # This list keeps track of embedded datasources in workbooks so that we retrieve those
+        # when emitting embedded data sources.
+        self.embedded_datasource_ids_being_used: List[str] = []
+        # Initial SQL for embedded datasources lives in the parent workbook's .twb.
+        # Cache the parsed {caption -> [InitialSqlConnection]} map per workbook luid so
+        # we download each workbook at most once (None = download/parse failed).
+        self._workbook_initial_sql_cache: Dict[
+            str, Optional[Dict[str, List[InitialSqlConnection]]]
+        ] = {}
+        # This list keeps track of datasource being actively used by workbooks so that we only retrieve those
+        # when emitting published data sources.
+        self.datasource_ids_being_used: List[str] = []
+        # This list keeps track of datasource being actively used by workbooks so that we only retrieve those
+        # when emitting custom SQL data sources.
+        self.custom_sql_ids_being_used: List[str] = []
+
+        report_user_role(report=report, server=server)
+
+    @property
+    def no_env_browse_prefix(self) -> str:
+        # Prefix to use with browse path (v1)
+        # This is for charts and dashboards.
+
+        platform_with_instance = (
+            f"{self.platform}/{self.config.platform_instance}"
+            if self.config.platform_instance
+            else self.platform
+        )
+        return f"/{platform_with_instance}{self.site_name_browse_path}"
+
+    @property
+    def site_name_browse_path(self) -> str:
+        site_name_prefix = (
+            self.site.name if self.site and self.config.add_site_container else ""
+        )
+        return f"/{site_name_prefix}" if site_name_prefix else ""
+
+    @property
+    def dataset_browse_prefix(self) -> str:
+        # datasets also have the env in the browse path
+        return f"/{self.config.env.lower()}{self.no_env_browse_prefix}"
+
+    def _re_authenticate(self) -> None:
+        logger.info(f"Re-authenticating to Tableau site '{self.site_content_url}'")
+        # Sign-in again may not be enough because Tableau sometimes caches invalid sessions
+        # so we need to recreate the Tableau Server object
+        self.server = self.config.make_tableau_client(self.site_content_url)
+        self.report.last_authenticated_at = datetime.now(timezone.utc)
+
+    def _populate_usage_stat_registry(self) -> None:
+        if self.server is None:
+            return
+
+        view: TSC.ViewItem
+        for view in TSC.Pager(self.server.views, usage=True):
+            if not view.id:
+                continue
+            self.tableau_stat_registry[view.id] = UsageStat(view_count=view.total_views)
+        logger.info(f"Got Tableau stats for {len(self.tableau_stat_registry)} assets")
+        logger.debug("Tableau stats %s", self.tableau_stat_registry)
+
+    def _populate_database_server_hostname_map(self) -> None:
+        for database_server in self.get_connection_objects(
+            query=database_servers_graphql_query,
+            connection_type=c.DATABASE_SERVERS_CONNECTION,
+            page_size=self.config.effective_database_server_page_size,
+        ):
+            database_server_id = database_server.get(c.ID)
+            server_connection = database_server.get(c.HOST_NAME)
+            host_name = parse_database_server_hostname(server_connection)
+            name = database_server.get(c.NAME) or ""
+            connection_type = database_server.get(c.CONNECTION_TYPE) or ""
+
+            # An id-less server gets no map entry: None is the only "absent id"
+            # sentinel, so a placeholder key here could collide with a table whose
+            # own database id is missing and misroute it to this server.
+            if database_server_id and host_name:
+                self.database_server_hostname_map[str(database_server_id)] = host_name
+
+            # Log every server so users can find ids for the id routing map
+            # without hitting the Tableau Metadata API directly.
+            logger.info(
+                "Tableau database server: id=%s name=%r hostName=%s connectionType=%s",
+                database_server_id,
+                name,
+                host_name,
+                connection_type,
+            )
+
+    def _get_all_project(self) -> Dict[str, TableauProject]:
+        all_project_map: Dict[str, TableauProject] = {}
+
+        def fetch_projects():
+            if self.server is None:
+                return all_project_map
+
+            for project in TSC.Pager(self.server.projects):
+                if project.id is None or project.name is None:
+                    self.report.warning(
+                        title="Project without an id or name skipped",
+                        message="A project returned by the Tableau API has no id or name and was excluded from the project hierarchy.",
+                        context=f"id={project.id}, name={project.name}",
+                    )
+                    continue
+                all_project_map[project.id] = TableauProject(
+                    id=project.id,
+                    name=project.name,
+                    parent_id=project.parent_id,
+                    parent_name=None,
+                    description=project.description,
+                    path=[],
+                    owner_username=getattr(
+                        getattr(project, "owner", None), "name", None
+                    ),
+                    owner_email=getattr(getattr(project, "owner", None), "email", None),
+                )
+            # Set parent project name
+            for _project_id, tableau_project in all_project_map.items():
+                if tableau_project.parent_id is None:
+                    continue
+
+                if tableau_project.parent_id in all_project_map:
+                    tableau_project.parent_name = all_project_map[
+                        tableau_project.parent_id
+                    ].name
+                else:
+                    self.report.warning(
+                        title="Incomplete project hierarchy",
+                        message="Project details missing. Child projects will be ingested without reference to their parent project. We generally need Site Administrator Explorer permissions to extract the complete project hierarchy.",
+                        context=f"Missing {tableau_project.parent_id}, referenced by {tableau_project.id} {tableau_project.name}",
+                    )
+                    tableau_project.parent_id = None
+
+            # Post-condition
+            assert all(
+                [
+                    ((project.parent_id is None) == (project.parent_name is None))
+                    and (
+                        project.parent_id is None
+                        or project.parent_id in all_project_map
+                    )
+                    for project in all_project_map.values()
+                ]
+            ), "Parent project id and name should be consistent"
+
+        def set_project_path():
+            def form_path(project_id: str) -> List[str]:
+                cur_proj = all_project_map[project_id]
+                ancestors = [cur_proj.name]
+                while cur_proj.parent_id is not None:
+                    cur_proj = all_project_map[cur_proj.parent_id]
+                    ancestors = [cur_proj.name, *ancestors]
+                return ancestors
+
+            for project in all_project_map.values():
+                project.path = form_path(project_id=project.id)
+                logger.debug(f"Project {project.name}({project.id})")
+                logger.debug(f"Project path = {project.path}")
+
+        fetch_projects()
+        set_project_path()
+
+        return all_project_map
+
+    def _is_allowed_project(self, project: TableauProject) -> bool:
+        is_allowed = is_project_allowed(
+            self.config, project.name, self._get_project_path(project)
+        )
+        if is_allowed is False:
+            logger.info(
+                f"Project ({project.name}) is not allowed as per project_pattern or project_path_pattern"
+            )
+        return is_allowed
+
+    def _init_tableau_project_registry(self, all_project_map: dict) -> None:
+        list_of_skip_projects: List[TableauProject] = []
+        projects_to_ingest = {}
+        for project in all_project_map.values():
+            # Skip project if it is not allowed
+            logger.debug(f"Evaluating project pattern for {project.name}")
+            if self._is_allowed_project(project) is False:
+                list_of_skip_projects.append(project)
+                logger.debug(f"Project {project.name} is skipped")
+                continue
+            logger.debug(f"Project {project.name} is added in project registry")
+            projects_to_ingest[project.id] = project
+
+        # One pass in listing order: a project re-admitted under a parent that
+        # is itself only re-admitted depends on that order (project_selection's
+        # depends_on_rescued_parent).
+        for project in list_of_skip_projects:
+            if is_readmitted(
+                self.config,
+                project.name,
+                self._get_project_path(project),
+                parent_included=project.parent_id in projects_to_ingest,
+            ):
+                logger.debug(
+                    f"Project {project.name} is added in project registry as it's a child project and not explicitly denied in `deny` list"
+                )
+                projects_to_ingest[project.id] = project
+
+        # We rely on automatic browse paths (v2) when creating containers. That's why we need to sort the projects here.
+        # Otherwise, nested projects will not have the correct browse paths if not created in correct order / hierarchy.
+        self.tableau_project_registry = OrderedDict(
+            sorted(projects_to_ingest.items(), key=lambda item: len(item[1].path))
+        )
+
+    def _init_datasource_registry(self) -> None:
+        if self.server is None:
+            return
+
+        try:
+            for ds in TSC.Pager(self.server.datasources):
+                if ds.project_id not in self.tableau_project_registry:
+                    logger.debug(
+                        f"project id ({ds.project_id}) of datasource {ds.name} is not present in project "
+                        f"registry"
+                    )
+                    continue
+                if ds.id is None:
+                    self.report.warning(
+                        title="Datasource without an id skipped",
+                        message="A datasource returned by the Tableau API has no id and was excluded from the datasource-to-project map.",
+                        context=f"name={ds.name}, project_id={ds.project_id}",
+                    )
+                    continue
+                self.datasource_project_map[ds.id] = ds.project_id
+        except Exception as e:
+            self.report.get_all_datasources_query_failed = True
+            self.report.warning(
+                title="Unexpected Query Error",
+                message="Get all datasources query failed due to error",
+                exc=e,
+            )
+
+    def _init_workbook_registry(self) -> None:
+        if self.server is None:
+            return
+
+        # Every workbook is recorded, not just those in selected projects, so that a
+        # workbook returned by the Metadata API for an unselected project (e.g. one that
+        # shares its name with a selected project) can be reported accurately without
+        # a follow-up REST lookup. Consumers check tableau_project_registry membership.
+        for wb in TSC.Pager(self.server.workbooks):
+            if wb.id is None:
+                self.report.warning(
+                    title="Workbook without an id skipped",
+                    message="A workbook returned by the Tableau API has no id and was excluded from the workbook-to-project map.",
+                    context=f"name={wb.name}, project_id={wb.project_id}",
+                )
+                continue
+            self.workbook_project_map[wb.id] = wb.project_id
+
+    def _populate_projects_registry(self) -> Dict[str, TableauProject]:
+        if self.server is None:
+            logger.warning("server is None. Can not initialize the project registry")
+            return {}
+
+        logger.info("Initializing site project registry")
+
+        all_project_map: Dict[str, TableauProject] = self._get_all_project()
+
+        self._init_tableau_project_registry(all_project_map)
+        self._init_datasource_registry()
+        self._init_workbook_registry()
+
+        logger.debug(f"All site projects {all_project_map}")
+        logger.debug(f"Projects selected for ingestion {self.tableau_project_registry}")
+        logger.debug(
+            f"Tableau data-sources {self.datasource_project_map}",
+        )
+        logger.debug(
+            f"Tableau workbooks {self.workbook_project_map}",
+        )
+
+        return all_project_map
+
+    def get_data_platform_instance(self) -> DataPlatformInstanceClass:
+        return DataPlatformInstanceClass(
+            platform=builder.make_data_platform_urn(self.platform),
+            instance=(
+                builder.make_dataplatform_instance_urn(
+                    self.platform, self.config.platform_instance
+                )
+                if self.config.platform_instance
+                else None
+            ),
+        )
+
+    def _is_hidden_view(self, dashboard_or_view: Dict) -> bool:
+        # LUID is blank if the view is hidden in the workbook.
+        # More info here: https://help.tableau.com/current/api/metadata_api/en-us/reference/view.doc.html
+        return not dashboard_or_view.get(c.LUID)
+
+    def _should_ingest_worksheet(self, worksheet: Dict) -> bool:
+        return (
+            self.config.ingest_hidden_assets is True
+            or (
+                isinstance(self.config.ingest_hidden_assets, list)
+                and "worksheet" in self.config.ingest_hidden_assets
+            )
+            or not self._is_hidden_view(worksheet)
+        )
+
+    def _should_ingest_dashboard(self, dashboard: Dict) -> bool:
+        return (
+            self.config.ingest_hidden_assets is True
+            or (
+                isinstance(self.config.ingest_hidden_assets, list)
+                and "dashboard" in self.config.ingest_hidden_assets
+            )
+            or not self._is_hidden_view(dashboard)
+        )
+
+    def get_connection_object_page(
+        self,
+        query: str,
+        connection_type: str,
+        query_filter: str,
+        current_cursor: Optional[str],
+        fetch_size: int,
+        retry_on_auth_error: bool = True,
+        retries_remaining: Optional[int] = None,
+    ) -> Tuple[dict, Optional[str], int]:
+        """
+        `current_cursor:` Tableau Server executes the query and returns
+            a set of records based on the specified fetch_size. It also provides a cursor that
+            indicates the current position within the result set. In the next API call,
+            you pass this cursor to retrieve the next batch of records,
+            with each batch containing up to fetch_size records.
+            Initial value is None.
+
+        `fetch_size:` The number of records to retrieve from Tableau
+            Server in a single API call, starting from the current cursor position on Tableau Server.
+        """
+        retries_remaining = (
+            self.config.max_retries if retries_remaining is None else retries_remaining
+        )
+
+        logger.debug(
+            f"Query {connection_type} to get {fetch_size} objects with cursor {current_cursor}"
+            f" and filter {query_filter}"
+        )
+        try:
+            assert self.server is not None
+            self.report.num_actual_tableau_metadata_queries += 1
+            query_data = query_metadata_cursor_based_pagination(
+                server=self.server,
+                main_query=query,
+                connection_name=connection_type,
+                first=fetch_size,
+                after=current_cursor,
+                qry_filter=query_filter,
+            )
+
+        except REAUTHENTICATE_ERRORS as e:
+            self.report.tableau_server_error_stats[e.__class__.__name__] += 1
+            if not retry_on_auth_error or retries_remaining <= 0:
+                raise
+
+            # We have been getting some irregular authorization errors like below well before the expected expiry time
+            # - within few seconds of initial authentication . We'll retry without re-auth for such cases.
+            # <class 'tableauserverclient.server.endpoint.exceptions.NonXMLResponseError'>:
+            # b'{"timestamp":"xxx","status":401,"error":"Unauthorized","path":"/relationship-service-war/graphql"}'
+            if self.report.last_authenticated_at and (
+                datetime.now(timezone.utc) - self.report.last_authenticated_at
+                > REGULAR_AUTH_EXPIRY_PERIOD
+            ):
+                # If ingestion has been running for over 2 hours, the Tableau
+                # temporary credentials will expire. If this happens, this exception
+                # will be thrown, and we need to re-authenticate and retry.
+                self._re_authenticate()
+
+            # Add exponential backoff to avoid hammering the server
+            backoff_time = min(
+                (self.config.max_retries - retries_remaining + 1) ** 2, 60
+            )
+            logger.info(
+                f"Retrying query due to {e.__class__.__name__} with {retries_remaining} retries remaining, "
+                f"will retry in {backoff_time} seconds"
+            )
+            time.sleep(backoff_time)
+
+            return self.get_connection_object_page(
+                query=query,
+                connection_type=connection_type,
+                query_filter=query_filter,
+                fetch_size=fetch_size,
+                current_cursor=current_cursor,
+                retry_on_auth_error=True,
+                retries_remaining=retries_remaining - 1,
+            )
+
+        except InternalServerError as ise:
+            self.report.tableau_server_error_stats[InternalServerError.__name__] += 1
+            # In some cases Tableau Server returns 504 error, which is a timeout error, so it worths to retry.
+            # Extended with other retryable errors.
+            if ise.code in RETRIABLE_ERROR_CODES:
+                if retries_remaining <= 0:
+                    raise ise
+
+                # Add exponential backoff to avoid hammering the server
+                backoff_time = min(
+                    (self.config.max_retries - retries_remaining + 1) ** 2, 60
+                )
+                logger.info(
+                    f"Retrying query due to error {ise.code} with {retries_remaining} retries remaining, "
+                    f"will retry in {backoff_time} seconds"
+                )
+                time.sleep(backoff_time)
+
+                return self.get_connection_object_page(
+                    query=query,
+                    connection_type=connection_type,
+                    query_filter=query_filter,
+                    fetch_size=fetch_size,
+                    current_cursor=current_cursor,
+                    retry_on_auth_error=True,
+                    retries_remaining=retries_remaining - 1,
+                )
+            else:
+                raise ise
+
+        except OSError:
+            self.report.tableau_server_error_stats[OSError.__name__] += 1
+            # In tableauseverclient 0.26 (which was yanked and released in 0.28 on 2023-10-04),
+            # the request logic was changed to use threads.
+            # https://github.com/tableau/server-client-python/commit/307d8a20a30f32c1ce615cca7c6a78b9b9bff081
+            # I'm not exactly sure why, but since then, we now occasionally see
+            # `OSError: Response is not a http response?` for some requests. This
+            # retry logic is basically a bandaid for that.
+            if retries_remaining <= 0:
+                raise
+
+            # Add exponential backoff to avoid hammering the server
+            backoff_time = min(
+                (self.config.max_retries - retries_remaining + 1) ** 2, 60
+            )
+            logger.info(
+                f"Retrying query due to OSError with {retries_remaining} retries remaining, "
+                f"will retry in {backoff_time} seconds"
+            )
+            time.sleep(backoff_time)
+
+            return self.get_connection_object_page(
+                query=query,
+                connection_type=connection_type,
+                query_filter=query_filter,
+                fetch_size=fetch_size,
+                current_cursor=current_cursor,
+                retry_on_auth_error=True,
+                retries_remaining=retries_remaining - 1,
+            )
+
+        if c.ERRORS in query_data:
+            errors = query_data[c.ERRORS]
+            if all(
+                # The format of the error messages is highly unpredictable, so we have to
+                # be extra defensive with our parsing.
+                error and (error.get(c.EXTENSIONS) or {}).get(c.SEVERITY) == c.WARNING
+                for error in errors
+            ):
+                # filter out PERMISSIONS_MODE_SWITCHED to report error in human-readable format
+                other_errors = []
+                permission_mode_errors = []
+                node_limit_errors = []
+                for error in errors:
+                    if (
+                        error.get("extensions")
+                        and error["extensions"].get("code")
+                        == "PERMISSIONS_MODE_SWITCHED"
+                    ):
+                        permission_mode_errors.append(error)
+                    elif (
+                        error.get("extensions")
+                        and error["extensions"].get("code") == "NODE_LIMIT_EXCEEDED"
+                    ):
+                        node_limit_errors.append(error)
+                    else:
+                        other_errors.append(error)
+
+                if other_errors:
+                    self.report.warning(
+                        message="Received error fetching Query Connection",
+                        context=f"connection_type={connection_type}, errors={other_errors}",
+                    )
+
+                if permission_mode_errors:
+                    self.report.warning(
+                        title="Derived Permission Error",
+                        message="Turn on your derived permissions. See for details "
+                        "https://community.tableau.com/s/question/0D54T00000QnjHbSAJ/how-to-fix-the"
+                        "-permissionsmodeswitched-error",
+                        context=f"{permission_mode_errors}",
+                    )
+
+                if node_limit_errors:
+                    self.report.warning(
+                        title="Tableau Data Exceed Predefined Limit",
+                        message="The numbers of record in result set exceeds a predefined limit. Increase the tableau "
+                        "configuration metadata query node limit to higher value. Refer "
+                        "https://help.tableau.com/current/server/en-us/"
+                        "cli_configuration-set_tsm.htm#metadata_nodelimit",
+                        context=f"""{{
+                                "errors": {node_limit_errors},
+                                "connection_type": {connection_type},
+                                "query_filter": {query_filter},
+                                "query": {query},
+                        }}""",
+                    )
+            else:
+                if all(
+                    # As of Tableau Server 2024.2, the metadata API sporadically returns a 30-second
+                    # timeout error.
+                    # It doesn't reliably happen, so retrying a couple of times makes sense.
+                    error.get("message")
+                    == "Execution canceled because timeout of 30000 millis was reached"
+                    # The Metadata API sometimes returns an 'unexpected error' message when querying
+                    # embeddedDatasourcesConnection. Try retrying a couple of times.
+                    or error.get("message") == "Unexpected error occurred"
+                    for error in errors
+                ):
+                    # If it was only a timeout error, we can retry.
+                    if retries_remaining <= 0:
+                        raise
+
+                    # This is a pretty dumb backoff mechanism, but it's good enough for now.
+                    backoff_time = min(
+                        (self.config.max_retries - retries_remaining + 1) ** 2, 60
+                    )
+                    logger.info(
+                        f"Query {connection_type} received a retryable error with {retries_remaining} retries remaining, "
+                        f"will retry in {backoff_time} seconds: {errors}"
+                    )
+                    time.sleep(backoff_time)
+                    return self.get_connection_object_page(
+                        query=query,
+                        connection_type=connection_type,
+                        query_filter=query_filter,
+                        fetch_size=fetch_size,
+                        current_cursor=current_cursor,
+                        retry_on_auth_error=True,
+                        retries_remaining=retries_remaining - 1,
+                    )
+                raise RuntimeError(f"Query {connection_type} error: {errors}")
+
+        connection_object = query_data.get(c.DATA, {}).get(connection_type, {})
+
+        has_next_page = connection_object.get(c.PAGE_INFO, {}).get(
+            c.HAS_NEXT_PAGE, False
+        )
+
+        next_cursor = connection_object.get(c.PAGE_INFO, {}).get(
+            "endCursor",
+            None,
+        )
+
+        return connection_object, next_cursor, has_next_page
+
+    def get_connection_objects(
+        self,
+        query: str,
+        connection_type: str,
+        page_size: int,
+        query_filter: Optional[dict] = None,
+    ) -> Iterable[dict]:
+        query_filter = query_filter or {}
+        query_filter = optimize_query_filter(query_filter)
+
+        # Calls the get_connection_object_page function to get the objects,
+        # and automatically handles pagination.
+
+        filter_pages = get_filter_pages(query_filter, page_size)
+        self.report.num_queries_by_connection_type[connection_type] += 1
+        self.report.num_filter_queries_by_connection_type[connection_type] += len(
+            filter_pages
+        )
+
+        for filter_page in filter_pages:
+            has_next_page = 1
+            current_cursor: Optional[str] = None
+            while has_next_page:
+                filter_: str = make_filter(filter_page)
+
+                self.report.num_paginated_queries_by_connection_type[
+                    connection_type
+                ] += 1
+
+                self.report.num_expected_tableau_metadata_queries += 1
+                (
+                    connection_objects,
+                    current_cursor,
+                    has_next_page,
+                ) = self.get_connection_object_page(
+                    query=query,
+                    connection_type=connection_type,
+                    query_filter=filter_,
+                    current_cursor=current_cursor,
+                    # `filter_page` contains metadata object IDs (e.g., Project IDs, Field IDs, Sheet IDs, etc.).
+                    # The number of IDs is always less than or equal to page_size.
+                    # If the IDs are primary keys, the number of metadata objects to load matches the number of records to return.
+                    # In our case, mostly, the IDs are primary key, therefore, fetch_size is set equal to page_size.
+                    fetch_size=page_size,
+                )
+
+                yield from connection_objects.get(c.NODES) or []
+
+    def emit_workbooks(self) -> Iterable[MetadataWorkUnit]:
+        if self.tableau_project_registry:
+            project_names: List[str] = [
+                project.name for project in self.tableau_project_registry.values()
+            ]
+            projects = {c.PROJECT_NAME_WITH_IN: project_names}
+
+            for workbook in self.get_connection_objects(
+                query=workbook_graphql_query,
+                connection_type=c.WORKBOOKS_CONNECTION,
+                query_filter=projects,
+                page_size=self.config.effective_workbook_page_size,
+            ):
+                # This check is needed as we are using projectNameWithin which return project as per project name so if
+                # user want to ingest only nested project C from A->B->C then tableau might return more than one Project
+                # if multiple project has name C. Ideal solution is to use projectLuidWithin to avoid duplicate project,
+                # however Tableau supports projectLuidWithin in Tableau Cloud June 2022 / Server 2022.3 and later.
+                project_luid: Optional[str] = self._get_workbook_project_luid(workbook)
+                if project_luid not in self.tableau_project_registry:
+                    wrk_name: Optional[str] = workbook.get(c.NAME)
+                    wrk_id: Optional[str] = workbook.get(c.ID)
+                    prj_name: Optional[str] = workbook.get(c.PROJECT_NAME)
+
+                    if project_luid is None:
+                        self.report.warning(
+                            title="Unable to Resolve Workbook Project",
+                            message="Skipping workbook because its project could not be resolved: the workbook has no luid, or the Tableau REST API did not return it or returned it without a project. Check that the ingestion user can view the workbook. If it was published or modified during this run, it will be picked up on the next run.",
+                            context=f"workbook={wrk_name}({wrk_id}), project={prj_name}",
+                        )
+                    else:
+                        self.report.info(
+                            title="Skipping Workbook in Unselected Project",
+                            message="Skipping workbook because its project is not selected by the project filters. This typically happens when another project with the same name is selected.",
+                            context=f"workbook={wrk_name}({wrk_id}), project={prj_name}({project_luid})",
+                        )
+                    continue
+
+                yield from self.emit_workbook_as_container(workbook)
+
+                for sheet in workbook.get(c.SHEETS, []):
+                    self.sheet_ids.append(sheet[c.ID])
+
+                for dashboard in workbook.get(c.DASHBOARDS, []):
+                    self.dashboard_ids.append(dashboard[c.ID])
+
+                for ds in workbook.get(c.EMBEDDED_DATA_SOURCES, []):
+                    self.embedded_datasource_ids_being_used.append(ds[c.ID])
+
+    def _track_custom_sql_ids(self, field: dict) -> None:
+        # Tableau shows custom sql datasource as a table in ColumnField's upstreamColumns.
+        for column in field.get(c.UPSTREAM_COLUMNS, []):
+            table_id = (
+                column.get(c.TABLE, {}).get(c.ID)
+                if column.get(c.TABLE)
+                and column[c.TABLE][c.TYPE_NAME] == c.CUSTOM_SQL_TABLE
+                else None
+            )
+
+            if table_id is not None and table_id not in self.custom_sql_ids_being_used:
+                self.custom_sql_ids_being_used.append(table_id)
+
+    def _create_upstream_table_lineage(
+        self,
+        datasource: dict,
+        browse_path: Optional[str],
+        is_embedded_ds: bool = False,
+    ) -> LineageResult:
+        upstream_tables: List[Upstream] = []
+        fine_grained_lineages: List[FineGrainedLineage] = []
+        table_id_to_urn = {}
+
+        upstream_datasources = self.get_upstream_datasources(datasource)
+        upstream_tables.extend(upstream_datasources)
+
+        # Check if this datasource uses Virtual Connection tables first
+        datasource_id = datasource.get(c.ID)
+        vc_upstreams: List[Upstream] = []
+        if datasource_id and self.config.ingest_virtual_connections:
+            vc_result = self.get_upstream_vc_tables(datasource_id)
+            vc_upstreams = vc_result.upstream_tables
+
+        # When tableau workbook connects to published datasource, it creates an embedded
+        # datasource inside workbook that connects to published datasource. Both embedded
+        # and published datasource have same upstreamTables in this case.
+        # However, if the embedded datasource has VC references, we should use those instead.
+        if upstream_tables and is_embedded_ds and not vc_upstreams:
+            logger.debug(
+                f"Embedded datasource {datasource.get(c.ID)} has upstreamDatasources; "
+                "skipping upstreamTables (will be set via published datasource)."
+            )
+        else:
+            if vc_upstreams:
+                # VC table IDs are intentionally NOT added to table_id_to_urn here.
+                # Column-level lineage for VC→datasource is handled exclusively by
+                # create_datasource_vc_lineage to avoid duplicate CLL entries.
+                upstream_tables.extend(vc_upstreams)
+            else:
+                upstreams, id_to_urn = self.get_upstream_tables(
+                    datasource.get(c.UPSTREAM_TABLES, []),
+                    datasource.get(c.NAME),
+                    browse_path,
+                    is_custom_sql=False,
+                )
+                upstream_tables.extend(upstreams)
+                table_id_to_urn.update(id_to_urn)
+
+            # This adds an edge to upstream CustomSQLTables using `fields`.`upstreamColumns`.`table`
+            csql_upstreams, csql_id_to_urn = self.get_upstream_csql_tables(
+                datasource.get(c.FIELDS) or [],
+            )
+            upstream_tables.extend(csql_upstreams)
+            table_id_to_urn.update(csql_id_to_urn)
+
+        logger.debug(
+            f"A total of {len(upstream_tables)} upstream table edges found for datasource {datasource[c.ID]}"
+        )
+
+        datasource_urn = builder.make_dataset_urn_with_platform_instance(
+            platform=self.platform,
+            name=datasource[c.ID],
+            platform_instance=self.config.platform_instance,
+            env=self.config.env,
+        )
+
+        if not upstream_tables:
+            # Tableau's metadata graphql API sometimes returns an empty list for upstreamTables
+            # for embedded datasources. However, the upstreamColumns field often includes information.
+            # This attempts to populate upstream table information from the upstreamColumns field.
+            # Build table_id_to_urn mapping for CustomSQL and VirtualConnection tables
+            table_id_to_urn = {}
+
+            # Handle CustomSQL tables
+            for field in datasource.get(c.FIELDS, []):
+                for column in field.get(c.UPSTREAM_COLUMNS, []):
+                    table = column.get(c.TABLE, {})
+                    table_type = table.get(c.TYPE_NAME)
+                    table_id = table.get(c.ID)
+
+                    if table_id and table_type == c.CUSTOM_SQL_TABLE:
+                        table_id_to_urn[table_id] = (
+                            builder.make_dataset_urn_with_platform_instance(
+                                self.platform,
+                                table_id,
+                                self.config.platform_instance,
+                                self.config.env,
+                            )
+                        )
+                    elif table_id and table_type == c.VIRTUAL_CONNECTION_TABLE:
+                        # For Virtual Connection tables, create URN using VC_ID.TABLE_NAME format
+                        virtual_connection = table.get(c.VIRTUAL_CONNECTION, {})
+                        vc_id = virtual_connection.get(c.ID)
+                        table_name = table.get(c.NAME)
+
+                        if vc_id and table_name:
+                            # Use the same format as VirtualConnectionProcessor: {vc_id}.{table_name}
+                            vc_table_name = f"{vc_id}.{table_name}"
+                            table_id_to_urn[table_id] = (
+                                builder.make_dataset_urn_with_platform_instance(
+                                    self.platform,
+                                    vc_table_name,
+                                    self.config.platform_instance,
+                                    self.config.env,
+                                )
+                            )
+            fine_grained_lineages = self.get_upstream_columns_of_fields_in_datasource(
+                datasource, datasource_urn, table_id_to_urn
+            )
+            upstream_tables = [
+                Upstream(dataset=table_urn, type=DatasetLineageType.TRANSFORMED)
+                for table_urn in table_id_to_urn.values()
+            ]
+
+            # If still no upstream tables after fallback attempt, report a warning
+            if not upstream_tables:
+                self.report.warning(
+                    title="No upstream table lineage found",
+                    message=(
+                        "No upstream tables lineage found for this datasource."
+                        "If lineage is expected, this may be due to known limitations in the Tableau Metadata API not returning complete information;"
+                        "else, this warning can be ignored."
+                    ),
+                    context=f"{datasource.get(c.NAME)} (ID: {datasource.get(c.ID)})",
+                )
+
+        if datasource.get(c.FIELDS):
+            if self.config.extract_column_level_lineage:
+                # Find fine grained lineage for datasource column to datasource column edge,
+                # upstream columns may be from same datasource
+                upstream_fields = self.get_upstream_fields_of_field_in_datasource(
+                    datasource, datasource_urn
+                )
+                fine_grained_lineages.extend(upstream_fields)
+
+                # Find fine grained lineage for table column to datasource column edge,
+                upstream_columns = self.get_upstream_columns_of_fields_in_datasource(
+                    datasource,
+                    datasource_urn,
+                    table_id_to_urn,
+                )
+                fine_grained_lineages.extend(upstream_columns)
+
+                logger.debug(
+                    f"A total of {len(fine_grained_lineages)} upstream column edges found for datasource {datasource[c.ID]}"
+                )
+
+        return LineageResult(
+            upstream_tables=upstream_tables, fine_grained_lineages=fine_grained_lineages
+        )
+
+    def get_upstream_datasources(self, datasource: dict) -> List[Upstream]:
+        upstream_tables = []
+        for ds in datasource.get(c.UPSTREAM_DATA_SOURCES, []):
+            if ds[c.ID] not in self.datasource_ids_being_used:
+                self.datasource_ids_being_used.append(ds[c.ID])
+
+            upstream_ds_urn = builder.make_dataset_urn_with_platform_instance(
+                platform=self.platform,
+                name=ds[c.ID],
+                platform_instance=self.config.platform_instance,
+                env=self.config.env,
+            )
+            upstream_table = Upstream(
+                dataset=upstream_ds_urn,
+                type=DatasetLineageType.TRANSFORMED,
+            )
+            upstream_tables.append(upstream_table)
+        return upstream_tables
+
+    def get_upstream_csql_tables(
+        self, fields: Sequence[Optional[dict]]
+    ) -> Tuple[List[Upstream], Dict[str, str]]:
+        upstream_csql_urns = set()
+        csql_id_to_urn = {}
+
+        for field in fields:
+            if not isinstance(field, dict):
+                continue
+            if not field.get(c.UPSTREAM_COLUMNS):
+                continue
+            for upstream_col in field[c.UPSTREAM_COLUMNS]:
+                if (
+                    upstream_col
+                    and upstream_col.get(c.TABLE)
+                    and upstream_col.get(c.TABLE)[c.TYPE_NAME] == c.CUSTOM_SQL_TABLE
+                ):
+                    upstream_table_id = upstream_col.get(c.TABLE)[c.ID]
+
+                    csql_urn = builder.make_dataset_urn_with_platform_instance(
+                        platform=self.platform,
+                        name=upstream_table_id,
+                        platform_instance=self.config.platform_instance,
+                        env=self.config.env,
+                    )
+                    csql_id_to_urn[upstream_table_id] = csql_urn
+
+                    upstream_csql_urns.add(csql_urn)
+
+        return [
+            Upstream(dataset=csql_urn, type=DatasetLineageType.TRANSFORMED)
+            for csql_urn in upstream_csql_urns
+        ], csql_id_to_urn
+
+    def get_upstream_vc_tables(self, datasource_id: str) -> UpstreamTablesResult:
+        """Build table-level upstream lineage for datasources that reference VC tables."""
+        if datasource_id not in self.vc_processor.datasource_vc_relationships:
+            return UpstreamTablesResult(upstream_tables=[], table_id_to_urn={})
+
+        vc_refs = self.vc_processor.datasource_vc_relationships[datasource_id]
+        upstream_vc_urns: set = set()
+        vc_id_to_urn: Dict[str, str] = {}
+        vc_tables_seen: set = set()
+
+        for vc_ref in vc_refs:
+            vc_table_id = vc_ref.get("vc_table_id")
+            vc_id = vc_ref.get("vc_id")
+            # vc_table_id_to_name is populated by lookup_vc_ids_from_table_ids(), which runs
+            # after all datasources are emitted. This fallback is always empty at this call
+            # site; references with a null table name will be skipped by the guard below.
+            vc_table_name = vc_ref.get(
+                "vc_table_name"
+            ) or self.vc_processor.vc_table_id_to_name.get(vc_table_id or "", "")
+
+            if not (vc_id and vc_table_name and vc_table_id):
+                continue
+
+            vc_table_full_name = f"{vc_id}.{vc_table_name}"
+            if vc_table_full_name in vc_tables_seen:
+                continue
+
+            vc_tables_seen.add(vc_table_full_name)
+            vc_urn = builder.make_dataset_urn_with_platform_instance(
+                platform=self.platform,
+                name=vc_table_full_name,
+                platform_instance=self.config.platform_instance,
+                env=self.config.env,
+            )
+            vc_id_to_urn[vc_table_id] = vc_urn
+            upstream_vc_urns.add(vc_urn)
+
+        return UpstreamTablesResult(
+            upstream_tables=[
+                Upstream(dataset=vc_urn, type=DatasetLineageType.TRANSFORMED)
+                for vc_urn in upstream_vc_urns
+            ],
+            table_id_to_urn=vc_id_to_urn,
+        )
+
+    def get_upstream_tables(
+        self,
+        tables: Sequence[Optional[dict]],
+        datasource_name: Optional[str],
+        browse_path: Optional[str],
+        is_custom_sql: bool,
+    ) -> Tuple[List[Upstream], Dict[str, str]]:
+        upstream_tables = []
+        # Same table urn can be used when setting fine grained lineage,
+        table_id_to_urn: Dict[str, str] = {}
+        for table in tables:
+            if not isinstance(table, dict):
+                logger.debug(
+                    f"Skipping None/non-dict upstream table entry in datasource '{datasource_name}'"
+                )
+                continue
+
+            # Extract column count if available
+            num_tbl_cols: Optional[int] = table.get(c.COLUMNS_CONNECTION) and table[
+                c.COLUMNS_CONNECTION
+            ].get(c.TOTAL_COUNT)
+
+            # Tables without column metadata: create table-level lineage only
+            if not is_custom_sql and not num_tbl_cols:
+                self.report.num_upstream_table_processed_without_columns += 1
+                logger.info(
+                    f"Table {table[c.ID]} has no column metadata from Tableau API. "
+                    f"Creating table-level lineage only (column-level lineage will be skipped). "
+                    f"Table details: {table}"
+                )
+
+            if table[c.NAME] is None:
+                self.report.num_upstream_table_skipped_no_name += 1
+                logger.warning(
+                    f"Skipping upstream table {table[c.ID]} from lineage since its name is none: {table}"
+                )
+                continue
+
+            try:
+                ref = TableauUpstreamReference.create(
+                    table, default_schema_map=self.config.default_schema_map
+                )
+            except Exception as e:
+                self.report.num_upstream_table_failed_generate_reference += 1
+                self.report.warning(
+                    title="Potentially Missing Lineage Issue",
+                    message="Failed to generate upstream reference",
+                    exc=e,
+                    context=f"table={table}",
+                )
+                continue
+
+            table_urn = ref.make_dataset_urn(
+                env=self.config.env,
+                platform_instance_map=self.config.platform_instance_map,
+                lineage_overrides=self.config.lineage_overrides,
+                database_hostname_to_platform_instance_map=self.config.database_hostname_to_platform_instance_map,
+                database_server_hostname_map=self.database_server_hostname_map,
+                database_id_to_platform_instance_map=self.config.database_id_to_platform_instance_map,
+            )
+            table_id_to_urn[table[c.ID]] = table_urn
+
+            upstream_table = Upstream(
+                dataset=table_urn,
+                type=DatasetLineageType.TRANSFORMED,
+            )
+            upstream_tables.append(upstream_table)
+
+            table_path: Optional[str] = None
+            if browse_path and datasource_name:
+                table_path = f"{browse_path}/{datasource_name}"
+
+            if table_urn not in self.database_tables:
+                self.database_tables[table_urn] = DatabaseTable(
+                    urn=table_urn,
+                    id=table[c.ID],
+                    num_cols=num_tbl_cols,
+                    paths={table_path} if table_path else set(),
+                )
+            else:
+                self.database_tables[table_urn].update_table(
+                    table[c.ID], num_tbl_cols, table_path
+                )
+
+        return upstream_tables, table_id_to_urn
+
+    def get_upstream_columns_of_fields_in_datasource(
+        self,
+        datasource: dict,
+        datasource_urn: str,
+        table_id_to_urn: Dict[str, str],
+    ) -> List[FineGrainedLineage]:
+        fine_grained_lineages = []
+
+        for field in datasource.get(c.FIELDS) or []:
+            if not isinstance(field, dict):
+                continue
+            field_name = field.get(c.NAME)
+            # upstreamColumns lineage will be set via upstreamFields.
+            # such as for CalculatedField
+            if (
+                not field_name
+                or not field.get(c.UPSTREAM_COLUMNS)
+                or field.get(c.UPSTREAM_FIELDS)
+            ):
+                continue
+            input_columns = []
+            for upstream_col in field.get(c.UPSTREAM_COLUMNS) or []:
+                if not upstream_col:
+                    continue
+                name = upstream_col.get(c.NAME)
+                upstream_table_id = (
+                    upstream_col.get(c.TABLE)[c.ID]
+                    if upstream_col.get(c.TABLE)
+                    else None
+                )
+                if name and upstream_table_id and upstream_table_id in table_id_to_urn:
+                    parent_dataset_urn = table_id_to_urn[upstream_table_id]
+                    if (
+                        self.is_snowflake_urn(parent_dataset_urn)
+                        and not self.config.ingest_tables_external
+                    ):
+                        # Snowflake field paths follow that source's own casing
+                        # settings, so match against the schema already in DataHub
+                        # rather than assuming a convention.
+                        #
+                        # It should not be done if snowflake tables are not pre ingested but
+                        # parsed from SQL queries or ingested from Tableau metadata (in this case
+                        # it just breaks case sensitive table level linage)
+                        name = self._match_snowflake_column_name(
+                            parent_dataset_urn, name
+                        )
+                    input_columns.append(
+                        builder.make_schema_field_urn(
+                            parent_urn=parent_dataset_urn,
+                            field_path=name,
+                        )
+                    )
+
+            if input_columns:
+                fine_grained_lineages.append(
+                    FineGrainedLineage(
+                        downstreamType=FineGrainedLineageDownstreamType.FIELD,
+                        downstreams=sorted(
+                            [builder.make_schema_field_urn(datasource_urn, field_name)]
+                        ),
+                        upstreamType=FineGrainedLineageUpstreamType.FIELD_SET,
+                        upstreams=sorted(input_columns),
+                    )
+                )
+
+        return fine_grained_lineages
+
+    @cached_property
+    def _upstream_schema_resolver(self) -> Optional["SchemaResolver"]:
+        """Resolver used to read upstream schemas already in DataHub.
+
+        ``resolve_urn`` keys off the URN itself, so one instance serves every
+        upstream platform; the platform and env below only seed the factory.
+        """
+        if self.ctx.graph is None:
+            return None
+        return create_and_cache_schema_resolver(
+            platform="snowflake",
+            env=self.config.env,
+            graph=self.ctx.graph,
+        )
+
+    def _match_snowflake_column_name(self, dataset_urn: str, name: str) -> str:
+        """Resolve a Tableau field to the field path the Snowflake source emitted.
+
+        Tableau reports the warehouse's own casing. What the Snowflake source
+        stored depends on its `preserve_column_case` setting, so lowercasing here
+        would silently sever column lineage whenever that setting is on. Match
+        against the ingested schema and adopt its spelling.
+
+        Falls back to lowercasing — the behaviour this replaces — whenever the
+        schema cannot answer: no graph, dataset not ingested, the column absent
+        from the schema we have, or the lookup itself failing.
+        """
+        schema_info = self._ingested_schema(dataset_urn)
+        if schema_info:
+            by_folded_name = {column.lower(): column for column in schema_info}
+            # The space-to-underscore substitution is a candidate, not a
+            # pre-transform: Snowflake allows a space in a quoted identifier and
+            # keeps it, so a column really named `My Col` is only findable by the
+            # unsubstituted name. Doing it up front made that column unmatchable
+            # under either casing setting.
+            for candidate in (name, name.replace(" ", "_")):
+                # Exact before case-insensitive. With preserve_column_case on, the
+                # schema can hold `col` and `COL` as two real columns, and folding
+                # straight away collapses them into one index entry -- attaching
+                # this column's lineage to its sibling. Tableau reports the
+                # warehouse's own spelling, so an exact hit is the column asked for.
+                if candidate in schema_info:
+                    return candidate
+
+                # Then folded, for the far more common case: the Snowflake source
+                # lowercased its field paths, so nothing matches exactly.
+                # Deliberately not match_columns_to_schema: it returns the input
+                # unchanged on a miss, which here would emit warehouse casing for a
+                # column the schema does not have. A miss must fall through instead.
+                matched = by_folded_name.get(candidate.lower())
+                if matched is not None:
+                    return matched
+
+        return name.replace(" ", "_").lower()
+
+    def _ingested_schema(self, dataset_urn: str) -> Optional["SchemaInfo"]:
+        """The upstream's schema as DataHub holds it, or None if unavailable.
+
+        This is a graph call on a path that used to be a local string rewrite, so
+        it must not be able to fail the run: the site ingest loop only catches
+        MetadataQueryException, and one timed-out lookup would otherwise abort
+        every remaining workbook.
+        """
+        resolver = self._upstream_schema_resolver
+        if resolver is None:
+            return None
+
+        # SchemaResolver caches hits and misses but not exceptions, and this runs
+        # once per upstream column. Without remembering the failure, a single GMS
+        # outage would re-request — and re-warn — for every column on the dataset.
+        if dataset_urn in self._failed_schema_lookups:
+            return None
+
+        try:
+            _, schema_info = resolver.resolve_urn(dataset_urn)
+            return schema_info
+        except Exception as e:
+            self._failed_schema_lookups.add(dataset_urn)
+            self.report.warning(
+                title="Could not read an upstream schema for column lineage",
+                message="Falling back to lowercased column names, which is only "
+                "correct while the upstream source lowercases its field paths. "
+                "Column-level lineage to this dataset may not resolve.",
+                context=f"{dataset_urn}: {type(e).__name__}: {e}",
+            )
+            return None
+
+    def is_snowflake_urn(self, urn: str) -> bool:
+        return (
+            DatasetUrn.from_string(urn).get_data_platform_urn().platform_name
+            == "snowflake"
+        )
+
+    def get_upstream_fields_of_field_in_datasource(
+        self, datasource: dict, datasource_urn: str
+    ) -> List[FineGrainedLineage]:
+        fine_grained_lineages = []
+        for field in datasource.get(c.FIELDS) or []:
+            field_name = field.get(c.NAME)
+            # It is observed that upstreamFields gives one-hop field
+            # lineage, and not multi-hop field lineage
+            # This behavior is as desired in our case.
+            if not field_name or not field.get(c.UPSTREAM_FIELDS):
+                continue
+            input_fields = []
+            for upstream_field in field.get(c.UPSTREAM_FIELDS):
+                if not upstream_field:
+                    continue
+                name = upstream_field.get(c.NAME)
+                upstream_ds_id = (
+                    upstream_field.get(c.DATA_SOURCE)[c.ID]
+                    if upstream_field.get(c.DATA_SOURCE)
+                    else None
+                )
+                if name and upstream_ds_id:
+                    input_fields.append(
+                        builder.make_schema_field_urn(
+                            parent_urn=builder.make_dataset_urn_with_platform_instance(
+                                self.platform,
+                                upstream_ds_id,
+                                self.config.platform_instance,
+                                self.config.env,
+                            ),
+                            field_path=name,
+                        )
+                    )
+            if input_fields:
+                fine_grained_lineages.append(
+                    FineGrainedLineage(
+                        downstreamType=FineGrainedLineageDownstreamType.FIELD,
+                        downstreams=[
+                            builder.make_schema_field_urn(datasource_urn, field_name)
+                        ],
+                        upstreamType=FineGrainedLineageUpstreamType.FIELD_SET,
+                        upstreams=input_fields,
+                        transformOperation=self.get_transform_operation(field),
+                    )
+                )
+        return fine_grained_lineages
+
+    def get_upstream_fields_from_custom_sql(
+        self, datasource: dict, datasource_urn: str
+    ) -> List[FineGrainedLineage]:
+        parsed = self.parse_custom_sql(
+            datasource=datasource,
+            datasource_urn=datasource_urn,
+            env=self.config.env,
+            platform=self.platform,
+            platform_instance=self.config.platform_instance,
+            func_overridden_info=None,  # Here we don't want to override any information from configuration
+        )
+
+        if parsed is None or parsed.result.debug_info.error:
+            return []
+        parsed_result = parsed.result
+
+        cll: List[ColumnLineageInfo] = (
+            parsed_result.column_lineage
+            if parsed_result.column_lineage is not None
+            else []
+        )
+
+        fine_grained_lineages: List[FineGrainedLineage] = []
+        for cll_info in cll:
+            downstream = (
+                [
+                    builder.make_schema_field_urn(
+                        datasource_urn, cll_info.downstream.column
+                    )
+                ]
+                if cll_info.downstream is not None and cll_info.downstream.column
+                else []
+            )
+            upstreams = cll_info.upstream_schema_field_urns()
+            fine_grained_lineages.append(
+                FineGrainedLineage(
+                    downstreamType=FineGrainedLineageDownstreamType.FIELD,
+                    downstreams=downstream,
+                    upstreamType=FineGrainedLineageUpstreamType.FIELD_SET,
+                    upstreams=upstreams,
+                )
+            )
+
+        return fine_grained_lineages
+
+    def get_transform_operation(self, field: dict) -> str:
+        field_type = field[c.TYPE_NAME]
+        if field_type in (
+            c.DATA_SOURCE_FIELD,
+            c.COLUMN_FIELD,
+        ):
+            op = c.IDENTITY  # How to specify exact same
+        elif field_type == c.CALCULATED_FIELD:
+            op = field_type
+            if field.get(c.FORMULA):
+                op += f"formula: {field.get(c.FORMULA)}"
+        else:
+            op = field_type  # BinField, CombinedField, etc
+
+        return op
+
+    def emit_custom_sql_datasources(self) -> Iterable[MetadataWorkUnit]:
+        custom_sql_filter = {c.ID_WITH_IN: self.custom_sql_ids_being_used}
+
+        custom_sql_connection = list(
+            self.get_connection_objects(
+                query=custom_sql_graphql_query,
+                connection_type=c.CUSTOM_SQL_TABLE_CONNECTION,
+                query_filter=custom_sql_filter,
+                page_size=self.config.effective_custom_sql_table_page_size,
+            )
+        )
+
+        unique_custom_sql = get_unique_custom_sql(custom_sql_connection)
+
+        for csql in unique_custom_sql:
+            csql_id: str = csql[c.ID]
+            csql_urn = builder.make_dataset_urn_with_platform_instance(
+                platform=self.platform,
+                name=csql_id,
+                platform_instance=self.config.platform_instance,
+                env=self.config.env,
+            )
+
+            dataset_snapshot = DatasetSnapshot(
+                urn=csql_urn,
+                aspects=[self.get_data_platform_instance()],
+            )
+            logger.debug(f"Processing custom sql = {csql}")
+
+            datasource_name: Optional[str] = None
+            browse_path_name: Optional[str] = None
+            project: Optional[str] = None
+            columns: List[Dict[Any, Any]] = []
+            if len(csql[c.DATA_SOURCES]) > 0:
+                # CustomSQLTable id owned by exactly one tableau data source
+                logger.debug(
+                    f"Number of datasources referencing CustomSQLTable: {len(csql[c.DATA_SOURCES])}"
+                )
+
+                datasource = csql[c.DATA_SOURCES][0]
+                datasource_name = datasource.get(c.NAME)
+                browse_path_name = datasource_name
+                if datasource.get(
+                    c.TYPE_NAME
+                ) == c.EMBEDDED_DATA_SOURCE and datasource.get(c.WORKBOOK):
+                    workbook = datasource.get(c.WORKBOOK)
+                    browse_path_name = (
+                        f"{workbook.get(c.NAME)}/{datasource_name}"
+                        if datasource_name and workbook.get(c.NAME)
+                        else None
+                    )
+                    logger.debug(
+                        f"Adding datasource {browse_path_name}({datasource.get('id')}) to workbook container"
+                    )
+                    yield from add_entity_to_container(
+                        self.gen_workbook_key(workbook[c.ID]),
+                        c.DATASET,
+                        dataset_snapshot.urn,
+                    )
+                else:
+                    project_luid = self._get_datasource_project_luid(datasource)
+                    if project_luid:
+                        logger.debug(
+                            f"Adding datasource {datasource_name}({datasource.get('id')}) to project {project_luid} container"
+                        )
+                        # TODO: Technically, we should have another layer of hierarchy with the datasource name here.
+                        # Same with the workbook name above. However, in practice most projects/workbooks have a single
+                        # datasource, so the extra nesting just gets in the way.
+                        yield from add_entity_to_container(
+                            self.gen_project_key(project_luid),
+                            c.DATASET,
+                            dataset_snapshot.urn,
+                        )
+                    else:
+                        logger.debug(
+                            f"Datasource {datasource_name}({datasource.get('id')}) project_luid not found"
+                        )
+
+                project = self._get_project_browse_path_name(datasource)
+
+                # if condition is needed as graphQL return "columns": None
+                columns = (
+                    cast(List[Dict[Any, Any]], csql.get(c.COLUMNS))
+                    if c.COLUMNS in csql and csql.get(c.COLUMNS) is not None
+                    else []
+                )
+
+                tableau_table_list = csql.get(c.TABLES, [])
+                if self.config.force_extraction_of_lineage_from_custom_sql_queries or (
+                    not tableau_table_list
+                    and self.config.extract_lineage_from_unsupported_custom_sql_queries
+                ):
+                    if not tableau_table_list:
+                        # custom sql tables may contain unsupported sql, causing incomplete lineage
+                        # we extract the lineage from the raw queries
+                        logger.debug(
+                            "Parsing TLL & CLL from custom sql (tableau metadata incomplete)"
+                        )
+                    else:
+                        # The Tableau SQL parser is much worse than our sqlglot based parser,
+                        # so relying on metadata parsed by Tableau from SQL queries can be
+                        # less accurate. This option allows us to ignore Tableau's parser and
+                        # only use our own.
+                        logger.debug("Parsing TLL & CLL from custom sql (forced)")
+
+                    yield from self._create_lineage_from_unsupported_csql(
+                        csql_urn, csql, columns
+                    )
+                else:
+                    # lineage from custom sql -> datasets/tables #
+                    yield from self._create_lineage_to_upstream_tables(
+                        csql_urn, tableau_table_list, datasource
+                    )
+
+            schema_metadata = self.get_schema_metadata_for_custom_sql(columns)
+            if schema_metadata is not None:
+                dataset_snapshot.aspects.append(schema_metadata)
+
+            if not (project and browse_path_name and datasource_name):
+                logger.debug(
+                    f"Skipping Custom SQL table {csql_id}: "
+                    f"project={project}, browse_path={browse_path_name}, datasource_name={datasource_name}"
+                )
+                logger.warning(
+                    f"Skipping Custom SQL table {csql_id} due to missing project, browse path, or datasource name"
+                )
+                continue
+
+            browse_paths = BrowsePathsClass(
+                paths=[f"{self.dataset_browse_prefix}/{project}/{browse_path_name}"]
+            )
+            dataset_snapshot.aspects.append(browse_paths)
+
+            dataset_properties = DatasetPropertiesClass(
+                name=datasource_name,
+                description=csql.get(c.DESCRIPTION),
+            )
+
+            dataset_snapshot.aspects.append(dataset_properties)
+
+            if csql.get(c.QUERY):
+                view_properties = ViewPropertiesClass(
+                    materialized=False,
+                    viewLanguage=c.SQL,
+                    viewLogic=clean_query(csql[c.QUERY]),
+                )
+                dataset_snapshot.aspects.append(view_properties)
+
+            yield self.get_metadata_change_event(dataset_snapshot)
+            yield self.get_metadata_change_proposal(
+                dataset_snapshot.urn,
+                aspect=SubTypesClass(typeNames=[DatasetSubTypes.VIEW, c.CUSTOM_SQL]),
+            )
+
+    def get_schema_metadata_for_custom_sql(
+        self, columns: List[dict]
+    ) -> Optional[SchemaMetadata]:
+        fields = []
+        schema_metadata = None
+        for field in columns:
+            # Datasource fields
+
+            if field.get(c.NAME) is None:
+                self.report.num_csql_field_skipped_no_name += 1
+                logger.warning(
+                    f"Skipping field {field[c.ID]} from schema since its name is none"
+                )
+                continue
+            nativeDataType = field.get(c.REMOTE_TYPE, c.UNKNOWN)
+            TypeClass = FIELD_TYPE_MAPPING.get(nativeDataType, NullTypeClass)
+            schema_field = SchemaField(
+                fieldPath=field[c.NAME],
+                type=SchemaFieldDataType(type=TypeClass()),
+                nativeDataType=nativeDataType,
+                description=field.get(c.DESCRIPTION),
+            )
+            fields.append(schema_field)
+
+        schema_metadata = SchemaMetadata(
+            schemaName="test",
+            platform=f"urn:li:dataPlatform:{self.platform}",
+            version=0,
+            fields=fields,
+            hash="",
+            platformSchema=OtherSchema(rawSchema=""),
+        )
+        return schema_metadata
+
+    def _get_published_datasource_project_luid(self, ds: dict) -> Optional[str]:
+        # This is fallback in case "get all datasources" query fails for some reason.
+        # It is possible due to https://github.com/tableau/server-client-python/issues/1210
+        if (
+            ds.get(c.LUID)
+            and ds[c.LUID] not in self.datasource_project_map
+            and self.report.get_all_datasources_query_failed
+        ):
+            logger.debug(
+                f"published datasource {ds.get(c.NAME)} project_luid not found."
+                f" Running get datasource query for {ds[c.LUID]}"
+            )
+            # Query and update self.datasource_project_map with luid
+            self._query_published_datasource_for_project_luid(ds[c.LUID])
+
+        if (
+            ds.get(c.LUID)
+            and ds[c.LUID] in self.datasource_project_map
+            and self.datasource_project_map[ds[c.LUID]] in self.tableau_project_registry
+        ):
+            return self.datasource_project_map[ds[c.LUID]]
+
+        logger.debug(f"published datasource {ds.get(c.NAME)} project_luid not found")
+
+        return None
+
+    def _query_published_datasource_for_project_luid(self, ds_luid: str) -> None:
+        if self.server is None:
+            return
+
+        try:
+            ds_result = self.server.datasources.get_by_id(ds_luid)
+            if ds_result.project_id not in self.tableau_project_registry:
+                logger.debug(
+                    f"project id ({ds_result.project_id}) of datasource {ds_result.name} is not present in project "
+                    f"registry"
+                )
+            else:
+                self.datasource_project_map[ds_luid] = ds_result.project_id
+        except Exception as e:
+            self.report.num_get_datasource_query_failures += 1
+            self.report.warning(
+                title="Unexpected Query Error",
+                message="Failed to get datasource details",
+                exc=e,
+                context=f"ds_luid={ds_luid}",
+            )
+
+    def _get_workbook_project_luid(self, wb: dict) -> Optional[str]:
+        wb_luid: Optional[str] = wb.get(c.LUID)
+        if not wb_luid:
+            logger.debug(
+                f"workbook {wb.get(c.NAME)} has no luid, project_luid not found"
+            )
+            return None
+
+        if wb_luid not in self.workbook_project_map:
+            # A None result is recorded too, so a failed lookup is not repeated.
+            self.workbook_project_map[wb_luid] = self._query_workbook_for_project_luid(
+                wb_luid
+            )
+
+        project_luid: Optional[str] = self.workbook_project_map[wb_luid]
+        if project_luid is None:
+            logger.debug(f"workbook {wb.get(c.NAME)} project_luid not found")
+
+        return project_luid
+
+    def _query_workbook_for_project_luid(self, wb_luid: str) -> Optional[str]:
+        self.report.num_workbook_project_lookups += 1
+
+        try:
+            return self.server.workbooks.get_by_id(wb_luid).project_id
+        except Exception:
+            # The skip itself is reported by emit_workbooks; only log the cause here
+            # so one failed workbook does not produce two report entries.
+            self.report.num_get_workbook_query_failures += 1
+            logger.warning(
+                f"Failed to get workbook details for workbook_luid={wb_luid}",
+                exc_info=True,
+            )
+            return None
+
+    def _get_embedded_datasource_project_luid(self, ds: dict) -> Optional[str]:
+        if ds.get(c.WORKBOOK):
+            project_luid: Optional[str] = self._get_workbook_project_luid(
+                ds[c.WORKBOOK]
+            )
+
+            if project_luid and project_luid in self.tableau_project_registry:
+                return project_luid
+
+        logger.debug(f"embedded datasource {ds.get(c.NAME)} project_luid not found")
+
+        return None
+
+    def _get_datasource_project_luid(self, ds: dict) -> Optional[str]:
+        # Only published and embedded data-sources are supported
+        ds_type: Optional[str] = ds.get(c.TYPE_NAME)
+        if ds_type not in (
+            c.PUBLISHED_DATA_SOURCE,
+            c.EMBEDDED_DATA_SOURCE,
+        ):
+            logger.debug(
+                f"datasource {ds.get(c.NAME)} type {ds.get(c.TYPE_NAME)} is unsupported"
+            )
+            return None
+
+        func_selector: Any = {
+            c.PUBLISHED_DATA_SOURCE: self._get_published_datasource_project_luid,
+            c.EMBEDDED_DATA_SOURCE: self._get_embedded_datasource_project_luid,
+        }
+
+        return func_selector[ds_type](ds)
+
+    @staticmethod
+    def _get_datasource_project_name(ds: dict) -> Optional[str]:
+        if ds.get(c.TYPE_NAME) == c.EMBEDDED_DATA_SOURCE and ds.get(c.WORKBOOK):
+            return ds[c.WORKBOOK].get(c.PROJECT_NAME)
+        if ds.get(c.TYPE_NAME) == c.PUBLISHED_DATA_SOURCE:
+            return ds.get(c.PROJECT_NAME)
+        return None
+
+    def _get_project_browse_path_name(self, ds: dict) -> Optional[str]:
+        if self.config.extract_project_hierarchy is False:
+            # backward compatibility. Just return the name of datasource project
+            return self._get_datasource_project_name(ds)
+
+        # form path as per nested project structure
+        project_luid = self._get_datasource_project_luid(ds)
+        if project_luid is None:
+            logger.warning(
+                f"Could not load project hierarchy for datasource {ds.get(c.NAME)}. Please check permissions."
+            )
+            logger.debug(f"datasource = {ds}")
+            return None
+
+        return self._project_luid_to_browse_path_name(project_luid=project_luid)
+
+    def _create_lineage_to_upstream_tables(
+        self, csql_urn: str, tables: List[dict], datasource: dict
+    ) -> Iterable[MetadataWorkUnit]:
+        # This adds an edge to upstream DatabaseTables using `upstreamTables`
+        upstream_tables, _ = self.get_upstream_tables(
+            tables,
+            datasource.get(c.NAME) or "",
+            self._get_project_browse_path_name(datasource),
+            is_custom_sql=True,
+        )
+
+        if upstream_tables:
+            upstream_lineage = UpstreamLineage(upstreams=upstream_tables)
+            yield self.get_metadata_change_proposal(
+                csql_urn,
+                aspect=upstream_lineage,
+            )
+            self.report.num_tables_with_upstream_lineage += 1
+            self.report.num_upstream_table_lineage += len(upstream_tables)
+
+    @staticmethod
+    def _clean_tableau_query_parameters(query: str) -> str:
+        if not query:
+            return query
+
+        #
+        # It replaces all following occurrences by 1
+        # which is enough to fix syntax of SQL query
+        # and make sqlglot parser happy:
+        #
+        #   <[Parameters].[SomeParameterName]>
+        #   <Parameters.[SomeParameterName]>
+        #   <[Parameters].SomeParameterName>
+        #   <[Parameters].SomeParameter Name>
+        #   <Parameters.SomeParameterName>
+        #
+        # It also neutralizes T-SQL / session variables (e.g. @Division, @2YearsAgo)
+        # that appear in Initial SQL batches. These are not valid SQL on their own and
+        # carry no lineage; replacing them with a literal lets the surrounding
+        # SELECT/FROM/JOIN parse so the real source tables are still extracted. (One or
+        # more leading @ also covers @@SYSTEM variables.)
+        #
+        # After, it unescapes (Tableau escapes it)
+        #   >> to >
+        #   << to <
+        #
+        cleaned = re.sub(r"\<\[?[Pp]arameters\]?\.(\[[^\]]+\]|[^\>]+)\>", "1", query)
+        cleaned = re.sub(r"@+\w+", "1", cleaned)
+        return cleaned.replace("<<", "<").replace(">>", ">").replace("\n\n", "\n")
+
+    def parse_custom_sql(
+        self,
+        datasource: dict,
+        datasource_urn: str,
+        platform: str,
+        env: str,
+        platform_instance: Optional[str],
+        func_overridden_info: Optional[OverriddenInfoFn],
+    ) -> Optional["CustomSqlParseResult"]:
+        database_field = datasource.get(c.DATABASE) or {}
+        database_id: Optional[str] = database_field.get(c.ID)
+        database_name: Optional[str] = database_field.get(c.NAME) or c.UNKNOWN.lower()
+        database_connection_type: Optional[str] = database_field.get(
+            c.CONNECTION_TYPE
+        ) or datasource.get(c.CONNECTION_TYPE)
+
+        if (
+            datasource.get(c.IS_UNSUPPORTED_CUSTOM_SQL) in (None, False)
+            and not self.config.force_extraction_of_lineage_from_custom_sql_queries
+        ):
+            logger.debug(f"datasource {datasource_urn} is not created from custom sql")
+            return None
+
+        if database_connection_type is None:
+            logger.debug(
+                f"database information is missing from datasource {datasource_urn}"
+            )
+            return None
+
+        query = datasource.get(c.QUERY)
+        if query is None:
+            logger.debug(
+                f"raw sql query is not available for datasource {datasource_urn}"
+            )
+            return None
+        query = self._clean_tableau_query_parameters(query)
+
+        logger.debug(f"Parsing sql={query}")
+
+        upstream_db = database_name
+
+        if func_overridden_info is not None:
+            # Override the information as per configuration
+            upstream_db, platform_instance, platform, _ = func_overridden_info(
+                connection_type=database_connection_type,
+                upstream_db=database_name,
+                upstream_db_id=database_id,
+                platform_instance_map=self.config.platform_instance_map,
+                lineage_overrides=self.config.lineage_overrides,
+                database_hostname_to_platform_instance_map=self.config.database_hostname_to_platform_instance_map,
+                database_server_hostname_map=self.database_server_hostname_map,
+                database_id_to_platform_instance_map=self.config.database_id_to_platform_instance_map,
+            )
+
+        logger.debug(
+            f"Overridden info upstream_db={upstream_db}, platform_instance={platform_instance}, platform={platform}"
+        )
+
+        parsed_result = create_lineage_sql_parsed_result(
+            query=query,
+            default_db=upstream_db,
+            platform=platform,
+            platform_instance=platform_instance,
+            env=env,
+            graph=self.ctx.graph,
+            schema_aware=not self.config.sql_parsing_disable_schema_awareness,
+        )
+
+        assert parsed_result is not None
+
+        if parsed_result.debug_info.table_error:
+            logger.warning(
+                f"Failed to extract table lineage from datasource {datasource_urn}: {parsed_result.debug_info.table_error}"
+            )
+            self.report.num_upstream_table_lineage_failed_parse_sql += 1
+        elif parsed_result.debug_info.column_error:
+            logger.warning(
+                f"Failed to extract column level lineage from datasource {datasource_urn}: {parsed_result.debug_info.column_error}"
+            )
+            self.report.num_upstream_fine_grained_lineage_failed_parse_sql += 1
+
+        return CustomSqlParseResult(
+            result=parsed_result, platform_instance=platform_instance
+        )
+
+    def _download_datasource_tds(self, luid: str) -> Optional[bytes]:
+        """Download a published datasource and return its .tds XML bytes (or None)."""
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # include_extract=False keeps the payload small — we only need the definition.
+                path = self.server.datasources.download(
+                    luid, filepath=tmpdir, include_extract=False
+                )
+                tds_bytes = extract_tds_bytes(Path(path).read_bytes())
+                if tds_bytes is None:
+                    self.report.num_initial_sql_definitions_missing += 1
+                    self.report.warning(
+                        title="No datasource definition for Initial SQL",
+                        message="Downloaded datasource contained no .tds definition; "
+                        "Initial SQL will be skipped for it.",
+                        context=f"datasource_luid={luid}",
+                    )
+                return tds_bytes
+        except Exception as e:
+            self.report.num_initial_sql_download_failures += 1
+            self.report.warning(
+                title="Failed to download datasource for Initial SQL",
+                message="Initial SQL lineage and custom property will be skipped "
+                "for this datasource.",
+                context=f"datasource_luid={luid}",
+                exc=e,
+            )
+            return None
+
+    def get_initial_sql_lineage(
+        self, datasource: dict, datasource_urn: str
+    ) -> InitialSqlLineage:
+        """Extract Initial SQL for a published datasource.
+
+        Performs one REST download per datasource — callers must gate on
+        self.config.ingest_initial_sql.
+        """
+        luid = datasource.get(c.LUID)
+        if not luid:
+            logger.debug(
+                f"Skipping Initial SQL for {datasource_urn}: datasource has no luid"
+            )
+            return InitialSqlLineage.empty()
+
+        tds_xml = self._download_datasource_tds(luid)
+        if tds_xml is None:
+            return InitialSqlLineage.empty()
+        self.report.num_initial_sql_datasources_processed += 1
+
+        # extract_initial_sql_connections already filters empty/whitespace-only SQL.
+        return self._initial_sql_result_from_connections(
+            extract_initial_sql_connections(tds_xml), datasource_urn
+        )
+
+    def _download_workbook_definition(self, workbook_luid: str) -> Optional[bytes]:
+        """Download a workbook and return its .twb XML bytes (or None)."""
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # include_extract=False keeps the payload small — we only need the
+                # workbook definition (.twb), not its (possibly huge) data extract.
+                path = self.server.workbooks.download(
+                    workbook_luid, filepath=tmpdir, include_extract=False
+                )
+                twb_bytes = extract_definition_bytes(Path(path).read_bytes())
+                if twb_bytes is None:
+                    self.report.num_initial_sql_definitions_missing += 1
+                    self.report.warning(
+                        title="No workbook definition for Initial SQL",
+                        message="Downloaded workbook contained no .twb definition; "
+                        "Initial SQL will be skipped for its embedded datasources.",
+                        context=f"workbook_luid={workbook_luid}",
+                    )
+                return twb_bytes
+        except Exception as e:
+            self.report.num_initial_sql_download_failures += 1
+            self.report.warning(
+                title="Failed to download workbook for Initial SQL",
+                message="Initial SQL lineage and custom property will be skipped "
+                "for this workbook's embedded datasources.",
+                context=f"workbook_luid={workbook_luid}",
+                exc=e,
+            )
+            return None
+
+    def _get_workbook_initial_sql_map(
+        self, workbook_luid: str
+    ) -> Optional[Dict[str, List[InitialSqlConnection]]]:
+        """Return the cached {caption -> [InitialSqlConnection]} map for a workbook,
+        downloading + parsing it on first use. None if the download/parse failed."""
+        if workbook_luid not in self._workbook_initial_sql_cache:
+            twb_xml = self._download_workbook_definition(workbook_luid)
+            self._workbook_initial_sql_cache[workbook_luid] = (
+                extract_initial_sql_by_datasource(twb_xml)
+                if twb_xml is not None
+                else None
+            )
+        return self._workbook_initial_sql_cache[workbook_luid]
+
+    def get_initial_sql_lineage_embedded(
+        self, datasource: dict, datasource_urn: str
+    ) -> InitialSqlLineage:
+        """Extract Initial SQL for an embedded datasource via its parent workbook.
+
+        Callers must gate on self.config.ingest_initial_sql. Matches the embedded
+        datasource to its workbook .twb definition by caption (== Metadata API name).
+        """
+        workbook = datasource.get(c.WORKBOOK) or {}
+        workbook_luid = workbook.get(c.LUID)
+        if not workbook_luid:
+            logger.debug(f"Skipping Initial SQL for {datasource_urn}: no workbook luid")
+            return InitialSqlLineage.empty()
+
+        ds_map = self._get_workbook_initial_sql_map(workbook_luid)
+        if ds_map is None:
+            return InitialSqlLineage.empty()
+        # Counts embedded datasources *processed* for Initial SQL. Unlike the
+        # published path (one download per datasource), many embedded datasources
+        # share one cached workbook download, so this is per-datasource, not
+        # per-download.
+        self.report.num_initial_sql_datasources_processed += 1
+
+        name = datasource.get(c.NAME)
+        if name is None or name not in ds_map:
+            # Name didn't match any uniquely-captioned top-level datasource (mismatch
+            # or ambiguous duplicate caption) -> skip rather than mis-attribute.
+            logger.debug(
+                f"No Initial SQL match for {datasource_urn}: datasource name {name!r} "
+                f"not found among workbook {workbook_luid} captions (mismatch or ambiguous)"
+            )
+            self.report.num_initial_sql_embedded_datasources_unmatched += 1
+            return InitialSqlLineage.empty()
+
+        return self._initial_sql_result_from_connections(ds_map[name], datasource_urn)
+
+    def _initial_sql_result_from_connections(
+        self,
+        connections: List[InitialSqlConnection],
+        datasource_urn: str,
+    ) -> InitialSqlLineage:
+        """Shared tail for both published and embedded Initial SQL paths: turn the
+        Initial SQL connections into upstream lineage + the raw SQL text, updating
+        the per-connection/per-statement counters."""
+        upstreams: List[Upstream] = []
+        sql_texts: List[str] = []
+        for conn in connections:
+            self.report.num_initial_sql_connections_found += 1
+            sql_texts.append(conn.initial_sql)
+
+            if not self.config.initial_sql_as_lineage:
+                continue
+
+            upstream_db, platform_instance, platform, _ = get_overridden_info(
+                connection_type=conn.connection_type,
+                upstream_db=conn.database,
+                # Initial SQL is read from the workbook/datasource definition XML,
+                # which carries no Tableau database id, so neither id- nor
+                # hostname-keyed platform_instance routing can apply here.
+                upstream_db_id=None,
+                platform_instance_map=self.config.platform_instance_map,
+                lineage_overrides=self.config.lineage_overrides,
+                database_hostname_to_platform_instance_map=self.config.database_hostname_to_platform_instance_map,
+                database_server_hostname_map=self.database_server_hostname_map,
+            )
+            # Initial SQL may contain multiple statements (e.g. a session-level
+            # `SET ...` followed by a temp-table `CREATE ... AS SELECT`), often without
+            # semicolons (idiomatic T-SQL). split_statements handles both. The parser
+            # handles one statement at a time; statements that reference no tables
+            # (e.g. SET) contribute no lineage.
+            for statement in split_statements(
+                conn.initial_sql, dialect=get_dialect_str(platform)
+            ):
+                if not statement.strip():
+                    continue
+                # Resolve Tableau parameter templating + neutralize T-SQL @variables
+                # before parsing (the raw SQL is preserved for the custom property).
+                # Temp-table (#/##) upstreams are dropped in make_upstream_class.
+                cleaned_statement = self._clean_tableau_query_parameters(statement)
+                parsed_result = create_lineage_sql_parsed_result(
+                    query=cleaned_statement,
+                    default_db=upstream_db,
+                    default_schema=conn.schema,
+                    platform=platform,
+                    platform_instance=platform_instance,
+                    env=self.config.env,
+                    graph=self.ctx.graph,
+                    schema_aware=not self.config.sql_parsing_disable_schema_awareness,
+                )
+                # Only table-level upstreams matter for Initial SQL; a column_error
+                # (with no table_error) is acceptable and intentionally ignored.
+                # Consistent with parse_custom_sql: a per-statement parse error is
+                # logged + counted (not raised as a structured report warning, which
+                # would be noisy per-statement). The aggregate surfaces via the counter.
+                if parsed_result.debug_info.table_error:
+                    logger.warning(
+                        f"Failed to parse Initial SQL statement for {datasource_urn}: "
+                        f"{parsed_result.debug_info.table_error}"
+                    )
+                    # The actual SQL is logged at DEBUG only (keeps SQL out of normal logs).
+                    # repr() makes whitespace/newline boundaries visible so you can debug
+                    # whether split_statements chopped the Initial SQL correctly; `cleaned`
+                    # differs from `split_statement` only when param/@var neutralization changed it.
+                    logger.debug(
+                        f"Initial SQL parse failure for {datasource_urn}: "
+                        f"split_statement={statement!r} cleaned={cleaned_statement!r}"
+                    )
+                    self.report.num_initial_sql_parse_failures += 1
+                    continue
+                # platform_instance is the overridden upstream instance so over-qualified
+                # names (e.g. a SQL Server linked-server prefix) are trimmed correctly.
+                upstreams.extend(
+                    make_upstream_class(
+                        parsed_result, platform_instance=platform_instance
+                    )
+                )
+
+        self.report.num_initial_sql_lineage_upstreams += len(upstreams)
+        initial_sql_text = "\n\n".join(sql_texts) if sql_texts else None
+        return InitialSqlLineage(upstreams=upstreams, raw_sql=initial_sql_text)
+
+    def _enrich_database_tables_with_parsed_schemas(
+        self, parsing_result: SqlParsingResult
+    ) -> None:
+        in_tables_schemas: Dict[str, Set[str]] = (
+            transform_parsing_result_to_in_tables_schemas(parsing_result)
+        )
+
+        if not in_tables_schemas:
+            logger.info("Unable to extract table schema from parsing result")
+            return
+
+        for table_urn, columns in in_tables_schemas.items():
+            if table_urn in self.database_tables:
+                self.database_tables[table_urn].update_table(
+                    table_urn, parsed_columns=columns
+                )
+            else:
+                self.database_tables[table_urn] = DatabaseTable(
+                    urn=table_urn, parsed_columns=columns
+                )
+
+    def _create_lineage_from_unsupported_csql(
+        self, csql_urn: str, csql: dict, out_columns: List[Dict[Any, Any]]
+    ) -> Iterable[MetadataWorkUnit]:
+        parsed = self.parse_custom_sql(
+            datasource=csql,
+            datasource_urn=csql_urn,
+            env=self.config.env,
+            platform=self.platform,
+            platform_instance=self.config.platform_instance,
+            func_overridden_info=get_overridden_info,
+        )
+        logger.debug(f"_create_lineage_from_unsupported_csql parsed_result = {parsed}")
+
+        if parsed is None:
+            return
+        parsed_result = parsed.result
+
+        self._enrich_database_tables_with_parsed_schemas(parsed_result)
+
+        # Use the overridden upstream platform instance (not Tableau's own) so the
+        # linked-server / over-qualified name trimming preserves the instance segment.
+        upstream_tables = make_upstream_class(
+            parsed_result, platform_instance=parsed.platform_instance
+        )
+
+        logger.debug(f"Upstream tables = {upstream_tables}")
+
+        fine_grained_lineages: List[FineGrainedLineage] = []
+        if self.config.extract_column_level_lineage:
+            logger.debug("Extracting CLL from custom sql")
+            fine_grained_lineages = make_fine_grained_lineage_class(
+                parsed_result, csql_urn, out_columns
+            )
+
+        upstream_lineage = UpstreamLineage(
+            upstreams=upstream_tables,
+            fineGrainedLineages=fine_grained_lineages,
+        )
+        yield self.get_metadata_change_proposal(
+            csql_urn,
+            aspect=upstream_lineage,
+        )
+        self.report.num_tables_with_upstream_lineage += 1
+        self.report.num_upstream_table_lineage += len(upstream_tables)
+        self.report.num_upstream_fine_grained_lineage += len(fine_grained_lineages)
+
+    def _get_schema_metadata_for_datasource(
+        self, datasource_fields: Sequence[Optional[dict]]
+    ) -> Optional[SchemaMetadata]:
+        fields = []
+        for field in datasource_fields:
+            if not isinstance(field, dict):
+                continue
+            # check datasource - custom sql relations from a field being referenced
+            self._track_custom_sql_ids(field)
+            if field.get(c.NAME) is None:
+                self.report.num_upstream_table_skipped_no_name += 1
+                logger.warning(
+                    f"Skipping field {field[c.ID]} from schema since its name is none"
+                )
+                continue
+
+            schema_field = tableau_field_to_schema_field(field, self.config.ingest_tags)
+            fields.append(schema_field)
+
+        return (
+            SchemaMetadata(
+                schemaName="test",
+                platform=f"urn:li:dataPlatform:{self.platform}",
+                version=0,
+                fields=fields,
+                hash="",
+                platformSchema=OtherSchema(rawSchema=""),
+            )
+            if fields
+            else None
+        )
+
+    def get_metadata_change_event(
+        self, snap_shot: Union["DatasetSnapshot", "DashboardSnapshot", "ChartSnapshot"]
+    ) -> MetadataWorkUnit:
+        mce = MetadataChangeEvent(proposedSnapshot=snap_shot)
+        return MetadataWorkUnit(id=snap_shot.urn, mce=mce)
+
+    def get_metadata_change_proposal(
+        self,
+        urn: str,
+        aspect: Union["UpstreamLineage", "SubTypesClass"],
+    ) -> MetadataWorkUnit:
+        return MetadataChangeProposalWrapper(
+            entityUrn=urn,
+            aspect=aspect,
+        ).as_workunit()
+
+    def _emit_datasource_upstream_lineage(
+        self,
+        datasource: dict,
+        datasource_urn: str,
+        browse_path: Optional[str],
+        is_embedded_ds: bool,
+        initial_sql_upstreams: List[Upstream],
+    ) -> Iterable[MetadataWorkUnit]:
+        upstream_tables: List[Upstream] = []
+        all_fine_grained_lineages: List[FineGrainedLineage] = []
+
+        if (
+            datasource.get(c.UPSTREAM_TABLES)
+            or datasource.get(c.UPSTREAM_DATA_SOURCES)
+            or datasource.get(c.FIELDS)
+        ):
+            lineage_result = self._create_upstream_table_lineage(
+                datasource, browse_path, is_embedded_ds=is_embedded_ds
+            )
+            upstream_tables = lineage_result.upstream_tables
+            fine_grained_lineages = lineage_result.fine_grained_lineages
+
+            if self.config.ingest_virtual_connections:
+                vc_lineage_result = self.vc_processor.create_datasource_vc_lineage(
+                    datasource_urn
+                )
+                upstream_tables.extend(vc_lineage_result.upstream_tables)
+                all_fine_grained_lineages = (
+                    fine_grained_lineages + vc_lineage_result.fine_grained_lineages
+                )
+                self.report.num_virtual_connections_lineages_created += len(
+                    vc_lineage_result.fine_grained_lineages
+                )
+            else:
+                all_fine_grained_lineages = fine_grained_lineages
+
+        # Merge Initial SQL upstreams (de-duplicated by dataset urn).
+        if initial_sql_upstreams:
+            existing_upstream_urns = {u.dataset for u in upstream_tables}
+            for upstream in initial_sql_upstreams:
+                if upstream.dataset not in existing_upstream_urns:
+                    upstream_tables.append(upstream)
+                    existing_upstream_urns.add(upstream.dataset)
+
+        if upstream_tables or all_fine_grained_lineages:
+            upstream_lineage = UpstreamLineage(
+                upstreams=upstream_tables,
+                fineGrainedLineages=sorted(
+                    all_fine_grained_lineages,
+                    key=lambda x: (x.downstreams, x.upstreams),
+                )
+                or None,
+            )
+            yield self.get_metadata_change_proposal(
+                datasource_urn,
+                aspect=upstream_lineage,
+            )
+            self.report.num_tables_with_upstream_lineage += 1
+            self.report.num_upstream_table_lineage += len(upstream_tables)
+            self.report.num_upstream_fine_grained_lineage += len(
+                all_fine_grained_lineages
+            )
+
+    def emit_datasource(
+        self,
+        datasource: dict,
+        workbook: Optional[dict] = None,
+        is_embedded_ds: bool = False,
+    ) -> Iterable[MetadataWorkUnit]:
+        is_not_allowed = self._get_datasource_project_luid(datasource) is None
+
+        if is_not_allowed:
+            ds_type = "embedded" if is_embedded_ds else "published"
+            logger.warning(
+                f"Skip ingesting {ds_type} datasource {datasource.get(c.NAME)} because of filtered project"
+            )
+            return
+
+        if self.config.ingest_virtual_connections:
+            try:
+                datasource_type = (
+                    DatasourceType.EMBEDDED
+                    if is_embedded_ds
+                    else DatasourceType.PUBLISHED
+                )
+                self.vc_processor.process_datasource_for_vc_refs(
+                    datasource, datasource_type
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Error collecting VC references from datasource {datasource.get('id', 'unknown')}: {e}"
+                )
+
+        datasource_info = workbook
+        if not is_embedded_ds:
+            datasource_info = datasource
+
+        browse_path = self._get_project_browse_path_name(datasource)
+
+        logger.debug(f"datasource {datasource.get(c.NAME)} browse-path {browse_path}")
+        datasource_id = datasource[c.ID]
+        datasource_urn = builder.make_dataset_urn_with_platform_instance(
+            self.platform, datasource_id, self.config.platform_instance, self.config.env
+        )
+        if not is_embedded_ds and datasource_id not in self.datasource_ids_being_used:
+            self.datasource_ids_being_used.append(datasource_id)
+
+        initial_sql_upstreams: List[Upstream] = []
+        initial_sql_text: Optional[str] = None
+        # Published datasources expose Initial SQL via their downloaded .tds; embedded
+        # datasources only via the parent workbook's .twb.
+        if self.config.ingest_initial_sql:
+            initial_sql = (
+                self.get_initial_sql_lineage_embedded(datasource, datasource_urn)
+                if is_embedded_ds
+                else self.get_initial_sql_lineage(datasource, datasource_urn)
+            )
+            initial_sql_upstreams = initial_sql.upstreams
+            initial_sql_text = initial_sql.raw_sql
+
+        dataset_snapshot = DatasetSnapshot(
+            urn=datasource_urn,
+            aspects=[self.get_data_platform_instance()],
+        )
+
+        # Tags
+        if datasource_info and self.config.ingest_tags:
+            tags = self.get_tags(datasource_info)
+            dataset_snapshot.aspects.append(
+                builder.make_global_tag_aspect_with_tag_list(tags)
+            )
+
+        # Browse path
+        if browse_path and is_embedded_ds and workbook and workbook.get(c.NAME):
+            browse_path = (
+                f"{browse_path}/{workbook[c.NAME].replace('/', REPLACE_SLASH_CHAR)}"
+            )
+
+        if browse_path:
+            browse_paths = BrowsePathsClass(
+                paths=[f"{self.dataset_browse_prefix}/{browse_path}"]
+            )
+            dataset_snapshot.aspects.append(browse_paths)
+
+        # Ownership
+        owner_identifier = (
+            self._get_owner_identifier(datasource_info[c.OWNER])
+            if datasource_info and datasource_info.get(c.OWNER)
+            else None
+        )
+        owner = self._get_ownership(owner_identifier) if owner_identifier else None
+        if owner is not None:
+            dataset_snapshot.aspects.append(owner)
+
+        # Dataset properties
+        dataset_props = DatasetPropertiesClass(
+            name=datasource.get(c.NAME),
+            description=datasource.get(c.DESCRIPTION),
+            customProperties=self.get_custom_props_from_dict(
+                datasource,
+                [
+                    c.LUID,
+                    c.HAS_EXTRACTS,
+                    c.EXTRACT_LAST_REFRESH_TIME,
+                    c.EXTRACT_LAST_INCREMENTAL_UPDATE_TIME,
+                    c.EXTRACT_LAST_UPDATE_TIME,
+                ],
+            ),
+        )
+        dataset_snapshot.aspects.append(dataset_props)
+
+        if initial_sql_text and self.config.initial_sql_as_custom_property:
+            if dataset_props.customProperties is None:
+                dataset_props.customProperties = {}
+            dataset_props.customProperties[c.INITIAL_SQL] = initial_sql_text
+
+        yield from self._emit_datasource_upstream_lineage(
+            datasource,
+            datasource_urn,
+            browse_path=browse_path,
+            is_embedded_ds=is_embedded_ds,
+            initial_sql_upstreams=initial_sql_upstreams,
+        )
+
+        # Datasource Fields
+        schema_metadata = self._get_schema_metadata_for_datasource(
+            datasource.get(c.FIELDS, [])
+        )
+        if schema_metadata is not None:
+            dataset_snapshot.aspects.append(schema_metadata)
+
+        yield self.get_metadata_change_event(dataset_snapshot)
+        yield self.get_metadata_change_proposal(
+            dataset_snapshot.urn,
+            aspect=SubTypesClass(
+                typeNames=(
+                    ["Embedded Data Source"]
+                    if is_embedded_ds
+                    else ["Published Data Source"]
+                )
+            ),
+        )
+
+        container_key = self._get_datasource_container_key(
+            datasource, workbook, is_embedded_ds
+        )
+        if container_key is not None:
+            yield from add_entity_to_container(
+                container_key,
+                c.DATASET,
+                dataset_snapshot.urn,
+            )
+
+    def get_custom_props_from_dict(self, obj: dict, keys: List[str]) -> Optional[dict]:
+        return {key: str(obj[key]) for key in keys if obj.get(key)} or None
+
+    def _get_datasource_container_key(
+        self, datasource: dict, workbook: Optional[dict], is_embedded_ds: bool
+    ) -> Optional[ContainerKey]:
+        container_key: Optional[ContainerKey] = None
+        if is_embedded_ds:  # It is embedded then parent is container is workbook
+            if workbook is not None:
+                container_key = self.gen_workbook_key(workbook[c.ID])
+            else:
+                logger.warning(
+                    f"Parent container not set for embedded datasource {datasource[c.ID]}"
+                )
+        else:
+            parent_project_luid = self._get_published_datasource_project_luid(
+                datasource
+            )
+            # It is published datasource and hence parent container is project
+            if parent_project_luid is not None:
+                container_key = self.gen_project_key(parent_project_luid)
+            else:
+                logger.warning(
+                    f"Parent container not set for published datasource {datasource[c.ID]}"
+                )
+
+        return container_key
+
+    def update_datasource_for_field_upstream(
+        self,
+        datasource: dict,
+        field_upstream_query: str,
+        page_size: int,
+    ) -> dict:
+        # Collect field ids to fetch field upstreams
+        field_ids: List[str] = []
+        for field in datasource.get(c.FIELDS, []):
+            if field.get(c.ID):
+                field_ids.append(field.get(c.ID))
+
+        # Fetch field upstreams and arrange them in map
+        field_vs_upstream: Dict[str, dict] = {}
+        for field_upstream in self.get_connection_objects(
+            query=field_upstream_query,
+            connection_type=c.FIELDS_CONNECTION,
+            query_filter={c.ID_WITH_IN: field_ids},
+            page_size=page_size,
+        ):
+            if field_upstream.get(c.ID):
+                field_id = field_upstream[c.ID]
+                # delete the field id, we don't need it for further processing
+                del field_upstream[c.ID]
+                field_vs_upstream[field_id] = field_upstream
+
+        # update datasource's field for its upstream
+        for field_dict in datasource.get(c.FIELDS, []):
+            field_upstream_dict: Optional[dict] = field_vs_upstream.get(
+                field_dict.get(c.ID)
+            )
+            if field_upstream_dict:
+                # Add upstream fields to field
+                field_dict.update(field_upstream_dict)
+
+        return datasource
+
+    def emit_published_datasources(self) -> Iterable[MetadataWorkUnit]:
+        datasource_filter = (
+            {}
+            if self.config.emit_all_published_datasources
+            else {c.ID_WITH_IN: self.datasource_ids_being_used}
+        )
+
+        for datasource in self.get_connection_objects(
+            query=published_datasource_graphql_query,
+            connection_type=c.PUBLISHED_DATA_SOURCES_CONNECTION,
+            query_filter=datasource_filter,
+            page_size=self.config.effective_published_datasource_page_size,
+        ):
+            datasource = self.update_datasource_for_field_upstream(
+                datasource=datasource,
+                field_upstream_query=datasource_upstream_fields_graphql_query,
+                page_size=self.config.effective_published_datasource_field_upstream_page_size,
+            )
+
+            yield from self.emit_datasource(datasource)
+
+    def emit_upstream_tables(self) -> Iterable[MetadataWorkUnit]:
+        tableau_database_table_id_to_urn_map: Dict[str, str] = dict()
+        for urn, tbl in self.database_tables.items():
+            # only tables that came from Tableau metadata have id
+            if tbl.id:
+                tableau_database_table_id_to_urn_map[tbl.id] = urn
+
+        tables_filter = {
+            c.ID_WITH_IN: list(tableau_database_table_id_to_urn_map.keys())
+        }
+
+        emitted_urns: Set[str] = set()
+
+        # Phase 1: Emitting tables that came from Tableau metadata
+        for tableau_table in self.get_connection_objects(
+            query=database_tables_graphql_query,
+            connection_type=c.DATABASE_TABLES_CONNECTION,
+            query_filter=tables_filter,
+            page_size=self.config.effective_database_table_page_size,
+        ):
+            if tableau_database_table_id_to_urn_map.get(tableau_table[c.ID]) is None:
+                logger.warning(
+                    f"Skipping table {tableau_table[c.ID]} due to filtered out published datasource"
+                )
+                continue
+            database_table = self.database_tables[
+                tableau_database_table_id_to_urn_map[tableau_table[c.ID]]
+            ]
+            tableau_columns = tableau_table.get(c.COLUMNS, [])
+            is_embedded = tableau_table.get(c.IS_EMBEDDED) or False
+            if not is_embedded and not self.config.ingest_tables_external:
+                logger.debug(
+                    f"Skipping external table {database_table.urn} as ingest_tables_external is set to False"
+                )
+                continue
+
+            yield from self.emit_table(database_table, tableau_columns)
+            emitted_urns.add(database_table.urn)
+
+        # Phase 2: Emit remaining tables: SQL-parsed (no Tableau ID) and
+        # tables not returned by Tableau re-query (no column metadata)
+        if self.config.ingest_tables_external:
+            for database_table in self.database_tables.values():
+                if database_table.urn not in emitted_urns:
+                    yield from self.emit_table(database_table, None)
+                    emitted_urns.add(database_table.urn)
+
+    def emit_table(
+        self,
+        database_table: DatabaseTable,
+        tableau_columns: Optional[List[Dict[str, Any]]],
+    ) -> Iterable[MetadataWorkUnit]:
+        logger.debug(
+            f"Emitting external table {database_table} tableau_columns {tableau_columns}"
+        )
+        dataset_urn = DatasetUrn.from_string(database_table.urn)
+        dataset_snapshot = DatasetSnapshot(
+            urn=str(dataset_urn),
+            aspects=[],
+        )
+        if database_table.paths:
+            # Browse path
+            browse_paths = BrowsePathsClass(
+                paths=[
+                    f"{self.dataset_browse_prefix}/{path}"
+                    for path in sorted(database_table.paths, key=lambda p: (len(p), p))
+                ]
+            )
+            dataset_snapshot.aspects.append(browse_paths)
+        else:
+            logger.debug(
+                f"Table {database_table.urn} has no browse path (likely external upstream table)"
+            )
+            # Continue to emit entity with other aspects
+
+        schema_metadata = self.get_schema_metadata_for_table(
+            tableau_columns, database_table.parsed_columns
+        )
+        if schema_metadata is not None:
+            dataset_snapshot.aspects.append(schema_metadata)
+
+        if not dataset_snapshot.aspects:
+            # This should only happen with ingest_tables_external enabled.
+            logger.warning(
+                f"Urn {database_table.urn} has no real aspects, adding a key aspect to ensure materialization"
+            )
+            dataset_snapshot.aspects.append(dataset_urn.to_key_aspect())
+
+        yield self.get_metadata_change_event(dataset_snapshot)
+
+    def get_schema_metadata_for_table(
+        self,
+        tableau_columns: Optional[List[Dict[str, Any]]],
+        parsed_columns: Optional[Set[str]] = None,
+    ) -> Optional[SchemaMetadata]:
+        schema_metadata: Optional[SchemaMetadata] = None
+
+        fields = []
+
+        if tableau_columns:
+            for field in tableau_columns:
+                if field.get(c.NAME) is None:
+                    self.report.num_table_field_skipped_no_name += 1
+                    logger.warning(
+                        f"Skipping field {field[c.ID]} from schema since its name is none"
+                    )
+                    continue
+                nativeDataType = field.get(c.REMOTE_TYPE, c.UNKNOWN)
+                TypeClass = FIELD_TYPE_MAPPING.get(nativeDataType, NullTypeClass)
+
+                schema_field = SchemaField(
+                    fieldPath=field[c.NAME],
+                    type=SchemaFieldDataType(type=TypeClass()),
+                    description=field.get(c.DESCRIPTION),
+                    nativeDataType=nativeDataType,
+                )
+
+                fields.append(schema_field)
+
+        if parsed_columns:
+            remaining_columns = (
+                parsed_columns.difference(map(lambda x: x.get(c.NAME), tableau_columns))
+                if tableau_columns
+                else parsed_columns
+            )
+            remaining_schema_fields = [
+                SchemaField(
+                    fieldPath=col,
+                    type=SchemaFieldDataType(type=NullTypeClass()),
+                    description="",
+                    nativeDataType=c.UNKNOWN,
+                )
+                for col in remaining_columns
+            ]
+            fields.extend(remaining_schema_fields)
+
+        if fields:
+            schema_metadata = SchemaMetadata(
+                schemaName="test",
+                platform=f"urn:li:dataPlatform:{self.platform}",
+                version=0,
+                fields=fields,
+                hash="",
+                platformSchema=OtherSchema(rawSchema=""),
+            )
+
+        # TODO: optionally add logic that will lookup current table schema from DataHub
+        # and merge it together with what was inferred during current run, it allows incrementally
+        # ingest different Tableau projects sharing the same tables
+
+        return schema_metadata
+
+    def get_sheetwise_upstream_datasources(self, sheet: dict) -> set:
+        sheet_upstream_datasources = set()
+
+        for field in sheet.get(c.DATA_SOURCE_FIELDS) or []:
+            if field and field.get(c.DATA_SOURCE):
+                sheet_upstream_datasources.add(field[c.DATA_SOURCE][c.ID])
+
+        return sheet_upstream_datasources
+
+    @staticmethod
+    def _create_datahub_chart_usage_stat(
+        usage_stat: UsageStat,
+    ) -> ChartUsageStatisticsClass:
+        return ChartUsageStatisticsClass(
+            timestampMillis=round(datetime.now().timestamp() * 1000),
+            viewsCount=usage_stat.view_count,
+        )
+
+    def _get_chart_stat_wu(
+        self, sheet: dict, sheet_urn: str
+    ) -> Optional[MetadataWorkUnit]:
+        luid: Optional[str] = sheet.get(c.LUID)
+        if luid is None:
+            logger.debug(
+                "stat:luid is none for sheet %s(id:%s)",
+                sheet.get(c.NAME),
+                sheet.get(c.ID),
+            )
+            return None
+        usage_stat: Optional[UsageStat] = self.tableau_stat_registry.get(luid)
+        if usage_stat is None:
+            logger.debug(
+                "stat:UsageStat is not available in tableau_stat_registry for sheet %s(id:%s)",
+                sheet.get(c.NAME),
+                sheet.get(c.ID),
+            )
+            return None
+
+        aspect: ChartUsageStatisticsClass = self._create_datahub_chart_usage_stat(
+            usage_stat
+        )
+        logger.debug(
+            "stat: Chart usage stat work unit is created for %s(id:%s)",
+            sheet.get(c.NAME),
+            sheet.get(c.ID),
+        )
+        return MetadataChangeProposalWrapper(
+            aspect=aspect,
+            entityUrn=sheet_urn,
+        ).as_workunit()
+
+    def emit_sheets(self) -> Iterable[MetadataWorkUnit]:
+        sheets_filter = {c.ID_WITH_IN: self.sheet_ids}
+
+        for sheet in self.get_connection_objects(
+            query=sheet_graphql_query,
+            connection_type=c.SHEETS_CONNECTION,
+            query_filter=sheets_filter,
+            page_size=self.config.effective_sheet_page_size,
+        ):
+            if self._should_ingest_worksheet(sheet):
+                yield from self.emit_sheets_as_charts(sheet, sheet.get(c.WORKBOOK))
+            else:
+                self.report.num_hidden_assets_skipped += 1
+                logger.debug(
+                    f"Skip view {sheet.get(c.ID)} because it's hidden (luid is blank)."
+                )
+
+    def emit_sheets_as_charts(
+        self, sheet: dict, workbook: Optional[Dict]
+    ) -> Iterable[MetadataWorkUnit]:
+        sheet_urn: str = builder.make_chart_urn(
+            self.platform, sheet[c.ID], self.config.platform_instance
+        )
+        chart_snapshot = ChartSnapshot(
+            urn=sheet_urn,
+            aspects=[self.get_data_platform_instance()],
+        )
+
+        creator: Optional[str] = None
+        if workbook is not None and workbook.get(c.OWNER) is not None:
+            creator = self._get_owner_identifier(workbook[c.OWNER])
+        created_at = sheet.get(c.CREATED_AT, datetime.now())
+        updated_at = sheet.get(c.UPDATED_AT, datetime.now())
+        last_modified = self.get_last_modified(creator, created_at, updated_at)
+
+        if sheet.get(c.PATH):
+            site_part = (
+                f"/site/{self.site_content_url}" if self.site_content_url else ""
+            )
+            sheet_external_url = (
+                f"{self.config.connect_uri}/#{site_part}/views/{sheet.get(c.PATH)}"
+            )
+        elif (
+            sheet.get(c.CONTAINED_IN_DASHBOARDS) is not None
+            and len(sheet[c.CONTAINED_IN_DASHBOARDS]) > 0
+            and sheet[c.CONTAINED_IN_DASHBOARDS][0] is not None
+            and sheet[c.CONTAINED_IN_DASHBOARDS][0].get(c.PATH)
+        ):
+            # sheet contained in dashboard
+            site_part = f"/t/{self.site_content_url}" if self.site_content_url else ""
+            dashboard_path = sheet[c.CONTAINED_IN_DASHBOARDS][0][c.PATH]
+            sheet_external_url = f"{self.config.connect_uri}{site_part}/authoring/{dashboard_path}/{quote(sheet.get(c.NAME, ''), safe='')}"
+        else:
+            # hidden or viz-in-tooltip sheet
+            sheet_external_url = None
+        input_fields: List[InputField] = []
+        if sheet.get(c.DATA_SOURCE_FIELDS):
+            self.populate_sheet_upstream_fields(sheet, input_fields)
+
+        datasource_urn = []
+        data_sources = self.get_sheetwise_upstream_datasources(sheet)
+
+        for ds_id in data_sources:
+            ds_urn = builder.make_dataset_urn_with_platform_instance(
+                self.platform, ds_id, self.config.platform_instance, self.config.env
+            )
+            datasource_urn.append(ds_urn)
+            if ds_id not in self.datasource_ids_being_used:
+                self.datasource_ids_being_used.append(ds_id)
+
+        # Chart Info
+        chart_info = ChartInfoClass(
+            description="",
+            title=sheet.get(c.NAME) or "",
+            lastModified=last_modified,
+            externalUrl=(
+                sheet_external_url
+                if self.config.ingest_external_links_for_charts
+                else None
+            ),
+            inputs=sorted(datasource_urn),
+            customProperties=self.get_custom_props_from_dict(sheet, [c.LUID]),
+        )
+        chart_snapshot.aspects.append(chart_info)
+        # chart_snapshot doesn't support the stat aspect as list element and hence need to emit MCP
+
+        if self.config.extract_usage_stats:
+            wu = self._get_chart_stat_wu(sheet, sheet_urn)
+            if wu is not None:
+                yield wu
+
+        browse_paths = self.get_browse_paths_aspect(workbook)
+        if browse_paths:
+            chart_snapshot.aspects.append(browse_paths)
+        else:
+            logger.warning(
+                f"Could not set browse path for workbook {sheet[c.ID]}. Please check permissions."
+            )
+
+        # Ownership
+        owner = self._get_ownership(creator)
+        if owner is not None:
+            chart_snapshot.aspects.append(owner)
+
+        #  Tags
+        if self.config.ingest_tags:
+            tags = self.get_tags(sheet)
+            if len(self.config.tags_for_hidden_assets) > 0 and self._is_hidden_view(
+                sheet
+            ):
+                tags.extend(self.config.tags_for_hidden_assets)
+
+            chart_snapshot.aspects.append(
+                builder.make_global_tag_aspect_with_tag_list(tags)
+            )
+
+        yield self.get_metadata_change_event(chart_snapshot)
+        if sheet_external_url is not None and self.config.ingest_embed_url is True:
+            yield self.new_work_unit(
+                self.new_embed_aspect_mcp(
+                    entity_urn=sheet_urn,
+                    embed_url=sheet_external_url,
+                )
+            )
+        if workbook is not None:
+            yield from add_entity_to_container(
+                self.gen_workbook_key(workbook[c.ID]), c.CHART, chart_snapshot.urn
+            )
+
+        if input_fields:
+            yield MetadataChangeProposalWrapper(
+                entityUrn=sheet_urn,
+                aspect=InputFields(
+                    fields=sorted(input_fields, key=lambda x: x.schemaFieldUrn)
+                ),
+            ).as_workunit()
+
+    def _project_luid_to_browse_path_name(self, project_luid: str) -> str:
+        assert project_luid
+        project: TableauProject = self.tableau_project_registry[project_luid]
+        normalised_path: List[str] = [
+            p.replace("/", REPLACE_SLASH_CHAR) for p in project.path
+        ]
+        return "/".join(normalised_path)
+
+    def _get_project_path(self, project: TableauProject) -> str:
+        return self.config.project_path_separator.join(project.path)
+
+    def populate_sheet_upstream_fields(
+        self, sheet: dict, input_fields: List[InputField]
+    ) -> None:
+        for field in sheet.get(c.DATA_SOURCE_FIELDS):  # type: ignore
+            if not field:
+                continue
+            name = field.get(c.NAME)
+            upstream_ds_id = (
+                field.get(c.DATA_SOURCE)[c.ID] if field.get(c.DATA_SOURCE) else None
+            )
+            if name and upstream_ds_id:
+                input_fields.append(
+                    InputField(
+                        schemaFieldUrn=builder.make_schema_field_urn(
+                            parent_urn=builder.make_dataset_urn_with_platform_instance(
+                                self.platform,
+                                upstream_ds_id,
+                                self.config.platform_instance,
+                                self.config.env,
+                            ),
+                            field_path=name,
+                        ),
+                        schemaField=tableau_field_to_schema_field(
+                            field, self.config.ingest_tags
+                        ),
+                    )
+                )
+
+    def emit_workbook_as_container(self, workbook: Dict) -> Iterable[MetadataWorkUnit]:
+        workbook_container_key = self.gen_workbook_key(workbook[c.ID])
+        creator = self._get_owner_identifier(workbook.get(c.OWNER, {}))
+
+        owner_urn = (
+            builder.make_user_urn(creator)
+            if (creator and self.config.ingest_owner)
+            else None
+        )
+
+        site_part = f"/site/{self.site_content_url}" if self.site_content_url else ""
+        workbook_uri = workbook.get("uri")
+        workbook_part = (
+            workbook_uri[workbook_uri.index("/workbooks/") :] if workbook_uri else None
+        )
+        workbook_external_url = (
+            f"{self.config.connect_uri}/#{site_part}{workbook_part}"
+            if workbook_part
+            else None
+        )
+
+        tags = self.get_tags(workbook) if self.config.ingest_tags else None
+
+        parent_key = None
+        project_luid: Optional[str] = self._get_workbook_project_luid(workbook)
+        if project_luid and project_luid in self.tableau_project_registry:
+            parent_key = self.gen_project_key(project_luid)
+        else:
+            workbook_id: Optional[str] = workbook.get(c.ID)
+            workbook_name: Optional[str] = workbook.get(c.NAME)
+            logger.warning(
+                f"Could not load project hierarchy for workbook {workbook_name}({workbook_id}). Please check permissions."
+            )
+
+        custom_props: Optional[Dict] = None
+        if (
+            self.config.permission_ingestion
+            and self.config.permission_ingestion.enable_workbooks
+        ):
+            workbook_luid = workbook.get(c.LUID)
+            logger.debug(f"Ingest access roles of workbook-id='{workbook_luid}'")
+            if workbook_luid:
+                workbook_instance = self.server.workbooks.get_by_id(workbook_luid)
+                self.server.workbooks.populate_permissions(workbook_instance)
+                custom_props = self._create_workbook_properties(
+                    workbook_instance.permissions
+                )
+            else:
+                self.report.warning(
+                    title="Workbook permissions skipped",
+                    message="Workbook has no LUID, so its access roles could not be ingested.",
+                    context=f"name={workbook.get(c.NAME)}, id={workbook.get(c.ID)}",
+                )
+
+        luid_props: Dict = (
+            {c.LUID: str(workbook[c.LUID])} if workbook.get(c.LUID) else {}
+        )
+        extra_props = {**luid_props, **(custom_props or {})}
+
+        yield from gen_containers(
+            container_key=workbook_container_key,
+            name=workbook.get(c.NAME) or "",
+            parent_container_key=parent_key,
+            description=workbook.get(c.DESCRIPTION),
+            sub_types=[BIContainerSubTypes.TABLEAU_WORKBOOK],
+            owner_urn=owner_urn,
+            external_url=workbook_external_url,
+            extra_properties=extra_props or None,
+            tags=tags,
+        )
+
+    def gen_workbook_key(self, workbook_id: str) -> WorkbookKey:
+        return WorkbookKey(
+            platform=self.platform,
+            instance=self.config.platform_instance,
+            workbook_id=workbook_id,
+        )
+
+    def gen_project_key(self, project_luid: str) -> ProjectKey:
+        return ProjectKey(
+            platform=self.platform,
+            instance=self.config.platform_instance,
+            project_id=project_luid,
+        )
+
+    def gen_site_key(self, site_id: str) -> SiteKey:
+        return SiteKey(
+            platform=self.platform,
+            instance=self.config.platform_instance,
+            site_id=site_id,
+        )
+
+    @staticmethod
+    def _create_datahub_dashboard_usage_stat(
+        usage_stat: UsageStat,
+    ) -> DashboardUsageStatisticsClass:
+        return DashboardUsageStatisticsClass(
+            timestampMillis=round(datetime.now().timestamp() * 1000),
+            # favoritesCount=looker_dashboard.favorite_count,  It is available in REST API response,
+            # however not exposed by tableau python library
+            viewsCount=usage_stat.view_count,
+            # lastViewedAt=looker_dashboard.last_viewed_at, Not available
+        )
+
+    def _get_dashboard_stat_wu(
+        self, dashboard: dict, dashboard_urn: str
+    ) -> Optional[MetadataWorkUnit]:
+        luid: Optional[str] = dashboard.get(c.LUID)
+        if luid is None:
+            logger.debug(
+                "stat:luid is none for dashboard %s(id:%s)",
+                dashboard.get(c.NAME),
+                dashboard.get(c.ID),
+            )
+            return None
+        usage_stat: Optional[UsageStat] = self.tableau_stat_registry.get(luid)
+        if usage_stat is None:
+            logger.debug(
+                "stat:UsageStat is not available in tableau_stat_registry for dashboard %s(id:%s)",
+                dashboard.get(c.NAME),
+                dashboard.get(c.ID),
+            )
+            return None
+
+        aspect: DashboardUsageStatisticsClass = (
+            self._create_datahub_dashboard_usage_stat(usage_stat)
+        )
+        logger.debug(
+            "stat: Dashboard usage stat is created for %s(id:%s)",
+            dashboard.get(c.NAME),
+            dashboard.get(c.ID),
+        )
+
+        return MetadataChangeProposalWrapper(
+            aspect=aspect,
+            entityUrn=dashboard_urn,
+        ).as_workunit()
+
+    @staticmethod
+    def new_embed_aspect_mcp(
+        entity_urn: str, embed_url: str
+    ) -> MetadataChangeProposalWrapper:
+        return MetadataChangeProposalWrapper(
+            entityUrn=entity_urn,
+            aspect=EmbedClass(renderUrl=embed_url),
+        )
+
+    def new_work_unit(self, mcp: MetadataChangeProposalWrapper) -> MetadataWorkUnit:
+        return MetadataWorkUnit(
+            id="{PLATFORM}-{ENTITY_URN}-{ASPECT_NAME}".format(
+                PLATFORM=self.platform,
+                ENTITY_URN=mcp.entityUrn,
+                ASPECT_NAME=mcp.aspectName,
+            ),
+            mcp=mcp,
+        )
+
+    def emit_dashboards(self) -> Iterable[MetadataWorkUnit]:
+        dashboards_filter = {c.ID_WITH_IN: self.dashboard_ids}
+
+        for dashboard in self.get_connection_objects(
+            query=dashboard_graphql_query,
+            connection_type=c.DASHBOARDS_CONNECTION,
+            query_filter=dashboards_filter,
+            page_size=self.config.effective_dashboard_page_size,
+        ):
+            if self._should_ingest_dashboard(dashboard):
+                yield from self.emit_dashboard(dashboard, dashboard.get(c.WORKBOOK))
+            else:
+                self.report.num_hidden_assets_skipped += 1
+                logger.debug(
+                    f"Skip dashboard {dashboard.get(c.ID)} because it's hidden (luid is blank)."
+                )
+
+    def get_tags(self, obj: dict) -> List[str]:
+        tag_list = obj.get(c.TAGS, [])
+        if tag_list:
+            tag_list_str = [
+                t[c.NAME] for t in tag_list if t is not None and t.get(c.NAME)
+            ]
+
+            return tag_list_str
+        return []
+
+    def emit_dashboard(
+        self, dashboard: dict, workbook: Optional[Dict]
+    ) -> Iterable[MetadataWorkUnit]:
+        dashboard_urn: str = builder.make_dashboard_urn(
+            self.platform, dashboard[c.ID], self.config.platform_instance
+        )
+        dashboard_snapshot = DashboardSnapshot(
+            urn=dashboard_urn,
+            aspects=[self.get_data_platform_instance()],
+        )
+
+        creator: Optional[str] = None
+        if workbook is not None and workbook.get(c.OWNER) is not None:
+            creator = self._get_owner_identifier(workbook[c.OWNER])
+        created_at = dashboard.get(c.CREATED_AT, datetime.now())
+        updated_at = dashboard.get(c.UPDATED_AT, datetime.now())
+        last_modified = self.get_last_modified(creator, created_at, updated_at)
+
+        site_part = f"/site/{self.site_content_url}" if self.site_content_url else ""
+        dashboard_external_url = (
+            f"{self.config.connect_uri}/#{site_part}/views/{dashboard.get(c.PATH, '')}"
+        )
+        title = (
+            dashboard[c.NAME].replace("/", REPLACE_SLASH_CHAR)
+            if dashboard.get(c.NAME)
+            else ""
+        )
+        chart_urns = [
+            builder.make_chart_urn(
+                self.platform,
+                sheet.get(c.ID),
+                self.config.platform_instance,
+            )
+            for sheet in dashboard.get(c.SHEETS, [])
+        ]
+        dashboard_info_class = DashboardInfoClass(
+            description="",
+            title=title,
+            charts=chart_urns,
+            lastModified=last_modified,
+            dashboardUrl=(
+                dashboard_external_url
+                if self.config.ingest_external_links_for_dashboards
+                else None
+            ),
+            customProperties=self.get_custom_props_from_dict(dashboard, [c.LUID]),
+        )
+        dashboard_snapshot.aspects.append(dashboard_info_class)
+
+        if self.config.ingest_tags:
+            tags = self.get_tags(dashboard)
+            if len(self.config.tags_for_hidden_assets) > 0 and self._is_hidden_view(
+                dashboard
+            ):
+                tags.extend(self.config.tags_for_hidden_assets)
+
+            dashboard_snapshot.aspects.append(
+                builder.make_global_tag_aspect_with_tag_list(tags)
+            )
+
+        if self.config.extract_usage_stats:
+            # dashboard_snapshot doesn't support the stat aspect as list element and hence need to emit MetadataWorkUnit
+            wu = self._get_dashboard_stat_wu(dashboard, dashboard_urn)
+            if wu is not None:
+                yield wu
+
+        browse_paths = self.get_browse_paths_aspect(workbook)
+        if browse_paths:
+            dashboard_snapshot.aspects.append(browse_paths)
+        else:
+            logger.warning(
+                f"Could not set browse path for dashboard {dashboard[c.ID]}. Please check permissions."
+            )
+
+        # Ownership
+        owner = self._get_ownership(creator)
+        if owner is not None:
+            dashboard_snapshot.aspects.append(owner)
+
+        yield self.get_metadata_change_event(dashboard_snapshot)
+        # Yield embed MCP
+        if self.config.ingest_embed_url is True:
+            yield self.new_work_unit(
+                self.new_embed_aspect_mcp(
+                    entity_urn=dashboard_urn,
+                    embed_url=dashboard_external_url,
+                )
+            )
+
+        if workbook is not None:
+            yield from add_entity_to_container(
+                self.gen_workbook_key(workbook[c.ID]),
+                c.DASHBOARD,
+                dashboard_snapshot.urn,
+            )
+
+    def get_browse_paths_aspect(
+        self, workbook: Optional[Dict]
+    ) -> Optional[BrowsePathsClass]:
+        browse_paths: Optional[BrowsePathsClass] = None
+        if workbook and workbook.get(c.NAME):
+            project_luid: Optional[str] = self._get_workbook_project_luid(workbook)
+            if project_luid in self.tableau_project_registry:
+                browse_paths = BrowsePathsClass(
+                    paths=[
+                        f"{self.no_env_browse_prefix}/{self._project_luid_to_browse_path_name(project_luid)}"
+                        f"/{workbook[c.NAME].replace('/', REPLACE_SLASH_CHAR)}"
+                    ]
+                )
+
+            elif workbook.get(c.PROJECT_NAME):
+                # browse path
+                browse_paths = BrowsePathsClass(
+                    paths=[
+                        f"{self.no_env_browse_prefix}/{workbook[c.PROJECT_NAME].replace('/', REPLACE_SLASH_CHAR)}"
+                        f"/{workbook[c.NAME].replace('/', REPLACE_SLASH_CHAR)}"
+                    ]
+                )
+
+        return browse_paths
+
+    def emit_embedded_datasources(self) -> Iterable[MetadataWorkUnit]:
+        datasource_filter = (
+            {}
+            if self.config.emit_all_embedded_datasources
+            else {c.ID_WITH_IN: self.embedded_datasource_ids_being_used}
+        )
+
+        for datasource in self.get_connection_objects(
+            query=embedded_datasource_graphql_query,
+            connection_type=c.EMBEDDED_DATA_SOURCES_CONNECTION,
+            query_filter=datasource_filter,
+            page_size=self.config.effective_embedded_datasource_page_size,
+        ):
+            datasource = self.update_datasource_for_field_upstream(
+                datasource=datasource,
+                field_upstream_query=datasource_upstream_fields_graphql_query,
+                page_size=self.config.effective_embedded_datasource_field_upstream_page_size,
+            )
+            yield from self.emit_datasource(
+                datasource,
+                datasource.get(c.WORKBOOK),
+                is_embedded_ds=True,
+            )
+
+    @lru_cache(maxsize=None)
+    def get_last_modified(
+        self, creator: Optional[str], created_at: bytes, updated_at: bytes
+    ) -> ChangeAuditStamps:
+        last_modified = ChangeAuditStamps()
+        if creator:
+            modified_actor = builder.make_user_urn(creator)
+            created_ts = int(dp.parse(created_at).timestamp() * 1000)
+            modified_ts = int(dp.parse(updated_at).timestamp() * 1000)
+            last_modified = ChangeAuditStamps(
+                created=AuditStamp(time=created_ts, actor=modified_actor),
+                lastModified=AuditStamp(time=modified_ts, actor=modified_actor),
+            )
+        return last_modified
+
+    def _get_owner_identifier(self, owner_dict: dict) -> Optional[str]:
+        """Extract owner identifier (email or username) based on configuration."""
+        if not owner_dict:
+            return None
+
+        if self.config.use_email_as_username:
+            email = owner_dict.get(c.EMAIL)
+            if email:
+                return email
+            # Fall back to username if email is not available
+            self.report.num_email_fallback_to_username += 1
+
+        return owner_dict.get(c.USERNAME)
+
+    @lru_cache(maxsize=None)
+    def _get_ownership(self, user: str) -> Optional[OwnershipClass]:
+        if self.config.ingest_owner and user:
+            owner_urn = builder.make_user_urn(user)
+            ownership: OwnershipClass = OwnershipClass(
+                owners=[
+                    OwnerClass(
+                        owner=owner_urn,
+                        type=OwnershipTypeClass.DATAOWNER,
+                    )
+                ]
+            )
+            return ownership
+
+        return None
+
+    def emit_project_containers(
+        self, all_project_map: Dict[str, TableauProject]
+    ) -> Iterable[MetadataWorkUnit]:
+        generated_project_keys: Set[str] = set()
+
+        def emit_project_in_topological_order(
+            project_: TableauProject,
+        ) -> Iterable[MetadataWorkUnit]:
+            """
+            The source_helpers.py file includes a function called auto_browse_path_v2 that automatically generates
+            BrowsePathsV2. This auto-generation relies on the correct sequencing of MetadataWorkUnit containers.
+            The emit_project_in_topological_order function ensures that parent containers are emitted before their child
+            containers.
+            This is a recursive function.
+            """
+            project_key: ProjectKey = self.gen_project_key(project_.id)
+
+            if project_key.guid() in generated_project_keys:
+                return
+
+            generated_project_keys.add(project_key.guid())
+
+            parent_project_key: Optional[Union[ProjectKey, SiteKey]] = (
+                None  # It is going
+            )
+            # to be used as a parent container key for the current tableau project
+
+            if project_.parent_id is not None:
+                # Go to the parent project as we need to generate container first for parent
+                parent_project_key = self.gen_project_key(project_.parent_id)
+
+                # Resolve from the full project map so we recurse to the root even
+                # through filtered-out ancestors. _get_all_project nulls out any
+                # parent_id absent from the map, so this always resolves; guard it so a
+                # future regression fails with context, not a bare KeyError.
+                parent_tableau_project = all_project_map.get(project_.parent_id)
+                if parent_tableau_project is None:
+                    raise ValueError(
+                        f"parent_id {project_.parent_id!r} of project "
+                        f"{project_.name!r} ({project_.id!r}) is missing from the "
+                        f"project map; expected _get_all_project to have nulled it out."
+                    )
+
+                yield from emit_project_in_topological_order(parent_tableau_project)
+
+            else:
+                # This is a root Tableau project since the parent_project_id is None.
+                # For a root project, either the site is the parent, or the platform is the default parent.
+                if self.config.add_site_container:
+                    # The site containers have already been generated by emit_site_container, so we
+                    # don't need to emit them again here.
+                    parent_project_key = self.gen_site_key(self.site_id)
+
+            owner_urn: Optional[str] = None
+            if self.config.ingest_owner and (
+                project_.owner_username or project_.owner_email
+            ):
+                owner_identifier = self._get_owner_identifier(
+                    {
+                        c.USERNAME: project_.owner_username,
+                        c.EMAIL: project_.owner_email,
+                    }
+                )
+                if owner_identifier:
+                    owner_urn = builder.make_user_urn(owner_identifier)
+
+            yield from gen_containers(
+                container_key=project_key,
+                name=project_.name,
+                description=project_.description,
+                sub_types=[BIContainerSubTypes.TABLEAU_PROJECT],
+                parent_container_key=parent_project_key,
+                owner_urn=owner_urn,
+            )
+
+        for project in self.tableau_project_registry.values():
+            logger.debug(
+                f"project {project.name} and it's parent {project.parent_name} and parent id {project.parent_id}"
+            )
+            yield from emit_project_in_topological_order(project)
+
+    def emit_site_container(self):
+        if not self.site:
+            logger.warning("Can not ingest site container. No site information found.")
+            return
+
+        yield from gen_containers(
+            container_key=self.gen_site_key(self.site_id),
+            name=self.site.name or "Default",
+            sub_types=[BIContainerSubTypes.TABLEAU_SITE],
+        )
+
+    def _fetch_groups(self):
+        for group in TSC.Pager(self.server.groups):
+            if group.id is None:
+                self.report.warning(
+                    title="Group without an id skipped",
+                    message="A group returned by the Tableau API has no id and was excluded from the group map.",
+                    context=f"name={group.name}",
+                )
+                continue
+            self.group_map[group.id] = group
+
+    def _get_allowed_capabilities(self, capabilities: Dict[str, str]) -> List[str]:
+        if not self.config.permission_ingestion:
+            return []
+
+        allowed_capabilities = [
+            key for key, value in capabilities.items() if value == "Allow"
+        ]
+        return allowed_capabilities
+
+    def _create_workbook_properties(
+        self, permissions: List[PermissionsRule]
+    ) -> Optional[Dict[str, str]]:
+        if not self.config.permission_ingestion:
+            return None
+
+        groups = []
+        for rule in permissions:
+            if rule.grantee.tag_name == "group":
+                grantee_id = rule.grantee.id
+                group = self.group_map.get(grantee_id) if grantee_id else None
+                if not group or not group.name:
+                    logger.debug(f"Group {rule.grantee.id} not found in group map.")
+                    continue
+                if not self.config.permission_ingestion.group_name_pattern.allowed(
+                    group.name
+                ):
+                    logger.info(
+                        f"Skip permission '{group.name}' as it's excluded in group_name_pattern."
+                    )
+                    continue
+
+                capabilities = self._get_allowed_capabilities(rule.capabilities)
+                groups.append({"group": group.name, "capabilities": capabilities})
+
+        return {"permissions": json.dumps(groups)} if len(groups) > 0 else None
+
+    def _find_matching_database_table(self, vc_table_name: str) -> Optional[dict]:
+        """Find matching database table using multiple name strategies."""
+        if not self.db_tables_lookup:
+            return None
+
+        clean_vc_name = clean_table_name(vc_table_name)
+        potential_names = [vc_table_name, clean_vc_name]
+
+        # Also try names extracted from "TABLE_NAME (SCHEMA.TABLE_NAME)" format
+        paren_match = re.search(r"^(.*?)\s*\((.*?)\)$", vc_table_name)
+        if paren_match:
+            potential_names.extend(
+                [paren_match.group(1).strip(), paren_match.group(2).strip()]
+            )
+
+        for potential_name in potential_names:
+            clean_potential = clean_table_name(potential_name).lower()
+
+            # Strategy 1: Direct exact match
+            if clean_potential in self.db_tables_lookup:
+                return self.db_tables_lookup[clean_potential]
+
+            # Strategy 2: Qualified suffix match (schema.table or database.table)
+            for db_name_key, db_table in self.db_tables_lookup.items():
+                if (
+                    db_name_key.endswith(f".{clean_potential}")
+                    and len(db_name_key.split(".")) >= 2
+                ):
+                    return db_table
+
+            # Strategy 3: Table name only
+            table_only = self._extract_table_name_only(potential_name)
+            if table_only and table_only.lower() != clean_potential:
+                if table_only.lower() in self.db_tables_lookup:
+                    return self.db_tables_lookup[table_only.lower()]
+
+        logger.debug(f"No database table match for VC table '{vc_table_name}'")
+        return None
+
+    def _create_database_table_urn(self, db_table: dict) -> Optional[str]:
+        """Create a DataHub URN for a database table fetched from Tableau's metadata API."""
+        try:
+            table_name = db_table.get(c.NAME, "")
+            full_name = db_table.get(c.FULL_NAME, "")
+            schema = db_table.get(c.SCHEMA, "")
+            database_info = db_table.get(c.DATABASE, {})
+
+            database_id: Optional[str]
+            if database_info and isinstance(database_info, dict):
+                connection_type = database_info.get(c.CONNECTION_TYPE)
+                database_name = database_info.get(c.NAME, "")
+                database_id = database_info.get(c.ID)
+            else:
+                connection_type = None
+                database_name = ""
+                database_id = None
+
+            raw_table_name = full_name or table_name
+            if not connection_type or not raw_table_name:
+                return None
+
+            (
+                upstream_db,
+                platform_instance,
+                platform,
+                _,
+            ) = get_overridden_info(
+                connection_type=connection_type,
+                upstream_db=database_name,
+                upstream_db_id=database_id,
+                lineage_overrides=self.config.lineage_overrides,
+                platform_instance_map=self.config.platform_instance_map,
+                database_hostname_to_platform_instance_map=self.config.database_hostname_to_platform_instance_map,
+                database_server_hostname_map=self.database_server_hostname_map,
+                database_id_to_platform_instance_map=self.config.database_id_to_platform_instance_map,
+            )
+
+            fully_qualified_name = get_fully_qualified_table_name(
+                platform=platform,
+                upstream_db=upstream_db or "",
+                schema=schema,
+                table_name=raw_table_name,
+            )
+
+            return builder.make_dataset_urn_with_platform_instance(
+                platform=platform,
+                name=fully_qualified_name,
+                platform_instance=platform_instance,
+                env=self.config.env,
+            )
+
+        except Exception as e:
+            logger.warning(f"Failed to create database table URN: {e}")
+            logger.debug(f"Database table data: {db_table}")
+            return None
+
+    def _build_database_tables_lookup(self) -> None:
+        """Build a multi-key lookup of database tables for VC→DB table matching.
+
+        Stores each table under several name variations (original, full, table-only,
+        fully-qualified, database.table, schema.table) to maximise match rate against
+        VC table names returned by Tableau's Metadata API.
+        """
+        if self.db_tables_lookup:
+            return
+
+        for db_table in self.get_connection_objects(
+            query=database_tables_graphql_query,
+            connection_type=c.DATABASE_TABLES_CONNECTION,
+            query_filter={},
+            page_size=self.config.effective_database_table_page_size,
+        ):
+            name = db_table.get(c.NAME, "")
+            full_name = db_table.get(c.FULL_NAME, "")
+            schema = db_table.get(c.SCHEMA, "")
+            database_info = db_table.get(c.DATABASE, {})
+            database_name = database_info.get(c.NAME, "") if database_info else ""
+            connection_type = (
+                database_info.get(c.CONNECTION_TYPE, "") if database_info else ""
+            )
+
+            if not name or not connection_type:
+                continue
+
+            name_variations: set = set()
+            name_variations.add(name.lower())
+            if full_name and full_name != name:
+                name_variations.add(full_name.lower())
+
+            table_name_only = self._extract_table_name_only(name)
+            if table_name_only:
+                name_variations.add(table_name_only.lower())
+            if full_name:
+                full_table_name_only = self._extract_table_name_only(full_name)
+                if full_table_name_only and full_table_name_only != table_name_only:
+                    name_variations.add(full_table_name_only.lower())
+
+            if database_name and schema and table_name_only:
+                try:
+                    fq_name = get_fully_qualified_table_name(
+                        platform=get_platform(connection_type),
+                        upstream_db=database_name,
+                        schema=schema,
+                        table_name=table_name_only,
+                    )
+                    name_variations.add(fq_name.lower())
+                except Exception:
+                    pass
+
+            if database_name and table_name_only:
+                name_variations.add(f"{database_name}.{table_name_only}".lower())
+            if schema and table_name_only:
+                name_variations.add(f"{schema}.{table_name_only}".lower())
+
+            for variation in name_variations:
+                if variation and variation not in self.db_tables_lookup:
+                    self.db_tables_lookup[variation] = db_table
+
+        logger.debug(
+            f"Built database tables lookup with {len(self.db_tables_lookup)} entries"
+        )
+
+    def _extract_table_name_only(self, full_name: str) -> Optional[str]:
+        """Extract just the table name from a potentially qualified name"""
+        if not full_name:
+            return None
+
+        # Split by dots and take the last part (table name)
+        parts = full_name.split(".")
+        table_name = parts[-1].strip()
+
+        return table_name if table_name else None
+
+    def ingest_tableau_site(self):
+        with self.report.new_stage(
+            f"Ingesting Tableau Site: {self.site_id} {self.site_content_url}"
+        ):
+            # Initialise the dictionary to later look-up for chart and dashboard stat
+            if self.config.extract_usage_stats:
+                with PerfTimer() as timer:
+                    self._populate_usage_stat_registry()
+                    self.report.extract_usage_stats_timer[self.site_content_url] = (
+                        timer.elapsed_seconds(digits=2)
+                    )
+
+            if self.config.permission_ingestion:
+                with PerfTimer() as timer:
+                    self._fetch_groups()
+                    self.report.fetch_groups_timer[self.site_content_url] = (
+                        timer.elapsed_seconds(digits=2)
+                    )
+
+            # `is not None` rather than truthiness: an empty map is a valid way to opt
+            # into the per-server INFO log while working out which ids to route.
+            if (
+                self.config.database_hostname_to_platform_instance_map is not None
+                or self.config.database_id_to_platform_instance_map is not None
+            ):
+                with PerfTimer() as timer:
+                    self._populate_database_server_hostname_map()
+                    self.report.populate_database_server_hostname_map_timer[
+                        self.site_content_url
+                    ] = timer.elapsed_seconds(digits=2)
+
+            with PerfTimer() as timer:
+                all_project_map = self._populate_projects_registry()
+                self.report.populate_projects_registry_timer[self.site_content_url] = (
+                    timer.elapsed_seconds(digits=2)
+                )
+
+            # Database tables lookup is now handled conditionally during VC processing
+            # (only when there are actual VC references that need database table matching)
+
+            if self.config.add_site_container:
+                yield from self.emit_site_container()
+            yield from self.emit_project_containers(all_project_map)
+
+            with PerfTimer() as timer:
+                yield from self.emit_workbooks()
+                self.report.emit_workbooks_timer[self.site_content_url] = (
+                    timer.elapsed_seconds(digits=2)
+                )
+
+            if self.sheet_ids:
+                with PerfTimer() as timer:
+                    yield from self.emit_sheets()
+                    self.report.emit_sheets_timer[self.site_content_url] = (
+                        timer.elapsed_seconds(digits=2)
+                    )
+
+            if self.dashboard_ids:
+                with PerfTimer() as timer:
+                    yield from self.emit_dashboards()
+                    self.report.emit_dashboards_timer[self.site_content_url] = (
+                        timer.elapsed_seconds(digits=2)
+                    )
+
+            # STEP 1: Emit datasources first (VC references get collected during this step)
+            if self.embedded_datasource_ids_being_used:
+                with PerfTimer() as timer:
+                    yield from self.emit_embedded_datasources()
+                    self.report.emit_embedded_datasources_timer[
+                        self.site_content_url
+                    ] = timer.elapsed_seconds(digits=2)
+
+            if self.datasource_ids_being_used:
+                with PerfTimer() as timer:
+                    yield from self.emit_published_datasources()
+                    self.report.emit_published_datasources_timer[
+                        self.site_content_url
+                    ] = timer.elapsed_seconds(digits=2)
+
+            if self.config.ingest_virtual_connections:
+                try:
+                    if self.vc_processor.vc_table_ids_for_lookup:
+                        self.vc_processor.lookup_vc_ids_from_table_ids()
+                        try:
+                            self._build_database_tables_lookup()
+                        except Exception as e:
+                            logger.debug(f"Database tables lookup not available: {e}")
+                    else:
+                        logger.debug("No VC references found, skipping VC processing")
+                except Exception as e:
+                    logger.warning(f"Error building VC mappings: {e}")
+
+            if self.config.ingest_virtual_connections:
+                with PerfTimer() as timer:
+                    self.report.num_virtual_connections_table_references_found = len(
+                        self.vc_processor.vc_table_ids_for_lookup
+                    )
+                    self.report.num_virtual_connections_processed = len(
+                        self.vc_processor.virtual_connection_ids_being_used
+                    )
+
+                    logger.info(
+                        f"Virtual connections: {self.report.num_virtual_connections_table_references_found} table references found, "
+                        f"{self.report.num_virtual_connections_processed} VCs to process"
+                    )
+
+                    if self.vc_processor.virtual_connection_ids_being_used:
+                        yield from self.vc_processor.emit_virtual_connections()
+
+                    self.report.emit_virtual_connections_timer[
+                        self.site_content_url
+                    ] = timer.elapsed_seconds(digits=2)
+
+            if self.custom_sql_ids_being_used:
+                with PerfTimer() as timer:
+                    yield from self.emit_custom_sql_datasources()
+                    self.report.emit_custom_sql_datasources_timer[
+                        self.site_content_url
+                    ] = timer.elapsed_seconds(digits=2)
+
+            if self.database_tables:
+                with PerfTimer() as timer:
+                    yield from self.emit_upstream_tables()
+                    self.report.emit_upstream_tables_timer[self.site_content_url] = (
+                        timer.elapsed_seconds(digits=2)
+                    )
+
+            # Log owner extraction statistics if there were fallbacks
+            if (
+                self.config.use_email_as_username
+                and self.config.ingest_owner
+                and self.report.num_email_fallback_to_username > 0
+            ):
+                logger.info(
+                    f"Owner extraction summary for site '{self.site_content_url}': "
+                    f"{self.report.num_email_fallback_to_username} entities fell back from email to username "
+                    f"(email was not available)"
+                )

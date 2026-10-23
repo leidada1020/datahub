@@ -1,0 +1,106 @@
+namespace com.linkedin.ermodelrelation
+
+import com.linkedin.common.AuditStamp
+import com.linkedin.common.Urn
+import com.linkedin.common.CustomProperties
+
+/**
+ * Properties associated with a ERModelRelationship
+ */
+@Aspect = {
+  "name": "erModelRelationshipProperties",
+  "schemaVersion": 2
+}
+record ERModelRelationshipProperties includes CustomProperties {
+
+  /**
+   * Name of the ERModelRelation
+   */
+  @Searchable = {
+    "fieldType": "TEXT_PARTIAL",
+    "enableAutocomplete": true,
+    "boostScore": 10.0,
+    "v3": {
+      "searchLabel": "name",
+      "mappings": [
+        { "type": "KEYWORD" },
+        { "subfield": "text", "type": "TEXT" },
+        { "subfield": "stemmed", "type": "STEMMED" }
+      ]
+    }
+  }
+  name: string
+
+  /**
+  * First dataset in the erModelRelationship (no directionality)
+  */
+   @Relationship = {
+     "name": "ermodelrelationA",
+     "entityTypes": [ "dataset" ]
+   }
+  @Searchable = {
+    "fieldType": "TEXT_PARTIAL",
+    "enableAutocomplete": true,
+    "boostScore": 10.0
+  }
+  source: Urn
+
+  /**
+  * Second dataset in the erModelRelationship (no directionality)
+  */
+   @Relationship = {
+     "name": "ermodelrelationB",
+     "entityTypes": [ "dataset" ]
+   }
+  @Searchable = {
+    "fieldType": "TEXT_PARTIAL",
+    "enableAutocomplete": true,
+    "boostScore": 10.0
+  }
+  destination: Urn
+
+
+  /**
+   * ERModelRelationFieldMapping (in future we can make it an array)
+   */
+  relationshipFieldMappings: array [RelationshipFieldMapping]
+
+  /**
+   * A timestamp documenting when the asset was created in the source Data Platform (not on DataHub)
+   */
+  @Searchable = {
+    "/time": {
+      "fieldName": "createdAt",
+      "fieldType": "DATETIME",
+      "v3": {
+        "searchLabel": "sourceCreatedAt",
+        "mappings": [
+          { "type": "DATETIME" }
+        ]
+      }
+    }
+  }
+  created: optional AuditStamp
+
+  /**
+   * A timestamp documenting when the asset was last modified in the source Data Platform (not on DataHub)
+   */
+  @Searchable = {
+    "/time": {
+      "fieldName": "lastModifiedAt",
+      "fieldType": "DATETIME",
+      "v3": {
+        "searchLabel": "sourceLastModifiedAt",
+        "mappings": [
+          { "type": "DATETIME" }
+        ]
+      }
+    }
+  }
+  lastModified: optional AuditStamp
+
+  /**
+   * Cardinality of the relationship
+   */
+  cardinality: ERModelRelationshipCardinality = "N_N"
+}

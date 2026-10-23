@@ -1,0 +1,176 @@
+import { Empty, Table } from 'antd';
+import React, { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { useEntityData } from '@app/entity/shared/EntityContext';
+import TabHeader from '@app/entity/shared/tabs/Properties/TabHeader';
+import { PropertyRow } from '@app/entity/shared/tabs/Properties/types';
+import useUpdateExpandedRowsFromFilter from '@app/entity/shared/tabs/Properties/useUpdateExpandedRowsFromFilter';
+import {
+    getFilteredCustomProperties,
+    mapCustomPropertiesToPropertyRows,
+} from '@app/entity/shared/tabs/Properties/utils';
+import ExpandIcon from '@app/entityV2/shared/tabs/Dataset/Schema/components/ExpandIcon';
+import NameColumn from '@app/entityV2/shared/tabs/Properties/NameColumn';
+import ValuesColumn from '@app/entityV2/shared/tabs/Properties/ValuesColumn';
+import useStructuredProperties from '@app/entityV2/shared/tabs/Properties/useStructuredProperties';
+import { filterHiddenProperties } from '@app/entityV2/shared/tabs/Properties/utils';
+import { TabRenderType } from '@app/entityV2/shared/types';
+import Loading from '@app/sharedV2/Loading';
+import { useEntityRegistry } from '@app/useEntityRegistry';
+import { EditColumn } from '@src/app/entity/shared/tabs/Properties/Edit/EditColumn';
+import { Maybe, SchemaFieldEntity } from '@src/types.generated';
+
+const PROPERTY_ROW_KEY = 'qualifiedName';
+
+const StyledTable = styled(Table)`
+    &&& .ant-table-cell-with-append {
+        padding: 16px;
+    }
+    &&& .ant-table-tbody > tr > td {
+        border: none;
+    }
+    &&& .row-icon-container {
+        margin-bottom: 4px;
+    }
+` as typeof Table;
+
+const EmptyText = styled(Empty)`
+    font-size: 14px;
+`;
+
+interface Props {
+    properties?: {
+        fieldPath?: string;
+        fieldUrn?: string;
+        fieldEntity?: Maybe<SchemaFieldEntity>;
+        refetch?: () => void;
+        disableEdit?: boolean;
+        disableSearch?: boolean;
+    };
+    renderType?: TabRenderType;
+}
+
+export const PropertiesTab = ({ renderType = TabRenderType.DEFAULT, properties }: Props) => {
+    const { t } = useTranslation('entity.profile.tabs');
+    const { t: tc } = useTranslation('common.labels');
+    const fieldPath = properties?.fieldPath;
+    const fieldUrn = properties?.fieldUrn;
+    const fieldEntity = properties?.fieldEntity;
+    const fieldProperties = fieldEntity?.structuredProperties;
+    const refetch = properties?.refetch;
+    const [filterText, setFilterText] = useState('');
+    const { entityData } = useEntityData();
+    const entityRegistry = useEntityRegistry();
+
+    const {
+        structuredPropertyRows,
+        expandedRowsFromFilter,
+        loading: structuredPropertiesLoading,
+    } = useStructuredProperties(entityRegistry, fieldPath || null, filterText, fieldEntity);
+
+    // avoid flashing an empty table when revisiting this tab before the parent drawer's
+    // field entity has loaded
+    const isLoadingFieldProperties = !!fieldPath && !fieldEntity && structuredPropertiesLoading;
+
+    // only show entity custom properties on entity level, not on field level
+    const customProperties = !fieldPath ? getFilteredCustomProperties(filterText, entityData) || [] : [];
+    const customPropertyRows = mapCustomPropertiesToPropertyRows(customProperties);
+    const dataSource: PropertyRow[] = filterHiddenProperties(structuredPropertyRows)
+        .concat(customPropertyRows)
+        .filter((row) => !row.structuredProperty?.settings?.isHidden);
+
+    const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
+
+    useUpdateExpandedRowsFromFilter({ expandedRowsFromFilter, setExpandedRows });
+
+    const propertyTableColumns = [
+        {
+            width: '40%',
+            title: tc('name'),
+            render: (propertyRow: PropertyRow) => <NameColumn propertyRow={propertyRow} filterText={filterText} />,
+        },
+        {
+            title: tc('value'),
+            ellipsis: true,
+            render: (propertyRow: PropertyRow) => (
+                <ValuesColumn
+                    propertyRow={propertyRow}
+                    filterText={filterText}
+                    renderType={renderType}
+                    scopeKey={fieldPath ? `${entityData?.urn}:${fieldPath}` : (entityData?.urn ?? '')}
+                />
+            ),
+        },
+    ];
+
+    const canEditProperties =
+        (entityData?.parent?.privileges?.canEditProperties || entityData?.privileges?.canEditProperties) &&
+        !properties?.disableEdit;
+
+    if (canEditProperties) {
+        propertyTableColumns.push({
+            title: '',
+            width: '10%',
+            render: (propertyRow: PropertyRow) => (
+                <EditColumn
+                    structuredProperty={propertyRow.structuredProperty}
+                    associatedUrn={propertyRow.associatedUrn}
+                    values={propertyRow.values?.map((v) => v.value) || []}
+                    refetch={refetch}
+                />
+            ),
+        } as any);
+    }
+
+    return (
+        <>
+            {!properties?.disableSearch && (
+                <TabHeader
+                    setFilterText={setFilterText}
+                    fieldUrn={fieldUrn}
+                    fieldProperties={fieldProperties}
+                    refetch={refetch}
+                />
+            )}
+            <div data-testid="entity-properties-table">
+                {isLoadingFieldProperties ? (
+                    <Loading />
+                ) : (
+                    <StyledTable
+                        pagination={false}
+                        // typescript is complaining that default sort order is not a valid column field- overriding this here
+                        // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+                        // @ts-ignore
+                        columns={propertyTableColumns}
+                        dataSource={dataSource}
+                        locale={{
+                            emptyText: (
+                                <EmptyText description={t('properties.empty')} image={Empty.PRESENTED_IMAGE_SIMPLE} />
+                            ),
+                        }}
+                        rowKey={PROPERTY_ROW_KEY}
+                        expandable={{
+                            expandedRowKeys: [...Array.from(expandedRows)],
+                            defaultExpandAllRows: false,
+                            expandRowByClick: false,
+                            expandIcon: (props) => <ExpandIcon {...props} isCompact />,
+                            onExpand: (expanded, record) => {
+                                if (expanded) {
+                                    setExpandedRows((previousRows) => new Set(previousRows.add(record.qualifiedName)));
+                                } else {
+                                    setExpandedRows((previousRows) => {
+                                        previousRows.delete(record.qualifiedName);
+                                        return new Set(previousRows);
+                                    });
+                                }
+                            },
+                            indentSize: 16,
+                        }}
+                    />
+                )}
+            </div>
+        </>
+    );
+};

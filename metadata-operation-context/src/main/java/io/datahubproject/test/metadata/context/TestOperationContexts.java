@@ -1,0 +1,468 @@
+package io.datahubproject.test.metadata.context;
+
+import com.datahub.authentication.Actor;
+import com.datahub.authentication.ActorType;
+import com.datahub.authentication.Authentication;
+import com.datahub.authorization.config.ViewAuthorizationConfiguration;
+import com.datahub.context.OperationFingerprint;
+import com.datahub.plugins.auth.authorization.Authorizer;
+import com.linkedin.common.urn.Urn;
+import com.linkedin.data.schema.annotation.PathSpecBasedSchemaAnnotationVisitor;
+import com.linkedin.entity.Aspect;
+import com.linkedin.identity.CorpUserInfo;
+import com.linkedin.metadata.Constants;
+import com.linkedin.metadata.aspect.AspectRetriever;
+import com.linkedin.metadata.aspect.CachingAspectRetriever;
+import com.linkedin.metadata.aspect.GraphRetriever;
+import com.linkedin.metadata.config.search.EntityIndexConfiguration;
+import com.linkedin.metadata.config.search.EntityIndexVersionConfiguration;
+import com.linkedin.metadata.entity.SearchRetriever;
+import com.linkedin.metadata.models.registry.ConfigEntityRegistry;
+import com.linkedin.metadata.models.registry.EntityRegistry;
+import com.linkedin.metadata.models.registry.EntityRegistryException;
+import com.linkedin.metadata.models.registry.MergedEntityRegistry;
+import com.linkedin.metadata.models.registry.SnapshotEntityRegistry;
+import com.linkedin.metadata.snapshot.Snapshot;
+import com.linkedin.metadata.utils.elasticsearch.SearchClientShim;
+import com.linkedin.metadata.utils.elasticsearch.SearchClusterAccess;
+import io.datahubproject.metadata.context.ObjectMapperContext;
+import io.datahubproject.metadata.context.OperationContext;
+import io.datahubproject.metadata.context.OperationContextConfig;
+import io.datahubproject.metadata.context.PrimaryStorageContext;
+import io.datahubproject.metadata.context.RequestContext;
+import io.datahubproject.metadata.context.RetrieverContext;
+import io.datahubproject.metadata.context.SearchContext;
+import io.datahubproject.metadata.context.ServicesRegistryContext;
+import io.datahubproject.metadata.context.SystemTelemetryContext;
+import io.datahubproject.metadata.context.ValidationContext;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+
+/**
+ * Useful for testing. If the defaults are not sufficient, try using the .toBuilder() and replacing
+ * the parts that you are interested in customizing.
+ */
+public class TestOperationContexts {
+  public static final Authentication TEST_SYSTEM_AUTH =
+      new Authentication(new Actor(ActorType.USER, "testSystemUser"), "");
+  public static final Authentication TEST_USER_AUTH =
+      new Authentication(new Actor(ActorType.USER, "datahub"), "");
+
+  private static final OperationContextConfig DEFAULT_OPCONTEXT_CONFIG =
+      OperationContextConfig.builder()
+          .viewAuthorizationConfiguration(
+              ViewAuthorizationConfiguration.builder().enabled(false).build())
+          .build();
+
+  private static EntityRegistry defaultEntityRegistryInstance;
+  private static ValidationContext defaultValidationContext =
+      ValidationContext.builder().alternateValidation(false).build();
+
+  public static EntityRegistry defaultEntityRegistry() {
+    if (defaultEntityRegistryInstance == null) {
+      defaultEntityRegistryInstance = constructNewEntityRegistry();
+    }
+    return defaultEntityRegistryInstance;
+  }
+
+  // Created to not share Spring managed entity registries with static instance, this results in
+  // unexpected
+  // modifications to the static instance so instead we use this for Spring config
+  public static EntityRegistry constructNewEntityRegistry() {
+    EntityRegistry entityRegistry;
+    PathSpecBasedSchemaAnnotationVisitor.class
+        .getClassLoader()
+        .setClassAssertionStatus(PathSpecBasedSchemaAnnotationVisitor.class.getName(), false);
+    try {
+      SnapshotEntityRegistry snapshotEntityRegistry = new SnapshotEntityRegistry();
+      ConfigEntityRegistry configEntityRegistry =
+          new ConfigEntityRegistry(
+              Snapshot.class.getClassLoader().getResourceAsStream("entity-registry.yml"));
+      entityRegistry = new MergedEntityRegistry(snapshotEntityRegistry).apply(configEntityRegistry);
+    } catch (EntityRegistryException e) {
+      throw new RuntimeException(e);
+    }
+    return entityRegistry;
+  }
+
+  /**
+   * Stamps a single-cluster {@link SearchClusterAccess} onto an existing context so DAO tests that
+   * already inject a client keep working without a live registry.
+   */
+  @Nonnull
+  public static OperationContext withSearchClusterAccess(
+      @Nonnull OperationContext opContext, @Nullable SearchClusterAccess access) {
+    return opContext.toBuilder()
+        .searchContext(opContext.getSearchContext().toBuilder().searchClusterAccess(access).build())
+        .build(opContext.getSessionActorContext(), false);
+  }
+
+  @Nonnull
+  public static OperationContext withFixedSearchClient(
+      @Nonnull OperationContext opContext, @Nonnull SearchClientShim<?> client) {
+    return withSearchClusterAccess(opContext, SearchClusterAccess.fixed(client));
+  }
+
+  public static RetrieverContext emptyActiveUsersRetrieverContext(
+      @Nullable Supplier<EntityRegistry> entityRegistrySupplier) {
+
+    return RetrieverContext.builder()
+        .cachingAspectRetriever(emptyActiveUsersAspectRetriever(entityRegistrySupplier))
+        .graphRetriever(GraphRetriever.EMPTY)
+        .searchRetriever(SearchRetriever.EMPTY)
+        .build();
+  }
+
+  public static CachingAspectRetriever emptyActiveUsersAspectRetriever(
+      @Nullable Supplier<EntityRegistry> entityRegistrySupplier) {
+
+    return new CachingAspectRetriever.EmptyAspectRetriever() {
+
+      @Nonnull
+      @Override
+      public Map<Urn, Map<String, Aspect>> getLatestAspectObjects(
+          @Nonnull OperationFingerprint context, Set<Urn> urns, Set<String> aspectNames) {
+        if (urns.stream().allMatch(urn -> urn.toString().startsWith("urn:li:corpuser:"))
+            && aspectNames.contains(Constants.CORP_USER_KEY_ASPECT_NAME)) {
+          return urns.stream()
+              .map(
+                  urn ->
+                      Map.entry(
+                          urn,
+                          Map.of(
+                              Constants.CORP_USER_KEY_ASPECT_NAME,
+                              new Aspect(
+                                  new CorpUserInfo()
+                                      .setActive(true)
+                                      .setEmail(urn.getId())
+                                      .setDisplayName(urn.getId())
+                                      .data()))))
+              .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+        }
+        return super.getLatestAspectObjects(context, urns, aspectNames);
+      }
+
+      @Nonnull
+      @Override
+      public EntityRegistry getEntityRegistry() {
+        return Optional.ofNullable(entityRegistrySupplier)
+            .map(Supplier::get)
+            .orElse(defaultEntityRegistry());
+      }
+    };
+  }
+
+  public static OperationContext systemContextNoSearchAuthorization(
+      @Nullable EntityRegistry entityRegistry) {
+    return systemContextNoSearchAuthorization(entityRegistry, (SearchContext) null);
+  }
+
+  public static OperationContext systemContextNoSearchAuthorization(
+      @Nullable SearchContext searchContext) {
+    return systemContextNoSearchAuthorization((EntityRegistry) null, searchContext);
+  }
+
+  public static OperationContext systemContextNoSearchAuthorization() {
+    return systemContextNoSearchAuthorization(null, null, null);
+  }
+
+  public static OperationContext systemContextNoValidate() {
+    return systemContextNoSearchAuthorization(
+        null, null, null, () -> ValidationContext.builder().alternateValidation(true).build());
+  }
+
+  public static OperationContext systemContextNoSearchAuthorization(
+      @Nullable EntityRegistry entityRegistry, @Nullable SearchContext searchContext) {
+    return systemContextNoSearchAuthorization(() -> entityRegistry, null, () -> searchContext);
+  }
+
+  public static OperationContext systemContextNoSearchAuthorization(
+      @Nullable RetrieverContext retrieverContext) {
+    return systemContextNoSearchAuthorization(
+        () -> retrieverContext.getAspectRetriever().getEntityRegistry(),
+        () -> retrieverContext,
+        null);
+  }
+
+  public static OperationContext systemContextNoSearchAuthorization(
+      @Nullable AspectRetriever aspectRetriever) {
+    RetrieverContext retrieverContext =
+        RetrieverContext.builder()
+            .aspectRetriever(aspectRetriever)
+            .cachingAspectRetriever(
+                emptyActiveUsersAspectRetriever(() -> aspectRetriever.getEntityRegistry()))
+            .graphRetriever(GraphRetriever.EMPTY)
+            .searchRetriever(SearchRetriever.EMPTY)
+            .build();
+    return systemContextNoSearchAuthorization(
+        () -> retrieverContext.getAspectRetriever().getEntityRegistry(),
+        () -> retrieverContext,
+        null);
+  }
+
+  public static OperationContext systemContextNoSearchAuthorization(
+      @Nullable Supplier<RetrieverContext> retrieverContextSupplier,
+      @Nullable SearchContext searchContext) {
+    return systemContextNoSearchAuthorization(null, retrieverContextSupplier, () -> searchContext);
+  }
+
+  public static OperationContext systemContextNoSearchAuthorization(
+      @Nullable Supplier<EntityRegistry> entityRegistrySupplier,
+      @Nullable Supplier<RetrieverContext> retrieverContextSupplier,
+      @Nullable Supplier<SearchContext> searchContextSupplier) {
+
+    return systemContext(
+        null,
+        null,
+        null,
+        entityRegistrySupplier,
+        retrieverContextSupplier,
+        searchContextSupplier,
+        null,
+        null,
+        null,
+        null);
+  }
+
+  public static OperationContext systemContextNoSearchAuthorization(
+      @Nullable Supplier<EntityRegistry> entityRegistrySupplier,
+      @Nullable Supplier<RetrieverContext> retrieverContextSupplier,
+      @Nullable Supplier<SearchContext> searchContextSupplier,
+      @Nullable Supplier<ValidationContext> environmentContextSupplier) {
+
+    return systemContext(
+        null,
+        null,
+        null,
+        entityRegistrySupplier,
+        retrieverContextSupplier,
+        searchContextSupplier,
+        null,
+        environmentContextSupplier,
+        null,
+        null);
+  }
+
+  public static OperationContext systemContextTraceNoSearchAuthorization(
+      @Nullable Supplier<ObjectMapperContext> objectMapperContextSupplier,
+      @Nullable Supplier<SystemTelemetryContext> systemTelemetryContextSupplier) {
+
+    return systemContext(
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        objectMapperContextSupplier,
+        systemTelemetryContextSupplier);
+  }
+
+  public static OperationContext systemContext(
+      @Nullable Supplier<OperationContextConfig> configSupplier,
+      @Nullable Supplier<Authentication> systemAuthSupplier,
+      @Nullable Supplier<ServicesRegistryContext> servicesRegistrySupplier,
+      @Nullable Supplier<EntityRegistry> entityRegistrySupplier,
+      @Nullable Supplier<RetrieverContext> retrieverContextSupplier,
+      @Nullable Supplier<SearchContext> searchContextSupplier,
+      @Nullable Consumer<OperationContext> postConstruct,
+      @Nullable Supplier<ValidationContext> environmentContextSupplier) {
+    return systemContext(
+        configSupplier,
+        systemAuthSupplier,
+        servicesRegistrySupplier,
+        entityRegistrySupplier,
+        retrieverContextSupplier,
+        searchContextSupplier,
+        postConstruct,
+        environmentContextSupplier,
+        null,
+        null);
+  }
+
+  public static OperationContext systemContext(
+      @Nullable Supplier<OperationContextConfig> configSupplier,
+      @Nullable Supplier<Authentication> systemAuthSupplier,
+      @Nullable Supplier<ServicesRegistryContext> servicesRegistrySupplier,
+      @Nullable Supplier<EntityRegistry> entityRegistrySupplier,
+      @Nullable Supplier<RetrieverContext> retrieverContextSupplier,
+      @Nullable Supplier<SearchContext> searchContextSupplier,
+      @Nullable Consumer<OperationContext> postConstruct,
+      @Nullable Supplier<ValidationContext> environmentContextSupplier,
+      @Nullable Supplier<ObjectMapperContext> objectMapperContextSupplier,
+      @Nullable Supplier<SystemTelemetryContext> systemTelemetryContextSupplier) {
+
+    OperationContextConfig config =
+        Optional.ofNullable(configSupplier).map(Supplier::get).orElse(DEFAULT_OPCONTEXT_CONFIG);
+
+    Authentication systemAuth =
+        Optional.ofNullable(systemAuthSupplier).map(Supplier::get).orElse(TEST_SYSTEM_AUTH);
+
+    RetrieverContext retrieverContext =
+        Optional.ofNullable(retrieverContextSupplier)
+            .map(Supplier::get)
+            .orElse(emptyActiveUsersRetrieverContext(entityRegistrySupplier));
+
+    EntityRegistry entityRegistry =
+        Optional.ofNullable(entityRegistrySupplier)
+            .map(Supplier::get)
+            .filter(Objects::nonNull)
+            .orElse(defaultEntityRegistry());
+
+    SearchContext searchContext =
+        Optional.ofNullable(searchContextSupplier).map(Supplier::get).orElse(SearchContext.EMPTY);
+
+    ServicesRegistryContext servicesRegistryContext =
+        Optional.ofNullable(servicesRegistrySupplier).map(Supplier::get).orElse(null);
+
+    ValidationContext validationContext =
+        Optional.ofNullable(environmentContextSupplier)
+            .map(Supplier::get)
+            .orElse(defaultValidationContext);
+
+    ObjectMapperContext objectMapperContext =
+        objectMapperContextSupplier == null
+            ? ObjectMapperContext.DEFAULT
+            : objectMapperContextSupplier.get();
+
+    SystemTelemetryContext systemTelemetryContext =
+        systemTelemetryContextSupplier != null
+            ? systemTelemetryContextSupplier.get()
+            : SystemTelemetryContext.TEST;
+
+    OperationContext operationContext =
+        OperationContext.asSystem(
+            config,
+            systemAuth,
+            entityRegistry,
+            servicesRegistryContext,
+            searchContext,
+            retrieverContext,
+            validationContext,
+            objectMapperContext,
+            systemTelemetryContext,
+            PrimaryStorageContext.EMPTY,
+            true);
+
+    if (postConstruct != null) {
+      postConstruct.accept(operationContext);
+    }
+
+    return operationContext;
+  }
+
+  public static OperationContext userContextNoSearchAuthorization(
+      @Nullable EntityRegistry entityRegistry) {
+    return userContextNoSearchAuthorization(Authorizer.EMPTY, TEST_USER_AUTH, entityRegistry);
+  }
+
+  public static OperationContext userContextNoSearchAuthorization(
+      @Nonnull Authorizer authorizer, @Nonnull Urn userUrn) {
+    return userContextNoSearchAuthorization(authorizer, userUrn, null);
+  }
+
+  public static OperationContext userContextNoSearchAuthorization(@Nonnull Urn userUrn) {
+    return userContextNoSearchAuthorization(Authorizer.EMPTY, userUrn, null);
+  }
+
+  public static OperationContext userContextNoSearchAuthorization(
+      @Nonnull Urn userUrn, @Nullable EntityRegistry entityRegistry) {
+    return userContextNoSearchAuthorization(Authorizer.EMPTY, userUrn, entityRegistry);
+  }
+
+  public static OperationContext userContextNoSearchAuthorization(
+      @Nonnull Authorizer authorizer,
+      @Nonnull Urn userUrn,
+      @Nullable EntityRegistry entityRegistry) {
+    return userContextNoSearchAuthorization(
+        authorizer,
+        new Authentication(new Actor(ActorType.USER, userUrn.getId()), ""),
+        entityRegistry);
+  }
+
+  public static OperationContext userContextNoSearchAuthorization(
+      @Nonnull Authentication sessionAuthorization) {
+    return userContextNoSearchAuthorization(Authorizer.EMPTY, sessionAuthorization, null);
+  }
+
+  public static OperationContext userContextNoSearchAuthorization(
+      @Nonnull Authorizer authorizer, @Nonnull Authentication sessionAuthorization) {
+    return userContextNoSearchAuthorization(authorizer, sessionAuthorization, null);
+  }
+
+  public static OperationContext userContextNoSearchAuthorization(
+      @Nonnull Authorizer authorizer,
+      @Nonnull Authentication sessionAuthorization,
+      @Nullable EntityRegistry entityRegistry) {
+    return systemContextNoSearchAuthorization(entityRegistry)
+        .asSession(RequestContext.TEST, authorizer, sessionAuthorization);
+  }
+
+  public static OperationContext userContextNoSearchAuthorization(
+      @Nonnull RequestContext.RequestContextBuilder requestContext) {
+    return systemContextNoSearchAuthorization(defaultEntityRegistry())
+        .asSession(requestContext, Authorizer.EMPTY, TEST_USER_AUTH);
+  }
+
+  @lombok.Builder
+  public static class Builder {
+    @Nullable Supplier<OperationContextConfig> configSupplier;
+    @Nullable Supplier<Authentication> systemAuthSupplier;
+    @Nullable Supplier<ServicesRegistryContext> servicesRegistrySupplier;
+    @Nullable Supplier<EntityRegistry> entityRegistrySupplier;
+    @Nullable Supplier<RetrieverContext> retrieverContextSupplier;
+    @Nullable Supplier<SearchContext> searchContextSupplier;
+    @Nullable Consumer<OperationContext> postConstruct;
+    @Nullable Supplier<ValidationContext> environmentContextSupplier;
+    @Nullable Supplier<ObjectMapperContext> objectMapperContextSupplier;
+    @Nullable Supplier<SystemTelemetryContext> systemTelemetryContextSupplier;
+
+    public static class BuilderBuilder {
+      private BuilderBuilder build() {
+        return null;
+      }
+
+      public OperationContext buildSystemContext() {
+        return TestOperationContexts.systemContext(
+            this.configSupplier,
+            this.systemAuthSupplier,
+            this.servicesRegistrySupplier,
+            this.entityRegistrySupplier,
+            this.retrieverContextSupplier,
+            this.searchContextSupplier,
+            this.postConstruct,
+            this.environmentContextSupplier,
+            this.objectMapperContextSupplier,
+            this.systemTelemetryContextSupplier);
+      }
+    }
+  }
+
+  private TestOperationContexts() {}
+
+  private static EntityIndexConfiguration createDefaultEntityIndexConfiguration() {
+    EntityIndexConfiguration config = new EntityIndexConfiguration();
+    // Enable V2 by default for backward compatibility
+    EntityIndexVersionConfiguration v2Config = new EntityIndexVersionConfiguration();
+    v2Config.setEnabled(true);
+    v2Config.setCleanup(true);
+    config.setV2(v2Config);
+
+    // Disable V3 by default for backward compatibility
+    EntityIndexVersionConfiguration v3Config = new EntityIndexVersionConfiguration();
+    v3Config.setEnabled(false);
+    v3Config.setCleanup(false);
+    config.setV3(v3Config);
+
+    return config;
+  }
+}

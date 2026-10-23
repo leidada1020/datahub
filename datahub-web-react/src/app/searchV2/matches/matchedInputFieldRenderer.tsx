@@ -1,0 +1,44 @@
+import React from 'react';
+
+import { useEntityRegistry } from '@app/useEntityRegistry';
+
+import { Chart, Dashboard, EntityType, GlossaryTerm, MatchedField } from '@types';
+
+const LABEL_INDEX_NAME = 'fieldLabels';
+const TYPE_PROPERTY_KEY_NAME = 'type';
+
+const TermName = ({ term }: { term: GlossaryTerm }) => {
+    const entityRegistry = useEntityRegistry();
+    return <>{entityRegistry.getDisplayName(EntityType.GlossaryTerm, term)}</>;
+};
+
+export const matchedInputFieldRenderer = (matchedField: MatchedField, entity: Chart | Dashboard) => {
+    if (matchedField?.name === LABEL_INDEX_NAME) {
+        const matchedSchemaField = entity.inputFields?.fields?.find(
+            (field) => field?.schemaField?.label === matchedField.value,
+        );
+        const matchedGlossaryTerm = matchedSchemaField?.schemaField?.glossaryTerms?.terms?.find(
+            (term) => term?.term?.name === matchedField.value,
+        );
+
+        if (matchedGlossaryTerm) {
+            /* untranslated-text -- termType is a dynamic value from the backend (custom property on a glossary term);
+               the fallback 'term' is part of a sentence fragment {termType} <TermName/> that requires a Trans
+               rewrite and backend-driven translation to localise properly */
+            let termType = 'term';
+            const typeProperty = matchedGlossaryTerm.term.properties?.customProperties?.find(
+                (property) => property.key === TYPE_PROPERTY_KEY_NAME,
+            );
+            if (typeProperty) {
+                termType = typeProperty.value || termType;
+            }
+
+            return (
+                <>
+                    {termType} <TermName term={matchedGlossaryTerm.term} />
+                </>
+            );
+        }
+    }
+    return null;
+};

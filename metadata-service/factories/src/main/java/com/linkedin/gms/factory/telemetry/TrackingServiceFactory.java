@@ -1,0 +1,86 @@
+package com.linkedin.gms.factory.telemetry;
+
+import com.datahub.telemetry.TrackingService;
+import com.linkedin.gms.factory.config.ConfigurationProvider;
+import com.linkedin.metadata.config.kafka.TopicsConfiguration;
+import com.linkedin.metadata.config.telemetry.TelemetryConfiguration;
+import com.linkedin.metadata.entity.EntityService;
+import com.linkedin.metadata.event.UsageEventPublisher;
+import com.linkedin.metadata.version.GitVersion;
+import com.mixpanel.mixpanelapi.MessageBuilder;
+import com.mixpanel.mixpanelapi.MixpanelAPI;
+import io.datahubproject.metadata.services.SecretService;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Scope;
+
+@Slf4j
+@Configuration
+public class TrackingServiceFactory {
+  @Autowired(required = false)
+  @Qualifier("mixpanelApi")
+  private MixpanelAPI _mixpanelAPI;
+
+  @Autowired(required = false)
+  @Qualifier("mixpanelMessageBuilder")
+  private MessageBuilder _mixpanelMessageBuilder;
+
+  @Autowired
+  @Qualifier("dataHubSecretService")
+  private SecretService _secretService;
+
+  @Autowired
+  @Qualifier("entityService")
+  private EntityService<?> _entityService;
+
+  @Autowired
+  @Qualifier("gitVersion")
+  private GitVersion _gitVersion;
+
+  @Autowired(required = false)
+  @Qualifier("dataHubUsageEventProducer")
+  private UsageEventPublisher usageEventPublisher;
+
+  @Autowired private ConfigurationProvider _configurationProvider;
+
+  @Bean(name = "trackingService")
+  @Scope("singleton")
+  protected TrackingService getInstance() throws Exception {
+
+    TelemetryConfiguration _telemetryConfiguration = _configurationProvider.getTelemetry();
+    TopicsConfiguration _topicsConfiguration = _configurationProvider.getKafka().getTopics();
+
+    // Check if telemetry is enabled
+    boolean telemetryEnabled = _telemetryConfiguration.isEnabledServer();
+
+    log.info(
+        "Initializing TrackingService with telemetry enabled: {}, MixpanelAPI: {} and MixpanelMessageBuilder: {}",
+        telemetryEnabled,
+        _mixpanelAPI != null ? "present" : "null",
+        _mixpanelMessageBuilder != null ? "present" : "null");
+
+    log.info(
+        "Initializing TrackingService with DataHubUsageProducer: {}",
+        usageEventPublisher != null ? "present" : "null");
+
+    // If telemetry is disabled, pass null for Mixpanel components
+    MixpanelAPI mixpanelAPI = telemetryEnabled ? _mixpanelAPI : null;
+    MessageBuilder mixpanelMessageBuilder = telemetryEnabled ? _mixpanelMessageBuilder : null;
+
+    TrackingService trackingService =
+        new TrackingService(
+            _topicsConfiguration,
+            _secretService,
+            mixpanelMessageBuilder,
+            mixpanelAPI,
+            _entityService,
+            _gitVersion,
+            usageEventPublisher);
+
+    log.info("TrackingService initialized successfully");
+    return trackingService;
+  }
+}

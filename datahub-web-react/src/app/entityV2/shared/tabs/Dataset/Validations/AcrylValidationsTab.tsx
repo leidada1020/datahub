@@ -1,0 +1,148 @@
+import { Tooltip } from '@components';
+import React, { useEffect } from 'react';
+import { Trans, useTranslation } from 'react-i18next';
+import { useHistory, useLocation } from 'react-router';
+import styled from 'styled-components';
+
+import { useEntityData } from '@app/entity/shared/EntityContext';
+import { EntityTabPath } from '@app/entityV2/shared/constants';
+import { AcrylAssertionList } from '@app/entityV2/shared/tabs/Dataset/Validations/AssertionList/AcrylAssertionList';
+import { AcrylAssertionSummaryTab } from '@app/entityV2/shared/tabs/Dataset/Validations/AssertionList/Summary/AcrylAssertionSummaryTab';
+import { DataContractTab } from '@app/entityV2/shared/tabs/Dataset/Validations/contract/DataContractTab';
+import { useGetValidationsTab } from '@app/entityV2/shared/tabs/Dataset/Validations/useGetValidationsTab';
+import { SEPARATE_SIBLINGS_URL_PARAM, useIsSeparateSiblingsMode } from '@app/entityV2/shared/useIsSeparateSiblingsMode';
+import { useAppConfig } from '@app/useAppConfig';
+
+const TabTitle = styled.span`
+    margin: 4px;
+`;
+
+const TabButton = styled.div<{ selected: boolean; disabled: boolean }>`
+    display: flex;
+    background-color: ${(props) => (props.selected && props.theme.colors.bgSurface) || 'none'};
+    color: ${(props) => (props.selected ? props.theme.colors.textBrand : 'none')};
+    align-items: center;
+    justify-content: center;
+    cursor: ${(props) => (props.disabled ? 'not-allowed' : 'pointer')};
+    border-radius: 8px;
+    padding: 0px 4px 0px 4px;
+    font-size: 14px;
+    height: 36px;
+    color: ${(props) => (props.disabled && props.theme.colors.textDisabled) || 'none'};
+`;
+const TabToolbar = styled.div`
+    display: flex;
+    position: relative;
+    z-index: 1;
+    height: 46px;
+    padding: 8px 8px;
+    flex: 0 0 auto;
+`;
+
+enum TabPaths {
+    ASSERTIONS = 'List',
+    DATA_CONTRACT = 'Data Contract',
+    SUMMARY = 'Summary',
+}
+
+const DEFAULT_TAB = TabPaths.SUMMARY;
+
+/**
+ * Acryl-specific component used for rendering the Entity Validations Tab.
+ */
+export const AcrylValidationsTab = () => {
+    const { t } = useTranslation('entity.profile.validations');
+    const history = useHistory();
+    const { pathname } = useLocation();
+    const { entityData } = useEntityData();
+    const isHideSiblingMode = useIsSeparateSiblingsMode();
+    const isRenderingSiblings = (entityData?.siblingsSearch?.total && !isHideSiblingMode) || false;
+    const appConfig = useAppConfig();
+
+    const { selectedTab, basePath } = useGetValidationsTab(pathname, Object.values(TabPaths));
+
+    // If no tab was selected, select a default tab.
+    useEffect(() => {
+        if (!selectedTab && basePath.endsWith(EntityTabPath.QUALITY)) {
+            // Route to the default tab.
+            history.replace(`${basePath}/${DEFAULT_TAB}?${SEPARATE_SIBLINGS_URL_PARAM}=${isHideSiblingMode}`);
+        }
+    }, [selectedTab, basePath, history, isHideSiblingMode]);
+
+    /**
+     * The top-level Toolbar tabs to display.
+     */
+    const tabs: any[] = [
+        {
+            title: (
+                <>
+                    <TabTitle>{t('tabs.summary')}</TabTitle>
+                </>
+            ),
+            path: TabPaths.SUMMARY,
+            disabled: false, // Always keep the assertions tab clickable in saas.
+            content: <AcrylAssertionSummaryTab />,
+            id: 'summary',
+        },
+        {
+            title: (
+                <>
+                    <TabTitle>{t('tabs.assertions')}</TabTitle>
+                </>
+            ),
+            path: TabPaths.ASSERTIONS,
+            disabled: false, // Always keep the assertions tab clickable in saas.
+            content: <AcrylAssertionList />,
+            id: 'assertions',
+        },
+    ];
+
+    if (appConfig.config.featureFlags?.dataContractsEnabled) {
+        // If contracts feature is enabled, add to list.
+        tabs.push({
+            title: (
+                <>
+                    <TabTitle>{t('tabs.dataContract')}</TabTitle>
+                </>
+            ),
+            path: TabPaths.DATA_CONTRACT,
+            content: <DataContractTab />,
+            disabled: isRenderingSiblings,
+            tip: isRenderingSiblings ? (
+                <>
+                    {t('summary.groupAssetsTooltip')} <br />
+                    <br />
+                    <Trans t={t} i18nKey="summary.navigateViaSection" components={{ bold: <b /> }} />
+                </>
+            ) : null,
+            id: 'data-contract',
+        });
+    }
+
+    return (
+        <>
+            <TabToolbar>
+                {tabs.map((tab) => (
+                    <Tooltip showArrow={false} title={tab.tip}>
+                        <TabButton
+                            key={tab.path}
+                            disabled={tab.disabled}
+                            selected={selectedTab === tab.path}
+                            id={`acryl-validation-tab-${tab.id}-sub-tab`}
+                            onClick={() => {
+                                if (!tab.disabled) {
+                                    history.replace(
+                                        `${basePath}/${tab.path}?${SEPARATE_SIBLINGS_URL_PARAM}=${isHideSiblingMode}`,
+                                    );
+                                }
+                            }}
+                        >
+                            {tab.title}
+                        </TabButton>
+                    </Tooltip>
+                ))}
+            </TabToolbar>
+            {tabs.filter((tab) => tab.path === selectedTab).map((tab) => tab.content)}
+        </>
+    );
+};

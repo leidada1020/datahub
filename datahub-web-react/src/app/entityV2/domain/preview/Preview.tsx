@@ -1,0 +1,66 @@
+import React from 'react';
+
+import { GenericEntityProperties } from '@app/entity/shared/types';
+import { IconStyleType, PreviewType } from '@app/entityV2/Entity';
+import DomainEntitiesSnippet from '@app/entityV2/domain/preview/DomainEntitiesSnippet';
+import { EntityMenuItems } from '@app/entityV2/shared/EntityDropdown/EntityMenuActions';
+import { useHandleDeprecateDomain } from '@app/entityV2/shared/EntityDropdown/useHandleDeprecateDomain';
+import EntityCount from '@app/entityV2/shared/containers/profile/header/EntityCount';
+import { DomainColoredIcon } from '@app/entityV2/shared/links/DomainColoredIcon';
+import DefaultPreviewCard from '@app/previewV2/DefaultPreviewCard';
+import { useEntityRegistry } from '@app/useEntityRegistry';
+
+import { Deprecation, Domain, EntityType, Owner, SearchInsight } from '@types';
+
+export const Preview = ({
+    domain,
+    urn,
+    data,
+    name,
+    description,
+    owners,
+    insights,
+    logoComponent,
+    entityCount,
+    deprecation,
+    headerDropdownItems,
+    previewType,
+}: {
+    domain: Domain;
+    urn: string;
+    data: GenericEntityProperties | null;
+    name: string;
+    description?: string | null;
+    owners?: Array<Owner> | null;
+    insights?: Array<SearchInsight> | null;
+    logoComponent?: JSX.Element;
+    entityCount?: number;
+    deprecation?: Deprecation | null;
+    headerDropdownItems?: Set<EntityMenuItems>;
+    previewType: PreviewType;
+}): JSX.Element => {
+    const entityRegistry = useEntityRegistry();
+    const { handleDeprecateDomainComplete } = useHandleDeprecateDomain(urn);
+    return (
+        <DefaultPreviewCard
+            url={entityRegistry.getEntityUrl(EntityType.Domain, urn)}
+            name={name || ''}
+            urn={urn}
+            data={data}
+            description={description || ''}
+            entityType={EntityType.Domain}
+            typeIcon={entityRegistry.getIcon(EntityType.Domain, 14, IconStyleType.ACCENT)}
+            owners={owners}
+            insights={insights}
+            logoComponent={logoComponent}
+            parentEntities={domain.parentDomains?.domains}
+            snippet={<DomainEntitiesSnippet domain={domain} />}
+            subHeader={<EntityCount displayAssetsText entityCount={entityCount} />}
+            entityIcon={<DomainColoredIcon domain={domain as Domain} size={20} fontSize={12} />}
+            deprecation={deprecation}
+            refetchDeprecation={() => handleDeprecateDomainComplete(false)}
+            headerDropdownItems={headerDropdownItems}
+            previewType={previewType}
+        />
+    );
+};

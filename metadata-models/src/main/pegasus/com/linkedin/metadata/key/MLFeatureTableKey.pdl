@@ -1,0 +1,39 @@
+namespace com.linkedin.metadata.key
+
+import com.linkedin.common.Urn
+
+/**
+ * Key for an MLFeatureTable
+ */
+@Aspect = {
+  "name": "mlFeatureTableKey"
+}
+record MLFeatureTableKey {
+  /**
+  * Data platform urn associated with the feature table
+  */
+  @Relationship = {
+    "name": "SourcePlatform",
+    "entityTypes": [ "dataPlatform" ]
+  }
+  platform: Urn
+
+  /**
+  * Name of the feature table
+  */
+  @Searchable = {
+    "fieldType": "WORD_GRAM",
+    "enableAutocomplete": true,
+    "boostScore": 10.0,
+    "fieldNameAliases": [ "_entityName" ],
+    "v3": {
+      "searchLabel": "name",
+      "mappings": [
+        { "type": "KEYWORD" },
+        { "subfield": "text", "type": "TEXT" },
+        { "subfield": "stemmed", "type": "STEMMED" }
+      ]
+    }
+  }
+  name: string
+}

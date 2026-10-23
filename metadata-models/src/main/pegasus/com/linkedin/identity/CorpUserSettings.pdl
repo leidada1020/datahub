@@ -1,0 +1,37 @@
+namespace com.linkedin.identity
+
+import com.linkedin.event.notification.settings.NotificationSettings
+
+/**
+ * Settings that a user can customize through the datahub ui
+ */
+@Aspect = {
+  "name": "corpUserSettings",
+  "schemaVersion": 2
+}
+record CorpUserSettings {
+  /**
+   * Settings for a user around the appearance of their DataHub U
+   */
+  appearance: CorpUserAppearanceSettings
+
+  /**
+   * User preferences for the Views feature.
+   */
+  views: optional CorpUserViewsSettings
+
+  /**
+   * Notification settings for a user
+   */
+  notificationSettings: optional NotificationSettings
+
+  /**
+   * Settings related to the home page for a user
+   */
+  homePage: optional CorpUserHomePageSettings
+
+  /**
+   * Locale and language preferences for a user
+   */
+  locale: optional CorpUserLocaleSettings
+}

@@ -1,0 +1,77 @@
+import { CircleNotch } from '@phosphor-icons/react/dist/csr/CircleNotch';
+import React from 'react';
+import styled, { keyframes } from 'styled-components';
+
+import { ButtonBase } from '@components/components/Button/components';
+import { ButtonProps, ButtonPropsDefaults } from '@components/components/Button/types';
+import { Icon } from '@components/components/Icon';
+
+const spin = keyframes`
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+`;
+
+const LoadingSpinner = styled(CircleNotch)`
+    animation: ${spin} 1s linear infinite;
+    color: currentColor;
+`;
+
+export const buttonDefaults: ButtonPropsDefaults = {
+    variant: 'filled',
+    color: 'primary',
+    // Intentionally undefined: when unset, getButtonColorStyles uses theme.colors.buttonFillBrand
+    // for primary/violet so configurable brand colors (and borders) apply. Only pass colorLevel
+    // when you need a specific foundation shade.
+    colorLevel: undefined,
+    size: 'md',
+    iconPosition: 'left',
+    isCircle: false,
+    isLoading: false,
+    isActive: false,
+};
+
+export const Button = ({
+    variant = buttonDefaults.variant,
+    color = buttonDefaults.color,
+    colorLevel = buttonDefaults.colorLevel,
+    size = buttonDefaults.size,
+    icon, // default undefined
+    iconPosition = buttonDefaults.iconPosition,
+    isCircle = buttonDefaults.isCircle,
+    isLoading = buttonDefaults.isLoading,
+    isActive = buttonDefaults.isActive,
+    children,
+    ...props
+}: ButtonProps) => {
+    const styleProps = {
+        variant,
+        color,
+        colorLevel,
+        size,
+        isCircle,
+        isLoading,
+        isActive,
+        hasChildren: !!children,
+    };
+
+    if (isLoading) {
+        return (
+            <ButtonBase {...styleProps} {...props}>
+                <LoadingSpinner /> {!isCircle && children}
+            </ButtonBase>
+        );
+    }
+
+    // Prefer `icon.size` over `size` for icon size
+    return (
+        <ButtonBase {...styleProps} {...props}>
+            {icon && iconPosition === 'left' && <Icon size={size} {...icon} />}
+            {!isCircle && children}
+            {icon && iconPosition === 'right' && <Icon size={size} {...icon} />}
+        </ButtonBase>
+    );
+};
+
+// `FloatingOverlay` keys off this to wrap a disabled button. A disabled native button
+// never fires the hover listeners, so the tooltip has to listen on a parent instead.
+Button.displayName = 'Button';

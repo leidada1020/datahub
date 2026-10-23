@@ -1,0 +1,98 @@
+import { Tooltip } from '@components';
+import React from 'react';
+import styled, { useTheme } from 'styled-components';
+
+import { AssertionResultPopover } from '@app/entityV2/shared/tabs/Dataset/Validations/assertion/profile/shared/result/AssertionResultPopover';
+import { getFormattedTimeString } from '@app/entityV2/shared/tabs/Dataset/Validations/assertion/profile/summary/result/timeline/utils';
+import { AssertionResultPill } from '@app/entityV2/shared/tabs/Dataset/Validations/assertion/profile/summary/shared/AssertionResultPill';
+import {
+    ResultStatusType,
+    getFormattedReasonText,
+} from '@app/entityV2/shared/tabs/Dataset/Validations/assertion/profile/summary/shared/resultMessageUtils';
+import { getResultColor } from '@app/entityV2/shared/tabs/Dataset/Validations/assertionUtils';
+import { applyOpacityToHexColor } from '@app/sharedV2/styleUtils';
+import { toLocalDateTimeString, toRelativeTimeString } from '@app/sharedV2/time/timeUtils';
+
+import { Assertion, AssertionRunEvent } from '@types';
+
+const Container = styled.div<{ highlightColor?: string }>`
+    display: flex;
+    align-items: start;
+    justify-content: start;
+    padding: 4px 8px;
+    border-radius: 4px;
+    :hover {
+        background-color: ${(props) => props.highlightColor || props.theme.colors.bgSurface};
+    }
+`;
+
+const TimeColumn = styled.div`
+    display: flex;
+    flex-direction: column;
+    justify-content: start;
+    align-items: start;
+    width: 112px;
+`;
+
+const ResultColumn = styled.div`
+    display: flex;
+    flex-direction: column;
+    justify-content: start;
+    align-items: start;
+    flex: 1;
+`;
+
+const PreHeaderText = styled.div<{ color?: string }>`
+    font-size: 12px;
+    color: ${(props) => props.color || props.theme.colors.textTertiary};
+`;
+
+const ResultStatusRow = styled.div`
+    display: flex;
+    align-items: center;
+    gap: 8px;
+`;
+
+const HeaderText = styled.div`
+    font-size: 14px;
+`;
+
+type Props = {
+    assertion: Assertion;
+    run: AssertionRunEvent;
+};
+
+export const AssertionResultsTableItem = ({ assertion, run }: Props) => {
+    const theme = useTheme();
+    const assertionRunTime = run.timestampMillis;
+    const absoluteRunTime = getFormattedTimeString(assertionRunTime);
+    const resultTextColor = getResultColor(theme, run.result?.type) || undefined;
+    const reasonText = getFormattedReasonText(assertion, run);
+    const highlightColor = getResultColor(theme, run.result?.type);
+    return (
+        <Container
+            highlightColor={(highlightColor && applyOpacityToHexColor(highlightColor, 0.035)) || resultTextColor}
+        >
+            <Tooltip showArrow={false} placement="left" title={toLocalDateTimeString(assertionRunTime)}>
+                <TimeColumn>
+                    <PreHeaderText>{toRelativeTimeString(assertionRunTime)}</PreHeaderText>
+                    <HeaderText>{absoluteRunTime}</HeaderText>
+                </TimeColumn>
+            </Tooltip>
+            <AssertionResultPopover
+                assertion={assertion}
+                run={run}
+                showProfileButton={false}
+                resultStatusType={ResultStatusType.HISTORICAL}
+                placement="bottom"
+            >
+                <ResultColumn>
+                    <ResultStatusRow>
+                        <AssertionResultPill result={run.result || undefined} type={ResultStatusType.HISTORICAL} />
+                    </ResultStatusRow>
+                    <HeaderText>{reasonText}</HeaderText>
+                </ResultColumn>
+            </AssertionResultPopover>
+        </Container>
+    );
+};

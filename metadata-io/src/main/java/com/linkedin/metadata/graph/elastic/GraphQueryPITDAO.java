@@ -1,0 +1,462 @@
+package com.linkedin.metadata.graph.elastic;
+
+import static com.linkedin.metadata.graph.elastic.ElasticSearchGraphService.INDEX_NAME;
+
+import com.datahub.util.exception.ESQueryException;
+import com.linkedin.common.urn.Urn;
+import com.linkedin.metadata.aspect.models.graph.Edge;
+import com.linkedin.metadata.config.graph.GraphServiceConfiguration;
+import com.linkedin.metadata.config.search.ElasticSearchConfiguration;
+import com.linkedin.metadata.config.search.SearchComponent;
+import com.linkedin.metadata.graph.LineageGraphFilters;
+import com.linkedin.metadata.graph.LineageRelationship;
+import com.linkedin.metadata.graph.LineageTimeoutException;
+import com.linkedin.metadata.graph.elastic.utils.GraphQueryConstants;
+import com.linkedin.metadata.graph.elastic.utils.GraphQueryUtils;
+import com.linkedin.metadata.graph.elastic.utils.PreRenderedQueryBuilder;
+import com.linkedin.metadata.search.utils.ESUtils;
+import com.linkedin.metadata.search.utils.SearchOperation;
+import com.linkedin.metadata.search.utils.SearchTookMetrics;
+import com.linkedin.metadata.utils.elasticsearch.SearchClientShim;
+import com.linkedin.metadata.utils.metrics.MetricUtils;
+import com.linkedin.metadata.utils.metrics.MicrometerMetricsRegistry;
+import io.datahubproject.metadata.context.OperationContext;
+import io.opentelemetry.api.trace.Span;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+import org.opensearch.action.search.SearchRequest;
+import org.opensearch.action.search.SearchResponse;
+import org.opensearch.client.RequestOptions;
+import org.opensearch.common.unit.TimeValue;
+import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.search.SearchHit;
+import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.search.slice.SliceBuilder;
+
+/** A search DAO for Elasticsearch backend. */
+@Slf4j
+public class GraphQueryPITDAO extends GraphQueryBaseDAO {
+
+  @Getter private final SearchClientShim<?> client;
+
+  private static final String PIT_EXECUTOR_METRIC_NAME = "graph-query-pit";
+  // Exact per-query values go on the esQuery span; as metric tags they would be unbounded.
+  static final String SEARCH_URNS_ATTR = "search.urns";
+  static final String SEARCH_HITS_ATTR = "search.hits";
+  static final String SEARCH_TOOK_MS_ATTR = "search.took_ms";
+
+  final ExecutorService pitExecutor;
+
+  /** {@link #pitExecutor} wrapped with executor metrics; slices are submitted through this. */
+  private final ExecutorService pitTaskExecutor;
+
+  public GraphQueryPITDAO(
+      SearchClientShim<?> client,
+      GraphServiceConfiguration graphServiceConfig,
+      ElasticSearchConfiguration config,
+      MetricUtils metricUtils) {
+    super(graphServiceConfig, config, metricUtils);
+    this.client = client;
+
+    // Create dedicated thread pool for PIT operations
+    int maxThreads = config.getSearch().getGraph().getMaxThreads();
+    this.pitExecutor =
+        new ThreadPoolExecutor(
+            maxThreads, // core pool size
+            maxThreads, // maximum pool size
+            60L,
+            TimeUnit.SECONDS, // keep alive time
+            new LinkedBlockingQueue<>(maxThreads), // bounded queue for backpressure
+            r -> {
+              Thread t = new Thread(r, "pit-worker-" + System.currentTimeMillis());
+              t.setDaemon(true);
+              return t;
+            },
+            new ThreadPoolExecutor.CallerRunsPolicy() // backpressure: caller runs when queue full
+            );
+
+    this.pitTaskExecutor =
+        metricUtils == null
+            ? pitExecutor
+            : MicrometerMetricsRegistry.monitorExecutor(
+                PIT_EXECUTOR_METRIC_NAME, pitExecutor, metricUtils.getRegistry());
+    if (metricUtils != null && pitTaskExecutor == pitExecutor) {
+      // Executor metric names are registered once per JVM, so only the first DAO is monitored.
+      log.warn(
+          "Executor metrics for '{}' are already registered by another instance; this PIT pool is"
+              + " not monitored",
+          PIT_EXECUTOR_METRIC_NAME);
+    }
+
+    log.info("Initialized PIT thread pool with {} threads and bounded queue", maxThreads);
+  }
+
+  /** Shutdown the PIT executor service gracefully. */
+  public void shutdown() {
+    if (pitExecutor != null && !pitExecutor.isShutdown()) {
+      log.info("Shutting down PIT thread pool");
+      pitExecutor.shutdown();
+      try {
+        if (!pitExecutor.awaitTermination(30, TimeUnit.SECONDS)) {
+          log.warn("PIT thread pool did not terminate gracefully, forcing shutdown");
+          pitExecutor.shutdownNow();
+          if (!pitExecutor.awaitTermination(10, TimeUnit.SECONDS)) {
+            log.error("PIT thread pool did not terminate after forced shutdown");
+          }
+        }
+      } catch (InterruptedException e) {
+        log.warn("Interrupted while waiting for PIT thread pool shutdown", e);
+        pitExecutor.shutdownNow();
+        Thread.currentThread().interrupt();
+      }
+    }
+  }
+
+  /**
+   * Search using PIT and slice-based parallel processing for better performance.
+   *
+   * @param maxRelations The remaining capacity for relationships (decremented from original limit)
+   * @param allowPartialResults If true, return partial results on timeout or maxRelations instead
+   *     of throwing
+   */
+  @Override
+  protected LineageSliceFetchResult searchWithSlices(
+      @Nonnull OperationContext opContext,
+      @Nonnull QueryBuilder query,
+      LineageGraphFilters lineageGraphFilters,
+      Set<Urn> visitedEntities,
+      Set<Urn> viaEntities,
+      int numHops,
+      int remainingHops,
+      ThreadSafePathStore existingPaths,
+      int maxRelations, // This is the REMAINING capacity, not the original total limit
+      int defaultPageSize,
+      int slices,
+      long remainingTime,
+      Set<Urn> entityUrns,
+      boolean allowPartialResults) {
+
+    // Create slice-based search requests
+    String pitId = null;
+    String keepAlive = config.getSearch().getGraph().getImpact().getKeepAlive();
+    List<CompletableFuture<List<LineageRelationship>>> sliceFutures = new ArrayList<>();
+    try {
+      pitId =
+          ESUtils.computePointInTime(
+              opContext,
+              null,
+              keepAlive,
+              graphClient(opContext),
+              opContext
+                  .getSearchContext()
+                  .getIndexConvention()
+                  .getIndexName(opContext, SearchComponent.GRAPH, INDEX_NAME));
+      final String tempPitId = pitId;
+
+      // Every page of every slice sends the same query, so render it once for the hop.
+      final QueryBuilder pageQuery;
+      try {
+        pageQuery = PreRenderedQueryBuilder.of(query);
+      } catch (IOException e) {
+        throw new ESQueryException("Failed to render lineage query", e);
+      }
+
+      // One budget shared across all slices of this hop (see GraphQueryBaseDAO); null == unlimited.
+      final AtomicInteger sharedRemaining = newSharedRelationshipBudget(maxRelations);
+      // Set by any slice that stops on a timeout or shard failure in partial mode so the hop is
+      // marked partial (see stopSliceOnTimeout / stopSliceOnShardFailure /
+      // markPartialIfSliceIncomplete).
+      final AtomicBoolean sliceIncomplete = new AtomicBoolean(false);
+
+      for (int sliceId = 0; sliceId < slices; sliceId++) {
+        final int currentSliceId = sliceId;
+
+        CompletableFuture<List<LineageRelationship>> sliceFuture =
+            CompletableFuture.supplyAsync(
+                () -> {
+                  return searchSingleSliceWithPit(
+                      opContext,
+                      pageQuery,
+                      lineageGraphFilters,
+                      visitedEntities,
+                      viaEntities,
+                      numHops,
+                      remainingHops,
+                      existingPaths,
+                      maxRelations,
+                      sharedRemaining,
+                      defaultPageSize,
+                      currentSliceId,
+                      slices,
+                      remainingTime,
+                      entityUrns,
+                      allowPartialResults,
+                      tempPitId,
+                      keepAlive,
+                      sliceIncomplete);
+                },
+                pitTaskExecutor); // Dedicated pool with CallerRunsPolicy for backpressure
+        sliceFutures.add(sliceFuture);
+      }
+
+      // Reuse the common slice coordination logic. If the shared budget ended exhausted, the hop
+      // was truncated at maxRelations — report partial explicitly, since the outer unique-entity
+      // limit check can miss it when cross-slice duplicates merge away. Likewise mark partial when
+      // a slice stopped on a server-side timeout (its collected results are incomplete).
+      return markPartialIfSliceIncomplete(
+          markPartialIfSharedBudgetExhausted(
+              processSliceFutures(sliceFutures, remainingTime, allowPartialResults),
+              sharedRemaining,
+              allowPartialResults),
+          sliceIncomplete,
+          allowPartialResults);
+    } finally {
+      // Cancel any still-running slice futures before deleting the shared PIT. Note this wait
+      // returns as soon as the futures are cancelled (cancel(true) completes them and does not
+      // interrupt the supplier), so a slice mid-request can still hit a deleted PIT; a real
+      // completion signal is a planned follow-up.
+      cancelAndDrainSliceFutures(sliceFutures);
+      ESUtils.cleanupPointInTime(
+          opContext, graphClient(opContext), pitId, "lineage search: " + entityUrns);
+    }
+  }
+
+  /**
+   * Search a single slice of the data using PIT and search_after for pagination.
+   *
+   * @param maxRelations The remaining capacity for relationships (decremented from original limit)
+   * @param allowPartialResults If true, return partial results on timeout or maxRelations instead
+   *     of throwing
+   */
+  private List<LineageRelationship> searchSingleSliceWithPit(
+      @Nonnull OperationContext opContext,
+      @Nonnull QueryBuilder query,
+      LineageGraphFilters lineageGraphFilters,
+      Set<Urn> visitedEntities,
+      Set<Urn> viaEntities,
+      int numHops,
+      int remainingHops,
+      ThreadSafePathStore existingPaths,
+      int maxRelations, // This is the REMAINING capacity, not the original total limit
+      @Nullable AtomicInteger sharedRemaining, // budget shared across this hop's slices; null=∞
+      int defaultPageSize,
+      int sliceId,
+      int totalSlices,
+      long remainingTime,
+      Set<Urn> entityUrns,
+      boolean allowPartialResults,
+      String pitId,
+      String keepAlive,
+      AtomicBoolean sliceIncomplete) {
+
+    List<LineageRelationship> sliceRelationships = new ArrayList<>();
+    Object[] searchAfter = null;
+    long deadline = System.currentTimeMillis() + remainingTime;
+
+    try {
+      // Fixed page size (capped to maxRelations so a small limit does not over-fetch). Retention is
+      // bounded per page below by reserving the ACTUAL retained count from the budget shared across
+      // this hop's slices and truncating any tail past it, so the slices can never collectively
+      // retain more than maxRelations. Reserving a full page BEFORE fetching would instead let the
+      // first slice speculatively grab the whole budget and starve its siblings.
+      int pageSize = maxRelations > 0 ? Math.min(defaultPageSize, maxRelations) : defaultPageSize;
+      while (true) {
+        // Check for thread interruption (from future.cancel(true))
+        if (Thread.currentThread().isInterrupted()) {
+          log.warn("Slice {} was interrupted, cleaning up PIT and stopping", sliceId);
+          throw new RuntimeException("Slice " + sliceId + " was interrupted");
+        }
+
+        // Hop deadline passed between pages: same policy as a server-side timed_out page.
+        if (System.currentTimeMillis() >= deadline) {
+          stopSliceOnTimeout(sliceId, "hop deadline passed", allowPartialResults, sliceIncomplete);
+          break;
+        }
+
+        // Stop before fetching once the shared per-hop budget is exhausted (consumed by this or
+        // another slice): strict mode rejects, partial mode stops and searchWithSlices marks the
+        // hop partial. Retention is already bounded by the reservation below.
+        if (stopSliceIfSharedBudgetExhausted(
+            sharedRemaining, maxRelations, sliceId, allowPartialResults)) {
+          break;
+        }
+
+        // Build search request with PIT and slice configuration
+        SearchRequest searchRequest = new SearchRequest();
+        SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
+        searchSourceBuilder.query(query);
+        searchSourceBuilder.size(pageSize);
+        // Ask each shard to stop collecting once the remaining hop budget elapses and return what
+        // it has with timedOut=true. Best-effort: this bounds the query phase only. It does not
+        // cancel the task, does not count threadpool queue time, and has no effect on PIT lifetime
+        // (that is keepAlive, refreshed on every page request).
+        searchSourceBuilder.timeout(
+            TimeValue.timeValueMillis(Math.max(1L, deadline - System.currentTimeMillis())));
+
+        // Add sorting for consistent results and search_after using Edge sort fields
+        ESUtils.buildSortOrder(searchSourceBuilder, Edge.EDGE_SORT_CRITERION, List.of(), false);
+
+        // Add slice configuration for parallel processing
+        searchSourceBuilder.slice(new SliceBuilder(sliceId, totalSlices));
+
+        // Set PIT and search_after
+        ESUtils.setSearchAfter(searchSourceBuilder, searchAfter, pitId, keepAlive);
+
+        searchRequest.source(searchSourceBuilder);
+
+        // Execute search
+        SearchResponse response =
+            opContext.withSpan(
+                "esQuery",
+                () -> {
+                  try {
+                    if (metricUtils != null)
+                      metricUtils.increment(
+                          this.getClass(), GraphQueryConstants.SEARCH_EXECUTIONS_METRIC, 1);
+                    return timedSearch(opContext, searchRequest, entityUrns.size());
+                  } catch (Exception e) {
+                    log.error("Search query failed for slice {}", sliceId, e);
+                    throw new ESQueryException("Search query failed for slice " + sliceId, e);
+                  }
+                },
+                MetricUtils.DROPWIZARD_NAME,
+                MetricUtils.name(this.getClass(), "esQuery"));
+
+        // A timed-out page still carries the hits collected before the shard budget ran out.
+        // Extract them first, then stop; an empty timed-out page must not read as "no more
+        // results".
+        boolean pageTimedOut = response != null && response.isTimedOut();
+
+        if (response == null
+            || response.getHits() == null
+            || response.getHits().getHits().length == 0) {
+          if (pageTimedOut) {
+            stopSliceOnTimeout(
+                sliceId, "server-side timed_out", allowPartialResults, sliceIncomplete);
+          } else if (response != null && response.getFailedShards() > 0) {
+            // A failed shard can return no hits on a page that is not the slice's last.
+            stopSliceOnShardFailure(
+                sliceId,
+                response.getFailedShards(),
+                response.getTotalShards(),
+                allowPartialResults,
+                sliceIncomplete);
+          } else {
+            log.debug("Slice {} completed, no more results", sliceId);
+          }
+          break;
+        }
+
+        // Extract relationships from current page
+        List<LineageRelationship> pageRelationships =
+            GraphQueryUtils.extractRelationships(
+                entityUrns,
+                response,
+                lineageGraphFilters,
+                visitedEntities,
+                viaEntities,
+                numHops,
+                remainingHops,
+                existingPaths,
+                false); // exploreMultiplePaths - not needed for impact lineage
+
+        int before = sliceRelationships.size();
+        sliceRelationships.addAll(pageRelationships);
+
+        // Decide the timeout before the budget check so a timed-out page that also exhausts the
+        // shared budget is classified as a timeout: strict mode throws here, partial mode flags the
+        // hop and still truncates the retained hits below.
+        if (pageTimedOut) {
+          stopSliceOnTimeout(
+              sliceId, "server-side timed_out", allowPartialResults, sliceIncomplete);
+        }
+        // With search_after, the next page starts after this page's last hit, so whatever the
+        // failed shards held before that point is never returned. Paging on cannot recover it.
+        boolean pageShardsFailed = !pageTimedOut && response.getFailedShards() > 0;
+        if (pageShardsFailed) {
+          stopSliceOnShardFailure(
+              sliceId,
+              response.getFailedShards(),
+              response.getTotalShards(),
+              allowPartialResults,
+              sliceIncomplete);
+        }
+
+        // Bound retained relationships to this slice's atomic share of the hop's shared budget.
+        boolean budgetExhausted =
+            reserveOrTruncateToSharedBudget(
+                sliceRelationships,
+                before,
+                sharedRemaining,
+                maxRelations,
+                sliceId,
+                allowPartialResults);
+        if (budgetExhausted || pageTimedOut || pageShardsFailed) {
+          break; // shared budget exhausted, page timed out or shards failed; partial results
+        }
+
+        // With a PIT and search_after, a page shorter than the page size is the slice's last page.
+        // Asking again would only return an empty page, at the full cost of the query. Pages with
+        // failed shards already stopped the slice above.
+        SearchHit[] hits = response.getHits().getHits();
+        if (hits.length < pageSize) {
+          log.debug("Slice {} completed on a short page ({} hits)", sliceId, hits.length);
+          break;
+        }
+
+        // Get search_after for next page
+        searchAfter = hits[hits.length - 1].getSortValues();
+      }
+    } catch (LineageTimeoutException | ESQueryException e) {
+      // Rethrow untouched: processSliceFutures rethrows a bare RuntimeException cause as-is, so the
+      // distinct type reaches getImpactLineage's catch (which records the timeout on the cascade)
+      // and the GraphQL/Rest.li mappers without a wrapper. ESQueryException covers strict-mode
+      // shard failures and search failures; both messages name the slice, and search failures are
+      // logged where they are thrown. The generic catch below would log a second stack trace.
+      throw e;
+    } catch (Exception e) {
+      log.error("Failed to execute PIT search for slice {}", sliceId, e);
+      throw new RuntimeException("Failed to execute PIT search for slice " + sliceId, e);
+    }
+
+    return sliceRelationships;
+  }
+
+  /**
+   * Runs the slice search through {@link SearchTookMetrics} and tags the current esQuery span with
+   * the query's URN count, page hit count and took.
+   */
+  private SearchResponse timedSearch(
+      @Nonnull OperationContext opContext, @Nonnull SearchRequest searchRequest, int urnCount)
+      throws IOException {
+    SearchResponse response =
+        SearchTookMetrics.time(
+            metricUtils,
+            SearchOperation.GRAPH_QUERY_PIT,
+            () -> graphClient(opContext).search(opContext, searchRequest, RequestOptions.DEFAULT));
+    Span span = Span.current();
+    span.setAttribute(SEARCH_URNS_ATTR, urnCount);
+    if (response != null) {
+      if (response.getHits() != null) {
+        span.setAttribute(SEARCH_HITS_ATTR, response.getHits().getHits().length);
+      }
+      if (response.getTook() != null) {
+        span.setAttribute(SEARCH_TOOK_MS_ATTR, response.getTook().millis());
+      }
+    }
+    return response;
+  }
+}

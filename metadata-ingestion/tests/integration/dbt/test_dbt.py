@@ -1,0 +1,804 @@
+import dataclasses
+import json
+from dataclasses import dataclass
+from os import PathLike
+from typing import Any, Dict, List, Union
+
+import pytest
+import time_machine
+
+from datahub.configuration.common import DynamicTypedConfig
+from datahub.ingestion.run.pipeline import Pipeline
+from datahub.ingestion.run.pipeline_config import PipelineConfig, SourceConfig
+from datahub.ingestion.source.dbt.dbt_common import DBTEntitiesEnabled, EmitDirective
+from datahub.ingestion.source.dbt.dbt_core import DBTCoreConfig, DBTCoreSource
+from datahub.testing import mce_helpers
+from datahub.testing.compare_metadata_json import assert_metadata_files_equal
+from datahub.utilities.urns.dataset_urn import DatasetUrn
+from tests.test_helpers import test_connection_helpers
+from tests.test_helpers.state_helpers import run_and_get_pipeline
+
+FROZEN_TIME = "2022-02-03 07:00:00"
+GMS_PORT = 8080
+GMS_SERVER = f"http://localhost:{GMS_PORT}"
+
+_default_dbt_source_args = {
+    # Needed to avoid needing to access datahub server.
+    "write_semantics": "OVERRIDE",
+}
+
+
+@pytest.fixture(scope="module")
+def test_resources_dir(pytestconfig):
+    # TODO: Move this into a constant based on __file__.
+    return pytestconfig.rootpath / "tests/integration/dbt"
+
+
+@dataclass
+class DbtTestConfig:
+    run_id: str
+    output_file: Union[str, PathLike]
+    golden_file: Union[str, PathLike]
+    manifest_file: str = "dbt_manifest.json"
+    catalog_file: str = "dbt_catalog.json"
+    sources_file: str = "dbt_sources.json"
+    run_results_files: List[str] = dataclasses.field(default_factory=list)
+    source_config_modifiers: Dict[str, Any] = dataclasses.field(default_factory=dict)
+    sink_config_modifiers: Dict[str, Any] = dataclasses.field(default_factory=dict)
+
+    def set_paths(
+        self,
+        dbt_metadata_uri_prefix: PathLike,
+        test_resources_dir: PathLike,
+        tmp_path: PathLike,
+    ) -> None:
+        manifest_path = f"{dbt_metadata_uri_prefix}/{self.manifest_file}"
+        catalog_path = f"{dbt_metadata_uri_prefix}/{self.catalog_file}"
+        sources_path = f"{dbt_metadata_uri_prefix}/{self.sources_file}"
+        run_results_paths = [
+            f"{dbt_metadata_uri_prefix}/{file}" for file in self.run_results_files
+        ]
+        target_platform = "postgres"
+
+        self.output_path = f"{tmp_path}/{self.output_file}"
+
+        self.golden_path = f"{test_resources_dir}/{self.golden_file}"
+        self.source_config = dict(
+            {
+                "manifest_path": manifest_path,
+                "catalog_path": catalog_path,
+                "sources_path": sources_path,
+                "run_results_paths": run_results_paths,
+                "target_platform": target_platform,
+                "enable_meta_mapping": False,
+                **_default_dbt_source_args,
+                "meta_mapping": {
+                    "owner": {
+                        "match": "^@(.*)",
+                        "operation": "add_owner",
+                        "config": {"owner_type": "user"},
+                    },
+                    "business_owner": {
+                        "match": ".*",
+                        "operation": "add_owner",
+                        "config": {"owner_type": "user"},
+                    },
+                    "has_pii": {
+                        "match": True,
+                        "operation": "add_tag",
+                        "config": {"tag": "has_pii_test"},
+                    },
+                    "int_property": {
+                        "match": 1,
+                        "operation": "add_tag",
+                        "config": {"tag": "int_meta_property"},
+                    },
+                    "double_property": {
+                        "match": 2.5,
+                        "operation": "add_term",
+                        "config": {"term": "double_meta_property"},
+                    },
+                    "data_governance.team_owner": {
+                        "match": "Finance",
+                        "operation": "add_term",
+                        "config": {"term": "Finance_test"},
+                    },
+                },
+                "query_tag_mapping": {
+                    "tag": {
+                        "match": ".*",
+                        "operation": "add_tag",
+                        "config": {"tag": "{{ $match }}"},
+                    }
+                },
+            },
+            **self.source_config_modifiers,
+        )
+
+        self.sink_config = dict(
+            {
+                "filename": self.output_path,
+            },
+            **self.sink_config_modifiers,
+        )
+
+
+def run_and_verify(config: DbtTestConfig) -> None:
+    run_and_get_pipeline(
+        {
+            "run_id": config.run_id,
+            "source": {"type": "dbt", "config": config.source_config},
+            "sink": {
+                "type": "file",
+                "config": config.sink_config,
+            },
+        }
+    )
+    assert_metadata_files_equal(
+        output_path=config.output_path,
+        golden_path=config.golden_path,
+    )
+
+
+@pytest.mark.parametrize(
+    # test manifest, catalog, sources are generated from https://github.com/kevinhu/sample-dbt
+    "dbt_test_config",
+    [
+        DbtTestConfig(
+            "dbt-test-with-schemas-dbt-enabled",
+            "dbt_enabled_with_schemas_mces.json",
+            "dbt_enabled_with_schemas_mces_golden.json",
+            source_config_modifiers={
+                "enable_meta_mapping": True,
+                "owner_extraction_pattern": r"^@(?P<owner>(.*))",
+            },
+        ),
+        DbtTestConfig(
+            "dbt-test-with-complex-owner-patterns",
+            "dbt_test_with_complex_owner_patterns_mces.json",
+            "dbt_test_with_complex_owner_patterns_mces_golden.json",
+            manifest_file="dbt_manifest_complex_owner_patterns.json",
+            source_config_modifiers={
+                "node_name_pattern": {
+                    "deny": ["source.sample_dbt.pagila.payment_p2020_06"]
+                },
+                "owner_extraction_pattern": "(.*)(?P<owner>(?<=\\().*?(?=\\)))",
+                "strip_user_ids_from_email": True,
+            },
+        ),
+        DbtTestConfig(
+            "dbt-test-with-data-platform-instance",
+            "dbt_test_with_data_platform_instance_mces.json",
+            "dbt_test_with_data_platform_instance_mces_golden.json",
+            source_config_modifiers={
+                "platform_instance": "dbt-instance-1",
+            },
+        ),
+        DbtTestConfig(
+            "dbt-test-with-non-incremental-lineage",
+            "dbt_test_with_non_incremental_lineage_mces.json",
+            "dbt_test_with_non_incremental_lineage_mces_golden.json",
+            source_config_modifiers={
+                "incremental_lineage": "False",
+            },
+        ),
+        DbtTestConfig(
+            "dbt-test-with-target-platform-instance",
+            "dbt_test_with_target_platform_instance_mces.json",
+            "dbt_test_with_target_platform_instance_mces_golden.json",
+            source_config_modifiers={
+                "target_platform_instance": "ps-instance-1",
+            },
+        ),
+        DbtTestConfig(
+            "dbt-column-meta-mapping",  # this also tests snapshot support and meta nested mapping
+            "dbt_test_column_meta_mapping.json",
+            "dbt_test_column_meta_mapping_golden.json",
+            catalog_file="sample_dbt_catalog_1.json",
+            manifest_file="sample_dbt_manifest_1.json",
+            sources_file="sample_dbt_sources_1.json",
+            source_config_modifiers={
+                "enable_meta_mapping": True,
+                "meta_mapping": {
+                    "data_governance_nested.team_owner": {
+                        "match": "Finance",
+                        "operation": "add_term",
+                        "config": {"term": "Finance_test_nested"},
+                    },
+                    "owner": {
+                        "match": "^@(.*)",
+                        "operation": "add_owner",
+                        "config": {"owner_type": "user"},
+                    },
+                    "business_owner": {
+                        "match": ".*",
+                        "operation": "add_owner",
+                        "config": {"owner_type": "user"},
+                    },
+                    "has_pii": {
+                        "match": True,
+                        "operation": "add_tag",
+                        "config": {"tag": "has_pii_test"},
+                    },
+                    "int_property": {
+                        "match": 1,
+                        "operation": "add_tag",
+                        "config": {"tag": "int_meta_property"},
+                    },
+                    "double_property": {
+                        "match": 2.5,
+                        "operation": "add_term",
+                        "config": {"term": "double_meta_property"},
+                    },
+                    "data_governance.team_owner": {
+                        "match": "Finance",
+                        "operation": "add_term",
+                        "config": {"term": "Finance_test"},
+                    },
+                },
+                "column_meta_mapping": {
+                    "terms": {
+                        "match": ".*",
+                        "operation": "add_terms",
+                        "config": {"separator": ","},
+                    },
+                    "is_sensitive": {
+                        "match": True,
+                        "operation": "add_tag",
+                        "config": {"tag": "sensitive"},
+                    },
+                    "maturity": {
+                        "match": ".*",
+                        "operation": "add_term",
+                        "config": {"term": "maturity_{{ $match }}"},
+                    },
+                    "governance.pii_category": {
+                        "match": ".*",
+                        "operation": "add_term",
+                        "config": {"term": "pii_category_{{ $match }}"},
+                    },
+                },
+                "entities_enabled": {
+                    "test_definitions": "NO",
+                    "test_results": "NO",
+                },
+            },
+        ),
+        DbtTestConfig(
+            "dbt-model-performance",
+            "dbt_test_model_performance.json",
+            "dbt_test_test_model_performance_golden.json",
+            catalog_file="sample_dbt_catalog_2.json",
+            manifest_file="sample_dbt_manifest_2.json",
+            sources_file="sample_dbt_sources_2.json",
+            run_results_files=["sample_dbt_run_results_2.json"],
+            source_config_modifiers={},
+        ),
+        DbtTestConfig(
+            "dbt-prefer-sql-parser-lineage",
+            "dbt_test_prefer_sql_parser_lineage.json",
+            "dbt_test_prefer_sql_parser_lineage_golden.json",
+            catalog_file="sample_dbt_catalog_2.json",
+            manifest_file="sample_dbt_manifest_2.json",
+            sources_file="sample_dbt_sources_2.json",
+            run_results_files=["sample_dbt_run_results_2.json"],
+            source_config_modifiers={
+                "prefer_sql_parser_lineage": True,
+                "skip_sources_in_lineage": True,
+                # "entities_enabled": {"sources": "NO"},
+            },
+        ),
+        DbtTestConfig(
+            "dbt-test-target-platform-primary-siblings",
+            "dbt_test_target_platform_primary_siblings.json",
+            "dbt_test_target_platform_primary_siblings_golden.json",
+            source_config_modifiers={
+                "dbt_is_primary_sibling": False,
+                "enable_meta_mapping": False,
+            },
+        ),
+        DbtTestConfig(
+            "dbt-test-with-source-schema-pattern",
+            "dbt_test_with_source_schema_pattern_mces.json",
+            "dbt_test_with_source_schema_pattern_mces_golden.json",
+            manifest_file="dbt_manifest_complex_owner_patterns.json",
+            source_config_modifiers={
+                "materialized_node_pattern": {
+                    "schema_pattern": {"allow": ["pagila\\.dbt_postgres"]}
+                }
+            },
+        ),
+        DbtTestConfig(
+            "dbt-test-with-source-database-pattern",
+            "dbt_test_with_source_database_pattern_mces.json",
+            "dbt_test_with_source_database_pattern_mces_golden.json",
+            manifest_file="dbt_manifest_complex_owner_patterns.json",
+            source_config_modifiers={
+                "materialized_node_pattern": {"database_pattern": {"allow": ["pagila"]}}
+            },
+        ),
+        DbtTestConfig(
+            "dbt-test-with-source-combined-patterns",
+            "dbt_test_with_source_combined_patterns_mces.json",
+            "dbt_test_with_source_combined_patterns_mces_golden.json",
+            manifest_file="dbt_manifest_complex_owner_patterns.json",
+            source_config_modifiers={
+                "node_name_pattern": {
+                    "deny": ["source.sample_dbt.pagila.payment_p2020_06"]
+                },
+                "materialized_node_pattern": {
+                    "database_pattern": {"allow": ["pagila"]},
+                    "schema_pattern": {"allow": ["pagila\\.dbt_postgres"]},
+                },
+            },
+        ),
+        DbtTestConfig(
+            "dbt-test-with-source-table-pattern",
+            "dbt_test_with_source_table_pattern_mces.json",
+            "dbt_test_with_source_table_pattern_mces_golden.json",
+            manifest_file="dbt_manifest_complex_owner_patterns.json",
+            source_config_modifiers={
+                "materialized_node_pattern": {
+                    "table_pattern": {"allow": ["pagila\\.dbt_postgres\\.customer.*"]}
+                }
+            },
+        ),
+        DbtTestConfig(
+            "dbt-test-query-entity-emission",
+            "dbt_test_query_entity_emission.json",
+            "dbt_test_query_entity_emission_golden.json",
+            manifest_file="dbt_manifest_with_queries.json",
+            source_config_modifiers={},  # queries enabled by default via entities_enabled.queries
+        ),
+        # Pins the legacy wire format: semantic models as plain dbt datasets
+        # with subtype "Semantic Model" and no semanticModel/metric entities.
+        # This golden is what "the feature is opt-in" means - it must stay
+        # byte-identical to the pre-feature output.
+        DbtTestConfig(
+            "dbt-test-semantic-models-legacy",
+            "dbt_test_semantic_models_legacy.json",
+            "dbt_test_semantic_models_legacy_golden.json",
+            manifest_file="dbt_manifest_semantic_models.json",
+            catalog_file="sample_dbt_catalog_2.json",
+            sources_file="sample_dbt_sources_2.json",
+            # Explicitly false rather than merely unset: this golden pins the
+            # legacy format, so it must not depend on how the tri-state
+            # default happens to resolve in the test environment.
+            source_config_modifiers={"emit_semantic_model_entities": False},
+        ),
+        DbtTestConfig(
+            "dbt-test-semantic-model-entities",
+            "dbt_test_semantic_model_entities.json",
+            "dbt_test_semantic_model_entities_golden.json",
+            manifest_file="dbt_manifest_semantic_models.json",
+            catalog_file="sample_dbt_catalog_2.json",
+            sources_file="sample_dbt_sources_2.json",
+            source_config_modifiers={"emit_semantic_model_entities": True},
+        ),
+        # platform_instance is the easiest thing to get wrong here: it is
+        # folded into the semanticModel/metric path (those keys have no
+        # platform_instance field) but must not change the dataset urn.
+        DbtTestConfig(
+            "dbt-test-semantic-model-entities-platform-instance",
+            "dbt_test_semantic_model_entities_platform_instance.json",
+            "dbt_test_semantic_model_entities_platform_instance_golden.json",
+            manifest_file="dbt_manifest_semantic_models.json",
+            catalog_file="sample_dbt_catalog_2.json",
+            sources_file="sample_dbt_sources_2.json",
+            source_config_modifiers={
+                "emit_semantic_model_entities": True,
+                "platform_instance": "dbt-instance-1",
+            },
+        ),
+    ],
+    ids=lambda dbt_test_config: dbt_test_config.run_id,
+)
+@pytest.mark.integration
+@time_machine.travel(FROZEN_TIME, tick=False)
+def test_dbt_ingest(
+    dbt_test_config,
+    test_resources_dir,
+    pytestconfig,
+    tmp_path,
+    mock_time,
+    requests_mock,
+):
+    config: DbtTestConfig = dbt_test_config
+    test_resources_dir = pytestconfig.rootpath / "tests/integration/dbt"
+
+    with open(test_resources_dir / "dbt_manifest.json") as f:
+        requests_mock.get("http://some-external-repo/dbt_manifest.json", text=f.read())
+
+    with open(test_resources_dir / "dbt_catalog.json") as f:
+        requests_mock.get("http://some-external-repo/dbt_catalog.json", text=f.read())
+
+    with open(test_resources_dir / "dbt_sources.json") as f:
+        requests_mock.get("http://some-external-repo/dbt_sources.json", text=f.read())
+
+    config.set_paths(
+        dbt_metadata_uri_prefix=test_resources_dir,
+        test_resources_dir=test_resources_dir,
+        tmp_path=tmp_path,
+    )
+
+    run_and_verify(config)
+
+
+@pytest.mark.integration
+@time_machine.travel(FROZEN_TIME, tick=False)
+def test_dbt_multi_project_glob(pytestconfig, tmp_path):
+    test_resources_dir = pytestconfig.rootpath / "tests/integration/dbt"
+    # Two small hand-authored projects under multi_project/, pinning the
+    # multi-project facts: both projects in one run, per-project platform
+    # instances derived from project_name, sibling catalogs resolved beside each
+    # manifest, a raw source declared by both projects, project_b consuming a
+    # project_a model as a source, one semantic model + metric per project, a
+    # shared-package model whose meta.queries must yield one query per project,
+    # and a run_results file whose test result lands on project_a's assertion.
+    config = DbtTestConfig(
+        "dbt-multi-project-glob",
+        "dbt_test_multi_project_glob.json",
+        "dbt_test_multi_project_glob_golden.json",
+        source_config_modifiers={
+            "manifest_path": f"{test_resources_dir}/multi_project/*/manifest.json",
+            "catalog_path": None,
+            "sources_path": None,
+            "run_results_paths": [
+                f"{test_resources_dir}/multi_project/*/run_results.json"
+            ],
+            "emit_semantic_model_entities": True,
+        },
+    )
+    config.set_paths(
+        dbt_metadata_uri_prefix=test_resources_dir,
+        test_resources_dir=test_resources_dir,
+        tmp_path=tmp_path,
+    )
+    run_and_verify(config)
+
+
+def _aspect_key(entry: Dict[str, Any]) -> Any:
+    snapshot = (
+        entry.get("proposedSnapshot", {}).get(
+            "com.linkedin.pegasus2avro.metadata.snapshot.DatasetSnapshot"
+        )
+        or {}
+    )
+    return (
+        entry.get("entityType", "snapshot"),
+        entry.get("entityUrn") or snapshot.get("urn"),
+        entry.get("aspectName", "SNAPSHOT"),
+    )
+
+
+def test_semantic_model_entities_are_purely_additive(test_resources_dir):
+    """Turning the flag on must not change a single aspect the dbt path emits.
+
+    The dataset urn and every aspect written for it - datasetProperties with
+    its dbt provenance, schemaMetadata, subTypes, tags, owners, upstream
+    lineage - belong to the ordinary dbt path, which runs them through
+    write_semantics. This compares the two goldens directly, so any drift is
+    caught even if both are regenerated together.
+    """
+    with open(test_resources_dir / "dbt_test_semantic_models_legacy_golden.json") as f:
+        legacy: List[Dict[str, Any]] = json.load(f)
+    with open(test_resources_dir / "dbt_test_semantic_model_entities_golden.json") as f:
+        with_entities: List[Dict[str, Any]] = json.load(f)
+
+    remaining: Dict[Any, List[Dict[str, Any]]] = {}
+    for entry in with_entities:
+        # runId is the pipeline name, which differs between the two configs by
+        # construction; it is not part of what the connector decided to emit.
+        entry.pop("systemMetadata", None)
+        remaining.setdefault(_aspect_key(entry), []).append(entry)
+
+    for entry in legacy:
+        entry.pop("systemMetadata", None)
+        key = _aspect_key(entry)
+        matches = remaining.get(key)
+        assert matches, f"{key} disappeared when semantic model entities were on"
+        assert entry == matches.pop(0), (
+            f"{key} changed when semantic model entities were on"
+        )
+
+    added = {key for key, entries in remaining.items() if entries}
+    added_types = {key[0] for key in added}
+    assert added_types == {"semanticModel", "metric", "schemaField", "dataset"}
+    # The only dataset-anchored addition is the membership back-reference.
+    assert {key[2] for key in added if key[0] == "dataset"} == {
+        "semanticModelProperties"
+    }
+
+
+@pytest.mark.parametrize(
+    "config_dict, is_success",
+    [
+        (
+            {
+                "manifest_path": "dbt_manifest.json",
+                "catalog_path": "dbt_catalog.json",
+                "target_platform": "postgres",
+            },
+            True,
+        ),
+        (
+            {
+                "manifest_path": "dbt_manifest.json",
+                "catalog_path": "dbt_catalog-this-file-does-not-exist.json",
+                "target_platform": "postgres",
+            },
+            False,
+        ),
+    ],
+)
+@pytest.mark.integration
+@time_machine.travel(FROZEN_TIME, tick=False)
+def test_dbt_test_connection(test_resources_dir, config_dict, is_success):
+    config_dict["manifest_path"] = str(
+        (test_resources_dir / config_dict["manifest_path"]).resolve()
+    )
+    config_dict["catalog_path"] = str(
+        (test_resources_dir / config_dict["catalog_path"]).resolve()
+    )
+    report = test_connection_helpers.run_test_connection(DBTCoreSource, config_dict)
+    if is_success:
+        test_connection_helpers.assert_basic_connectivity_success(report)
+    else:
+        test_connection_helpers.assert_basic_connectivity_failure(
+            report, "No such file or directory"
+        )
+
+
+@pytest.mark.integration
+@time_machine.travel(FROZEN_TIME, tick=False)
+def test_dbt_tests(test_resources_dir, pytestconfig, tmp_path, mock_time, **kwargs):
+    # Run the metadata ingestion pipeline.
+    output_file = tmp_path / "dbt_test_events.json"
+    # jaffle_shop_manifest.json is edited for coverage (JSON can't hold comments):
+    # unique_stg_orders_order_id has a custom `name:` and not_null_stg_orders_order_id
+    # a test `description:`.
+    golden_path = test_resources_dir / "dbt_test_events_golden.json"
+
+    pipeline = Pipeline(
+        config=PipelineConfig(
+            source=SourceConfig(
+                type="dbt",
+                config=DBTCoreConfig(
+                    **_default_dbt_source_args,
+                    manifest_path=str(
+                        (test_resources_dir / "jaffle_shop_manifest.json").resolve()
+                    ),
+                    catalog_path=str(
+                        (test_resources_dir / "jaffle_shop_catalog.json").resolve()
+                    ),
+                    target_platform="postgres",
+                    run_results_paths=[
+                        str(
+                            (
+                                test_resources_dir / "jaffle_shop_test_results.json"
+                            ).resolve()
+                        )
+                    ],
+                ),
+            ),
+            sink=DynamicTypedConfig(type="file", config={"filename": str(output_file)}),
+        )
+    )
+    pipeline.run()
+    pipeline.raise_from_status()
+    # Verify the output.
+    mce_helpers.check_golden_file(
+        pytestconfig,
+        output_path=output_file,
+        golden_path=golden_path,
+        ignore_paths=[],
+    )
+
+
+@pytest.mark.integration
+@time_machine.travel(FROZEN_TIME, tick=False)
+def test_dbt_tests_only_assertions(
+    test_resources_dir, pytestconfig, tmp_path, mock_time, **kwargs
+):
+    # Run the metadata ingestion pipeline.
+    output_file = tmp_path / "test_only_assertions.json"
+
+    pipeline = Pipeline(
+        config=PipelineConfig(
+            source=SourceConfig(
+                type="dbt",
+                config=DBTCoreConfig(
+                    **_default_dbt_source_args,
+                    manifest_path=str(
+                        (test_resources_dir / "jaffle_shop_manifest.json").resolve()
+                    ),
+                    catalog_path=str(
+                        (test_resources_dir / "jaffle_shop_catalog.json").resolve()
+                    ),
+                    target_platform="postgres",
+                    run_results_paths=[
+                        str(
+                            (
+                                test_resources_dir / "jaffle_shop_test_results.json"
+                            ).resolve()
+                        )
+                    ],
+                    entities_enabled=DBTEntitiesEnabled(
+                        test_results=EmitDirective.ONLY
+                    ),
+                ),
+            ),
+            sink=DynamicTypedConfig(type="file", config={"filename": str(output_file)}),
+        )
+    )
+    pipeline.run()
+    pipeline.raise_from_status()
+    # Verify the output.
+    # No datasets were emitted, and more than 20 events were emitted
+    assert (
+        mce_helpers.assert_entity_urn_not_like(
+            entity_type="dataset",
+            regex_pattern="urn:li:dataset:\\(urn:li:dataPlatform:dbt",
+            file=output_file,
+        )
+        > 20
+    )
+    number_of_valid_assertions_in_test_results = 24
+    assert (
+        mce_helpers.assert_entity_urn_like(
+            entity_type="assertion", regex_pattern="urn:li:assertion:", file=output_file
+        )
+        == number_of_valid_assertions_in_test_results
+    )
+
+    # no assertionInfo should be emitted
+    with pytest.raises(
+        AssertionError, match="Failed to find aspect_name assertionInfo for urns"
+    ):
+        mce_helpers.assert_for_each_entity(
+            entity_type="assertion",
+            aspect_name="assertionInfo",
+            aspect_field_matcher={},
+            file=output_file,
+        )
+
+    # all assertions must have an assertionRunEvent emitted (except for one assertion)
+    assert (
+        mce_helpers.assert_for_each_entity(
+            entity_type="assertion",
+            aspect_name="assertionRunEvent",
+            aspect_field_matcher={},
+            file=output_file,
+            exception_urns=["urn:li:assertion:2ff754df689ea951ed2e12cbe356708f"],
+        )
+        == number_of_valid_assertions_in_test_results
+    )
+
+
+@pytest.mark.integration
+@time_machine.travel(FROZEN_TIME, tick=False)
+def test_dbt_only_test_definitions_and_results(
+    test_resources_dir, pytestconfig, tmp_path, mock_time, **kwargs
+):
+    # Run the metadata ingestion pipeline.
+    output_file = tmp_path / "test_only_definitions_and_assertions.json"
+
+    pipeline = Pipeline(
+        config=PipelineConfig(
+            source=SourceConfig(
+                type="dbt",
+                config=DBTCoreConfig(
+                    **_default_dbt_source_args,
+                    manifest_path=str(
+                        (test_resources_dir / "jaffle_shop_manifest.json").resolve()
+                    ),
+                    catalog_path=str(
+                        (test_resources_dir / "jaffle_shop_catalog.json").resolve()
+                    ),
+                    target_platform="postgres",
+                    run_results_paths=[
+                        str(
+                            (
+                                test_resources_dir / "jaffle_shop_test_results.json"
+                            ).resolve()
+                        )
+                    ],
+                    entities_enabled=DBTEntitiesEnabled(
+                        sources=EmitDirective.NO,
+                        seeds=EmitDirective.NO,
+                        models=EmitDirective.NO,
+                    ),
+                ),
+            ),
+            sink=DynamicTypedConfig(type="file", config={"filename": str(output_file)}),
+        )
+    )
+    pipeline.run()
+    pipeline.raise_from_status()
+    # Verify the output. No datasets were emitted
+    assert (
+        mce_helpers.assert_entity_urn_not_like(
+            entity_type="dataset",
+            regex_pattern="urn:li:dataset:\\(urn:li:dataPlatform:dbt",
+            file=output_file,
+        )
+        > 20
+    )
+    number_of_assertions = 25
+    assert (
+        mce_helpers.assert_entity_urn_like(
+            entity_type="assertion", regex_pattern="urn:li:assertion:", file=output_file
+        )
+        == number_of_assertions
+    )
+    # all assertions must have an assertionInfo emitted
+    assert (
+        mce_helpers.assert_for_each_entity(
+            entity_type="assertion",
+            aspect_name="assertionInfo",
+            aspect_field_matcher={},
+            file=output_file,
+        )
+        == number_of_assertions
+    )
+    # all assertions must have an assertionRunEvent emitted (except for one assertion)
+    assert (
+        mce_helpers.assert_for_each_entity(
+            entity_type="assertion",
+            aspect_name="assertionRunEvent",
+            aspect_field_matcher={},
+            file=output_file,
+            exception_urns=["urn:li:assertion:2ff754df689ea951ed2e12cbe356708f"],
+        )
+        == number_of_assertions - 1
+    )
+
+
+@pytest.mark.integration
+@time_machine.travel(FROZEN_TIME, tick=False)
+def test_dbt_convert_urns_to_lowercase(
+    test_resources_dir, pytestconfig, tmp_path, mock_time, requests_mock
+):
+    """Verify that convert_urns_to_lowercase flows through the full pipeline
+    and all emitted dbt-platform URNs contain only lowercase dataset names."""
+    output_file = tmp_path / "dbt_lowercase_urns_output.json"
+
+    pipeline = Pipeline(
+        config=PipelineConfig(
+            source=SourceConfig(
+                type="dbt",
+                config=DBTCoreConfig(
+                    **_default_dbt_source_args,
+                    manifest_path=str(
+                        (test_resources_dir / "dbt_manifest.json").resolve()
+                    ),
+                    catalog_path=str(
+                        (test_resources_dir / "dbt_catalog.json").resolve()
+                    ),
+                    sources_path=str(
+                        (test_resources_dir / "dbt_sources.json").resolve()
+                    ),
+                    target_platform="postgres",
+                    convert_urns_to_lowercase=True,
+                ),
+            ),
+            sink=DynamicTypedConfig(type="file", config={"filename": str(output_file)}),
+        )
+    )
+    pipeline.run()
+    pipeline.raise_from_status()
+
+    with open(output_file) as f:
+        output = json.load(f)
+
+    dbt_urns = {
+        item["entityUrn"]
+        for item in output
+        if "entityUrn" in item and "dataPlatform:dbt" in item["entityUrn"]
+    }
+    assert len(dbt_urns) > 0, "Expected at least one dbt platform URN in output"
+    for urn in dbt_urns:
+        dataset_name = DatasetUrn.from_string(urn).name
+        assert dataset_name == dataset_name.lower(), (
+            f"dbt URN dataset name should be lowercase: {urn}"
+        )

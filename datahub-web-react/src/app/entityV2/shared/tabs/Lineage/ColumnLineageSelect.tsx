@@ -1,0 +1,128 @@
+import { Tooltip } from '@components';
+import { CaretDown } from '@phosphor-icons/react/dist/csr/CaretDown';
+import { TreeStructure } from '@phosphor-icons/react/dist/csr/TreeStructure';
+import { Button, Select } from 'antd';
+import * as React from 'react';
+import { Trans, useTranslation } from 'react-i18next';
+import { useHistory, useLocation } from 'react-router';
+import styled from 'styled-components/macro';
+
+import { useEntityData } from '@app/entity/shared/EntityContext';
+import { useGetEntityWithSchema } from '@app/entityV2/shared/tabs/Dataset/Schema/useGetEntitySchema';
+import { downgradeV2FieldPath } from '@app/lineageV3/utils/downgradeV2FieldPath';
+import updateQueryParams from '@app/sharedV2/updateQueryParams';
+
+const StyledSelect = styled(Select)`
+    margin-right: 5px;
+    min-width: 200px;
+    max-width: 300px;
+`;
+
+const StyledButton = styled(Button)<{ $isSelected: boolean }>`
+    && {
+        transition: color 0s;
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        height: auto;
+        padding: 4px 8px;
+        font-size: 12px;
+        font-weight: 700;
+        line-height: 16px;
+    }
+
+    ${(props) =>
+        props.$isSelected &&
+        `
+        color: ${props.theme.colors.textBrand};
+        &:focus, &:hover {
+            color: ${props.theme.colors.textBrand};
+        }
+    `};
+`;
+
+interface Props {
+    selectedColumn?: string;
+    isColumnLevelLineage: boolean;
+    setSelectedColumn: (column: any) => void;
+    setIsColumnLevelLineage: (isShowing: boolean) => void;
+}
+
+export default function ColumnsLineageSelect({
+    selectedColumn,
+    isColumnLevelLineage,
+    setSelectedColumn,
+    setIsColumnLevelLineage,
+}: Props) {
+    const { t } = useTranslation('lineage');
+    const { entityData } = useEntityData();
+    const location = useLocation();
+    const history = useHistory();
+    const { entityWithSchema } = useGetEntityWithSchema();
+
+    function selectColumn(column: any) {
+        updateQueryParams({ column }, location, history);
+        setSelectedColumn(column);
+    }
+
+    const columnButtonTooltip = isColumnLevelLineage ? t('columnLineage.hideTooltip') : t('columnLineage.showTooltip');
+
+    return (
+        <>
+            {isColumnLevelLineage && (
+                <StyledSelect
+                    data-testid="column-selector-dropdown"
+                    value={selectedColumn}
+                    onChange={selectColumn}
+                    showSearch
+                    allowClear
+                    placeholder={t('columnLineage.selectColumnPlaceholder')}
+                    optionFilterProp="label"
+                >
+                    {entityWithSchema?.schemaMetadata?.fields?.map((field) => {
+                        const fieldPath = downgradeV2FieldPath(field.fieldPath);
+                        return (
+                            <Select.Option
+                                value={field.fieldPath}
+                                label={fieldPath}
+                                data-testid={`column-option-${fieldPath}`}
+                            >
+                                <Tooltip title={fieldPath} showArrow={false}>
+                                    {fieldPath}
+                                </Tooltip>
+                            </Select.Option>
+                        );
+                    })}
+                    {entityData?.inputFields?.fields?.map((field, idx) => {
+                        const fieldPath = downgradeV2FieldPath(field?.schemaField?.fieldPath);
+                        const key = `${field?.schemaField?.fieldPath}-${idx}`;
+                        return (
+                            <Select.Option
+                                key={key}
+                                value={field?.schemaField?.fieldPath || ''}
+                                label={fieldPath}
+                                data-testid={`column-option-${fieldPath}`}
+                            >
+                                <Tooltip title={fieldPath} showArrow={false}>
+                                    {fieldPath}
+                                </Tooltip>
+                            </Select.Option>
+                        );
+                    })}
+                </StyledSelect>
+            )}
+            <Tooltip title={columnButtonTooltip} showArrow={false}>
+                <StyledButton
+                    type="text"
+                    onClick={() => setIsColumnLevelLineage(!isColumnLevelLineage)}
+                    data-testid="column-lineage-toggle"
+                    $isSelected={isColumnLevelLineage}
+                >
+                    <TreeStructure size={16} />
+                    <Trans i18nKey="lineage:columnLineage.buttonLabel" components={{ b: <b /> }} />
+                    <CaretDown size={12} />
+                </StyledButton>
+            </Tooltip>
+        </>
+    );
+}

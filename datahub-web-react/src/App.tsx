@@ -1,0 +1,163 @@
+import '@src/App.less';
+import '@src/AppV2.less';
+
+import { ApolloClient, ApolloLink, ApolloProvider, InMemoryCache, ServerError, createHttpLink } from '@apollo/client';
+import { onError } from '@apollo/client/link/error';
+import Cookies from 'js-cookie';
+import React, { Suspense } from 'react';
+import { Helmet, HelmetProvider } from 'react-helmet-async';
+import { BrowserRouter as Router } from 'react-router-dom';
+import { StyleSheetManager } from 'styled-components';
+
+import { GlobalStyles } from '@components/components/GlobalStyles';
+import { ToastRenderer } from '@components/components/Toast';
+
+import { Routes } from '@app/Routes';
+import { hideLineageInSearchCardsRef, showSeparateSiblingsRef } from '@app/appConfig/UpdateGlobalFlags';
+import { injectGlobalSearchVariables } from '@app/appConfig/injectedOperationVariables';
+import { isLoggedInVar } from '@app/auth/checkAuthStatus';
+import { FilesUploadingDownloadingLatencyTracker } from '@app/sharedV2/FilesUploadingDownloadingLatencyTracker';
+import { SuspenseGlobal } from '@app/sharedV2/SuspenseGlobal';
+import { ErrorCodes } from '@app/sharedV2/constants';
+import { loadIsDarkMode } from '@app/theme/useIsDarkMode';
+import { PageRoutes } from '@conf/Global';
+import CustomThemeProvider from '@src/CustomThemeProvider';
+import { installApolloPollingContextPatch } from '@src/apolloPolling';
+import { GlobalCfg } from '@src/conf';
+import { useCustomTheme } from '@src/customThemeContext';
+import { buildGraphqlHttpUri } from '@src/graphqlHttpUri';
+import { otelOperationLink } from '@src/otelApollo';
+import possibleTypesResult from '@src/possibleTypes.generated';
+import { getRuntimeBasePath, removeRuntimePath, resolveRuntimePath } from '@utils/runtimeBasePath';
+
+/*
+    Construct Apollo Client
+*/
+const httpLink = createHttpLink({
+    uri: ({ operationName }) => buildGraphqlHttpUri(operationName),
+});
+
+const errorLink = onError((error) => {
+    const { networkError } = error;
+    if (networkError) {
+        const serverError = networkError as ServerError;
+        if (serverError.statusCode === ErrorCodes.Unauthorized) {
+            isLoggedInVar(false);
+            Cookies.remove(GlobalCfg.CLIENT_AUTH_COOKIE);
+            const currentPath = removeRuntimePath(window.location.pathname) + window.location.search;
+            const authUrl = resolveRuntimePath(PageRoutes.AUTHENTICATE);
+            window.location.replace(`${authUrl}?redirect_uri=${encodeURIComponent(currentPath)}`);
+        }
+    }
+    // Disabled behavior for now -> Components are expected to handle their errors.
+    //
+    // if (graphQLErrors && graphQLErrors.length) {
+    //     const firstError = graphQLErrors[0];
+    //     const { extensions } = firstError;
+    //     const errorCode = extensions && (extensions.code as number);
+    //     // Fallback in case the calling component does not handle.
+    //     toast.error(`${firstError.message} (code ${errorCode})`, { duration: 3 }); // TODO: Decide if we want this back.
+    // }
+});
+
+const injectVariablesLink = new ApolloLink((operation, forward) => {
+    // eslint-disable-next-line no-param-reassign
+    operation.variables = injectGlobalSearchVariables(operation.variables, {
+        showSeparateSiblings: showSeparateSiblingsRef.current,
+        hideLineageInSearchCards: hideLineageInSearchCardsRef.current,
+    });
+
+    return forward(operation);
+});
+
+const client = new ApolloClient({
+    connectToDevTools: true,
+    link: ApolloLink.from([otelOperationLink, injectVariablesLink, errorLink, httpLink]),
+    cache: new InMemoryCache({
+        typePolicies: {
+            Query: {
+                fields: {
+                    latestProductUpdate: {
+                        keyArgs: ['locale'],
+                    },
+                    dataset: {
+                        merge: (oldObj, newObj) => {
+                            return { ...oldObj, ...newObj };
+                        },
+                    },
+                    entity: {
+                        merge: (oldObj, newObj) => {
+                            return { ...oldObj, ...newObj };
+                        },
+                    },
+                    // getGlossaryTerm and getRelatedTerms select different fields of the same term.
+                    // GlossaryTerm is not normalized, so without a merge the second write replaces
+                    // the first and the profile query refetches the whole term from the network.
+                    glossaryTerm: {
+                        merge: (oldObj, newObj) => {
+                            return { ...oldObj, ...newObj };
+                        },
+                    },
+                },
+            },
+            // ProductUpdate.id is a release version, not a unique cache identity across locales.
+            ProductUpdate: {
+                keyFields: false,
+            },
+        },
+        // need to define possibleTypes to allow us to use Apollo cache with union types
+        possibleTypes: possibleTypesResult.possibleTypes,
+    }),
+    credentials: 'include',
+    defaultOptions: {
+        watchQuery: {
+            fetchPolicy: 'no-cache',
+        },
+        query: {
+            fetchPolicy: 'no-cache',
+        },
+    },
+});
+
+// Forward NetworkStatus.poll onto operation.context so GraphQL tracing links can skip
+// timer-driven poll ticks without an op-name denylist. Must run after `new ApolloClient`.
+installApolloPollingContextPatch(client);
+
+export const InnerApp: React.VFC = () => {
+    const isDarkMode = loadIsDarkMode();
+
+    return (
+        // Lazy route chunks add library CSS to <head> after styled-components' tag. Keeping our styles in
+        // <body> puts them after every stylesheet, so they win at equal specificity however late a chunk loads.
+        <StyleSheetManager target={document.body}>
+            <HelmetProvider>
+                <CustomThemeProvider isDarkMode={isDarkMode} injectGlobalStyles>
+                    <GlobalStyles />
+                    {/* ToastRenderer translates its own labels and sits above the router's boundary,
+                        so it needs one of its own while the locale bundle loads. */}
+                    <Suspense fallback={null}>
+                        <ToastRenderer />
+                    </Suspense>
+                    <FilesUploadingDownloadingLatencyTracker />
+
+                    <Helmet>
+                        <title>{useCustomTheme().theme?.content?.title}</title>
+                    </Helmet>
+                    <Router basename={getRuntimeBasePath()}>
+                        <Suspense fallback={<SuspenseGlobal />}>
+                            <Routes />
+                        </Suspense>
+                    </Router>
+                </CustomThemeProvider>
+            </HelmetProvider>
+        </StyleSheetManager>
+    );
+};
+
+export const App: React.VFC = () => {
+    return (
+        <ApolloProvider client={client}>
+            <InnerApp />
+        </ApolloProvider>
+    );
+};

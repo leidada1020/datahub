@@ -1,0 +1,28 @@
+namespace com.linkedin.ml.metadata
+
+/**
+ * Properties associated with a MLFeatureTable editable from the ui
+ */
+@Aspect = {
+  "name": "editableMlFeatureTableProperties"
+}
+record EditableMLFeatureTableProperties {
+
+  /**
+   * Documentation of the MLFeatureTable
+   */
+  @Searchable = {
+    "fieldType": "TEXT",
+    "fieldName": "editedDescription",
+    "hasValuesFieldName": "hasDescription",
+    "v3": {
+      "searchLabel": "description",
+      "mappings": [
+        { "type": "KEYWORD", "index": false, "docValues": false },
+        { "subfield": "text", "type": "TEXT" },
+        { "subfield": "stemmed", "type": "STEMMED" }
+      ]
+    }
+  }
+  description: optional string
+}

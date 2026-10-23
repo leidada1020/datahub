@@ -1,0 +1,42 @@
+entity_mapping_config:
+  mappings:
+    dynamic: false
+    dynamic_templates:
+      - ownership_type_fields:
+          match: "urn:li:ownershipType:*"
+          mapping:
+            type: keyword
+            ignore_above: 255
+    properties:
+      urn:
+        type: keyword
+        ignore_above: 512
+      _entityType:
+        type: keyword
+      _system:
+        dynamic: false
+        properties:
+          created:
+            properties:
+              time:
+                type: date
+              actor:
+                type: keyword
+          modified:
+            properties:
+              time:
+                type: date
+              actor:
+                type: keyword
+          lastObserved:
+            type: date
+          runId:
+            type: keyword
+          lastRunId:
+            type: keyword
+      runId:
+        type: keyword
+      systemCreated:
+        type: date
+      systemIndexModified:
+        type: date

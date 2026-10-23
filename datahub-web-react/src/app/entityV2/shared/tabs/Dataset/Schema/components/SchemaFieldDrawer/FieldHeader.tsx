@@ -1,0 +1,148 @@
+import { X } from '@phosphor-icons/react/dist/csr/X';
+import { Divider } from 'antd';
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import { Link } from 'react-router-dom';
+import styled from 'styled-components';
+
+import translateFieldPath from '@app/entityV2/dataset/profile/schema/utils/translateFieldPath';
+import { EntityTabPath } from '@app/entityV2/shared/constants';
+import NullableLabel, {
+    PartitioningKeyLabel,
+    PrimaryKeyLabel,
+} from '@app/entityV2/shared/tabs/Dataset/Schema/components/ConstraintLabels';
+import MenuColumn from '@app/entityV2/shared/tabs/Dataset/Schema/components/MenuColumn';
+import FieldPath from '@app/entityV2/shared/tabs/Dataset/Schema/components/SchemaFieldDrawer/FieldPath';
+import TypeLabel from '@app/entityV2/shared/tabs/Dataset/Schema/components/TypeLabel';
+import { useAppConfig } from '@app/useAppConfig';
+import { useEntityRegistry } from '@app/useEntityRegistry';
+
+import { SchemaField } from '@types';
+
+const FIELD_PATH_SEPARATOR = '.';
+
+const FieldHeaderWrapper = styled.div`
+    padding: 16px;
+    display: flex;
+    justify-content: space-between;
+    border-bottom: 1px solid ${(props) => props.theme.colors.border};
+`;
+
+const NameTypesWrapper = styled.div`
+    display: flex;
+    flex-direction: column;
+`;
+
+const TitleWrapper = styled.div`
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 16px;
+`;
+
+const RightGroup = styled.div`
+    display: flex;
+    align-items: baseline;
+`;
+
+const MenuWrapper = styled.div`
+    margin-right: 5px;
+`;
+
+const FieldText = styled.div`
+    font-size: 12px;
+    line-height: 24px;
+    color: ${(props) => props.theme.colors.textTertiary};
+`;
+
+const CloseIcon = styled.div`
+    font-size: 12px;
+    padding: 0;
+    height: 24px;
+    width: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
+    &&:hover {
+        cursor: pointer;
+        stroke-width: 10px;
+    }
+
+    svg {
+        height: 16px;
+        width: 16px;
+    }
+`;
+
+const StyledDivider = styled(Divider)`
+    height: 75%;
+    margin: 0;
+`;
+
+const StyledTypeLabel = styled(TypeLabel)`
+    font-size: 14px;
+    color: ${(props) => props.theme.colors.textSecondary};
+`;
+
+const StyleLink = styled(Link)`
+    color: ${(props) => props.theme.colors.text};
+    font-weight: 700;
+
+    &:hover {
+        text-decoration: underline;
+    }
+`;
+
+interface Props {
+    expandedField: SchemaField;
+    setExpandedDrawerFieldPath: (fieldPath: string | null) => void;
+}
+
+export default function FieldHeader({ expandedField, setExpandedDrawerFieldPath }: Props) {
+    const { t: tc } = useTranslation('common.labels');
+    const { config } = useAppConfig();
+    const displayName = translateFieldPath(expandedField.fieldPath || '');
+    const entityRegistry = useEntityRegistry();
+
+    const linkEnabled = config.featureFlags.schemaFieldCLLEnabled;
+
+    return (
+        <FieldHeaderWrapper>
+            <NameTypesWrapper>
+                <TitleWrapper>
+                    {linkEnabled ? (
+                        <StyleLink
+                            to={
+                                expandedField.schemaFieldEntity &&
+                                `${entityRegistry.getEntityUrl(
+                                    expandedField.schemaFieldEntity?.type,
+                                    (expandedField.schemaFieldEntity?.urn as string) || '',
+                                )}/${EntityTabPath.LINEAGE}`
+                            }
+                        >
+                            {displayName.split(FIELD_PATH_SEPARATOR).pop()}
+                        </StyleLink>
+                    ) : (
+                        displayName.split(FIELD_PATH_SEPARATOR).pop()
+                    )}
+                    <StyledDivider type="vertical" />
+                    <StyledTypeLabel type={expandedField.type} nativeDataType={expandedField.nativeDataType} />
+                    {expandedField.isPartOfKey && <PrimaryKeyLabel />}
+                    {expandedField.isPartitioningKey && <PartitioningKeyLabel />}
+                    {expandedField.nullable && <NullableLabel />}
+                    <FieldPath displayName={displayName} setExpandedDrawerFieldPath={setExpandedDrawerFieldPath} />
+                </TitleWrapper>
+                <FieldText>{tc('column')}</FieldText>
+            </NameTypesWrapper>
+            <RightGroup>
+                <MenuWrapper>
+                    <MenuColumn field={expandedField} />
+                </MenuWrapper>
+                <CloseIcon onClick={() => setExpandedDrawerFieldPath(null)}>
+                    <X />
+                </CloseIcon>
+            </RightGroup>
+        </FieldHeaderWrapper>
+    );
+}

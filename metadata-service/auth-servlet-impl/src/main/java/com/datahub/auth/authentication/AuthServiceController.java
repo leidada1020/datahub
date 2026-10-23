@@ -1,0 +1,944 @@
+package com.datahub.auth.authentication;
+
+import static com.google.common.net.HttpHeaders.X_FORWARDED_FOR;
+import static com.linkedin.metadata.Constants.*;
+import static com.linkedin.metadata.telemetry.OpenTelemetryKeyConstants.EVENT_TYPE_ATTR;
+import static com.linkedin.metadata.telemetry.OpenTelemetryKeyConstants.LOGIN_DENIAL_REASON_ATTR;
+import static com.linkedin.metadata.telemetry.OpenTelemetryKeyConstants.LOGIN_EVENT;
+import static com.linkedin.metadata.telemetry.OpenTelemetryKeyConstants.LOGIN_SOURCE_ATTR;
+import static com.linkedin.metadata.telemetry.OpenTelemetryKeyConstants.SOURCE_IP;
+import static com.linkedin.metadata.telemetry.OpenTelemetryKeyConstants.USER_ID_ATTR;
+
+import com.datahub.authentication.Actor;
+import com.datahub.authentication.ActorType;
+import com.datahub.authentication.Authentication;
+import com.datahub.authentication.AuthenticationContext;
+import com.datahub.authentication.LoginDenialReason;
+import com.datahub.authentication.invite.InviteTokenService;
+import com.datahub.authentication.session.UserSessionEligibilityChecker;
+import com.datahub.authentication.token.StatelessTokenService;
+import com.datahub.authentication.token.TokenClaims;
+import com.datahub.authentication.token.TokenType;
+import com.datahub.authentication.user.NativeUserService;
+import com.datahub.authorization.AuthorizerChain;
+import com.datahub.plugins.auth.authorization.Authorizer;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.linkedin.common.urn.CorpuserUrn;
+import com.linkedin.common.urn.Urn;
+import com.linkedin.common.urn.UrnUtils;
+import com.linkedin.data.template.RecordTemplate;
+import com.linkedin.gms.factory.config.ConfigurationProvider;
+import com.linkedin.identity.CorpUserInfo;
+import com.linkedin.metadata.auth.LoginIdentityMask;
+import com.linkedin.metadata.datahubusage.DataHubUsageEventType;
+import com.linkedin.metadata.datahubusage.event.LoginSource;
+import com.linkedin.metadata.entity.EntityService;
+import com.linkedin.metadata.utils.metrics.MetricUtils;
+import com.linkedin.settings.global.GlobalSettingsInfo;
+import com.linkedin.settings.global.OidcSettings;
+import com.linkedin.settings.global.SsoSettings;
+import io.datahubproject.metadata.context.ActorContext;
+import io.datahubproject.metadata.context.OperationContext;
+import io.datahubproject.metadata.context.RequestContext;
+import io.datahubproject.metadata.context.usage.UsageOperation;
+import io.datahubproject.metadata.services.SecretService;
+import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.api.common.AttributesBuilder;
+import io.opentelemetry.api.trace.Span;
+import jakarta.servlet.http.HttpServletRequest;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import javax.annotation.Nonnull;
+import lombok.extern.slf4j.Slf4j;
+import org.json.JSONArray;
+import org.json.JSONObject;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@Slf4j
+@RestController
+@RequestMapping("/auth")
+public class AuthServiceController {
+
+  private static final String USER_ID_FIELD_NAME = "userId";
+  private static final String ACCESS_TOKEN_FIELD_NAME = "accessToken";
+  private static final String USER_URN_FIELD_NAME = "userUrn";
+  private static final String FULL_NAME_FIELD_NAME = "fullName";
+  private static final String EMAIL_FIELD_NAME = "email";
+  private static final String TITLE_FIELD_NAME = "title";
+  private static final String PASSWORD_FIELD_NAME = "password";
+  private static final String INVITE_TOKEN_FIELD_NAME = "inviteToken";
+  private static final String RESET_TOKEN_FIELD_NAME = "resetToken";
+  private static final String IS_NATIVE_USER_CREATED_FIELD_NAME = "isNativeUserCreated";
+  private static final String ARE_NATIVE_USER_CREDENTIALS_RESET_FIELD_NAME =
+      "areNativeUserCredentialsReset";
+  private static final String DOES_PASSWORD_MATCH_FIELD_NAME = "doesPasswordMatch";
+  private static final String LOGIN_DENIAL_REASON_FIELD_NAME = "loginDenialReason";
+  private static final String BASE_URL = "baseUrl";
+  private static final String OIDC_ENABLED = "oidcEnabled";
+  private static final String CLIENT_ID = "clientId";
+  private static final String CLIENT_SECRET = "clientSecret";
+  private static final String DISCOVERY_URI = "discoveryUri";
+  private static final String USER_NAME_CLAIM = "userNameClaim";
+  private static final String USER_NAME_CLAIM_REGEX = "userNameClaimRegex";
+  private static final String SCOPE = "scope";
+  private static final String CLIENT_AUTHENTICATION_METHOD = "clientAuthenticationMethod";
+  private static final String JIT_PROVISIONING_ENABLED = "jitProvisioningEnabled";
+  private static final String PRE_PROVISIONING_REQUIRED = "preProvisioningRequired";
+  private static final String EXTRACT_GROUPS_ENABLED = "extractGroupsEnabled";
+  private static final String GROUPS_CLAIM = "groupsClaim";
+  private static final String RESPONSE_TYPE = "responseType";
+  private static final String RESPONSE_MODE = "responseMode";
+  private static final String USE_NONCE = "useNonce";
+  private static final String READ_TIMEOUT = "readTimeout";
+  private static final String EXTRACT_JWT_ACCESS_TOKEN_CLAIMS = "extractJwtAccessTokenClaims";
+  // Retained for backwards compatibility
+  private static final String PREFERRED_JWS_ALGORITHM = "preferredJwsAlgorithm";
+  private static final String PREFERRED_JWS_ALGORITHM_2 = "preferredJwsAlgorithm2";
+  private static final String REQUIRED_GROUPS = "requiredGroups";
+  private static final String ACCESS_DENIED_MESSAGE = "accessDeniedMessage";
+  private static final String ACCESS_DENIED_REDIRECT_URL = "accessDeniedRedirectUrl";
+
+  private static final String LOGIN_OUTCOME_SUCCESS = "success";
+  private static final String LOGIN_OUTCOME_FAILURE = "failure";
+  private static final String LOGIN_DENIAL_REASON_NONE = "none";
+  private static final String LOGIN_SOURCE_UNKNOWN = "unknown";
+
+  @Autowired private StatelessTokenService _statelessTokenService;
+
+  @Autowired private Authentication _systemAuthentication;
+
+  @Autowired
+  @Qualifier("configurationProvider")
+  private ConfigurationProvider _configProvider;
+
+  @Autowired private NativeUserService _nativeUserService;
+
+  @Autowired private UserSessionEligibilityChecker _userSessionEligibilityChecker;
+
+  @Autowired private EntityService<?> _entityService;
+
+  @Autowired private SecretService _secretService;
+
+  @Autowired private InviteTokenService _inviteTokenService;
+
+  @Autowired private ObjectMapper mapper;
+
+  @Autowired
+  @Qualifier("systemOperationContext")
+  private OperationContext systemOperationContext;
+
+  @Autowired private AuthorizerChain authorizerChain;
+
+  /**
+   * Generates a JWT access token for as user UI session, provided a unique "user id" to generate
+   * the token for inside a JSON POST body.
+   *
+   * <p>Example Request:
+   *
+   * <p>POST /generateSessionTokenForUser -H "Authorization: Basic
+   * <system-client-id>:<system-client-secret>" { "userId": "datahub" }
+   *
+   * <p>Example Response:
+   *
+   * <p>{ "accessToken": "<the access token>" }
+   */
+  @PostMapping(value = "/generateSessionTokenForUser", produces = "application/json;charset=utf-8")
+  CompletableFuture<ResponseEntity<String>> generateSessionTokenForUser(
+      final HttpServletRequest request, final HttpEntity<String> httpEntity) {
+    String jsonStr = httpEntity.getBody();
+
+    JsonNode bodyJson = null;
+    try {
+      bodyJson = mapper.readTree(jsonStr);
+    } catch (JsonProcessingException e) {
+      log.error("Failed to parse json while attempting to generate session token ", e);
+      return CompletableFuture.completedFuture(new ResponseEntity<>(HttpStatus.BAD_REQUEST));
+    }
+    if (bodyJson == null) {
+      return CompletableFuture.completedFuture(new ResponseEntity<>(HttpStatus.BAD_REQUEST));
+    }
+    /*
+     * Extract userId field
+     */
+    JsonNode userId = bodyJson.get(USER_ID_FIELD_NAME);
+    if (userId == null) {
+      return CompletableFuture.completedFuture(new ResponseEntity<>(HttpStatus.BAD_REQUEST));
+    }
+
+    log.info(
+        "Attempting to generate session token for userRef={}",
+        LoginIdentityMask.mask(userId.asText()));
+    final Optional<Authentication> maybeAuth = AuthenticationContext.maybeAuthentication();
+    if (maybeAuth.isEmpty()) {
+      return CompletableFuture.completedFuture(new ResponseEntity<>(HttpStatus.UNAUTHORIZED));
+    }
+    final Authentication authentication = maybeAuth.get();
+    recordUsageSession(
+        httpEntity.getHeaders(), "generateSessionTokenForUser", UsageOperation.OTHER_WRITE);
+    final String actorUrn = authentication.getActor().toUrnStr();
+    final OperationContext opContext =
+        OperationContext.asSession(
+            systemOperationContext,
+            RequestContext.builder()
+                .buildOpenapi(actorUrn, request, "generateSessionTokenForUser", List.of()),
+            // Authorizer.SYSTEM: these /auth endpoints are called with system Basic credentials;
+            // matches
+            // pre-refactor systemOperationContext authorizer (not Authorizer.EMPTY which
+            // deny-alls).
+            Authorizer.SYSTEM,
+            authentication,
+            true);
+    if (!isTrustedAuthHelperCaller(opContext)) {
+      return CompletableFuture.completedFuture(new ResponseEntity<>(HttpStatus.UNAUTHORIZED));
+    }
+    return CompletableFuture.supplyAsync(
+        () -> {
+          try {
+            final boolean verboseAuthFailureLogging =
+                _configProvider.getAuthentication().isVerboseAuthFailureLogging();
+            final boolean enforceExistence =
+                _configProvider.getAuthentication().isEnforceExistenceEnabled();
+            final String loginSource =
+                resolveLoginSource(httpEntity.getHeaders(), LOGIN_SOURCE_UNKNOWN);
+            final Optional<LoginDenialReason> eligibilityDenial =
+                _userSessionEligibilityChecker.checkEligibility(
+                    opContext, userId.asText(), enforceExistence);
+            if (eligibilityDenial.isPresent()) {
+              final LoginDenialReason denialReason = eligibilityDenial.get();
+              recordFailedLoginUsageEvent(
+                  httpEntity,
+                  new CorpuserUrn(userId.asText()).toString(),
+                  denialReason,
+                  "failedLoginSessionEligibility",
+                  loginSource);
+              emitLoginDenialLog(
+                  verboseAuthFailureLogging,
+                  userId.asText(),
+                  denialReason,
+                  "generateSessionTokenForUser");
+              return new ResponseEntity<>(
+                  buildLoginDenialJsonBody(denialReason), HttpStatus.FORBIDDEN);
+            }
+
+            final long sessionTokenDurationMs =
+                _configProvider.getAuthentication().getSessionTokenDurationMs();
+            final String token =
+                _statelessTokenService.generateAccessToken(
+                    TokenType.SESSION,
+                    new Actor(ActorType.USER, userId.asText()),
+                    sessionTokenDurationMs);
+            log.info(
+                "Successfully generated session token for userRef: {}, duration: {} ms",
+                LoginIdentityMask.mask(userId.asText()),
+                sessionTokenDurationMs);
+            return opContext.withSpan(
+                "loginSuccess",
+                () -> {
+                  AttributesBuilder loginEventAttributes = Attributes.builder();
+                  loginEventAttributes.put(
+                      USER_ID_ATTR, new CorpuserUrn(userId.asText()).toString());
+                  loginEventAttributes.put(
+                      EVENT_TYPE_ATTR, DataHubUsageEventType.LOG_IN_EVENT.getType());
+                  if (!LOGIN_SOURCE_UNKNOWN.equals(loginSource)) {
+                    loginEventAttributes.put(LOGIN_SOURCE_ATTR, loginSource);
+                  }
+                  List<String> sourceIP = httpEntity.getHeaders().getOrEmpty(X_FORWARDED_FOR);
+                  if (!sourceIP.isEmpty()) {
+                    loginEventAttributes.put(SOURCE_IP, sourceIP.get(0));
+                  }
+                  Span.current().addEvent(LOGIN_EVENT, loginEventAttributes.build());
+                  incrementLoginMetric(
+                      LOGIN_OUTCOME_SUCCESS, loginSource, LOGIN_DENIAL_REASON_NONE);
+                  return new ResponseEntity<>(buildTokenResponse(token), HttpStatus.OK);
+                });
+          } catch (Exception e) {
+            log.error(
+                "Failed to generate session token for userRef: {}",
+                LoginIdentityMask.mask(userId.asText()),
+                e);
+            return new ResponseEntity<>(HttpStatus.INTERNAL_SERVER_ERROR);
+          }
+        });
+  }
+
+  /**
+   * Creates a native DataHub user using the provided full name, email and password. The provided
+   * invite token must be current otherwise a new user will not be created.
+   *
+   * <p>Example Request:
+   *
+   * <p>POST /signUp -H "Authorization: Basic <system-client-id>:<system-client-secret>" {
+   * "fullName": "Full Name" "userUrn": "urn:li:corpuser:test" "email": "email@test.com" "title":
+   * "Data Scientist" "password": "password123" "inviteToken": "abcd" }
+   *
+   * <p>Note: "title" is optional. If not provided, user title will not be set.
+   *
+   * <p>Example Response:
+   *
+   * <p>{ "isNativeUserCreated": true }
+   */
+  @PostMapping(value = "/signUp", produces = "application/json;charset=utf-8")
+  CompletableFuture<ResponseEntity<String>> signUp(
+      final HttpServletRequest request, final HttpEntity<String> httpEntity) {
+    String jsonStr = httpEntity.getBody();
+
+    JsonNode bodyJson;
+    try {
+      bodyJson = mapper.readTree(jsonStr);
+    } catch (JsonProcessingException e) {
+      log.debug("Failed to parse json while attempting to create native user", e);
+      return CompletableFuture.completedFuture(new ResponseEntity<>(HttpStatus.BAD_REQUEST));
+    }
+    if (bodyJson == null) {
+      return CompletableFuture.completedFuture(new ResponseEntity<>(HttpStatus.BAD_REQUEST));
+    }
+    /*
+     * Extract username and password field
+     */
+    JsonNode userUrn = bodyJson.get(USER_URN_FIELD_NAME);
+    JsonNode fullName = bodyJson.get(FULL_NAME_FIELD_NAME);
+    JsonNode email = bodyJson.get(EMAIL_FIELD_NAME);
+    JsonNode title = bodyJson.get(TITLE_FIELD_NAME);
+    JsonNode password = bodyJson.get(PASSWORD_FIELD_NAME);
+    JsonNode inviteToken = bodyJson.get(INVITE_TOKEN_FIELD_NAME);
+    if (fullName == null
+        || userUrn == null
+        || email == null
+        || password == null
+        || inviteToken == null) {
+      return CompletableFuture.completedFuture(new ResponseEntity<>(HttpStatus.BAD_REQUEST));
+    }
+
+    final Optional<Authentication> maybeAuth = AuthenticationContext.maybeAuthentication();
+    if (maybeAuth.isEmpty()) {
+      return CompletableFuture.completedFuture(new ResponseEntity<>(HttpStatus.UNAUTHORIZED));
+    }
+    final Authentication auth = maybeAuth.get();
+    final OperationContext opContext =
+        OperationContext.asSession(
+            systemOperationContext,
+            RequestContext.builder()
+                .buildOpenapi(auth.getActor().toUrnStr(), request, "signUp", List.of()),
+            Authorizer.SYSTEM,
+            auth,
+            true);
+    if (!isTrustedAuthHelperCaller(opContext)) {
+      return CompletableFuture.completedFuture(new ResponseEntity<>(HttpStatus.UNAUTHORIZED));
+    }
+    recordUsageSession(httpEntity.getHeaders(), "signUp", UsageOperation.OTHER_WRITE);
+
+    String userUrnString = userUrn.asText();
+    String systemClientUser =
+        new CorpuserUrn(_configProvider.getAuthentication().getSystemClientId()).toString();
+
+    if (userUrnString.equals(systemClientUser) || userUrnString.equals(UNKNOWN_ACTOR)) {
+      return CompletableFuture.completedFuture(new ResponseEntity<>(HttpStatus.BAD_REQUEST));
+    }
+    String fullNameString = fullName.asText();
+    String emailString = email.asText();
+    // Title is optional - null if not provided
+    String titleString = title == null ? null : title.asText();
+    String passwordString = password.asText();
+    String inviteTokenString = inviteToken.asText();
+    log.info("Attempting to create native user {}", userUrnString);
+    return CompletableFuture.supplyAsync(
+        () -> {
+          try {
+            if (_inviteTokenService.getVerifiedInviteToken(opContext, inviteTokenString) == null) {
+              log.error("Invalid invite token");
+              return new ResponseEntity<>(HttpStatus.BAD_REQUEST);
+            }
+
+            _nativeUserService.createNativeUser(
+                opContext, userUrnString, fullNameString, emailString, titleString, passwordString);
+            String response = buildSignUpResponse();
+            log.info("Created native user {}", userUrnString);
+            return new ResponseEntity<>(response, HttpStatus.OK);
+          } catch (Exception e) {
+            log.error("Failed to create credentials for native user {}", userUrnString, e);
+            return new ResponseEntity<>(HttpStatus.INTERNAL_SERVER_ERROR);
+          }
+        });
+  }
+
+  /**
+   * Resets the credentials for a native DataHub user using the provided email and new password. The
+   * provided reset token must be current otherwise the credentials will not be updated
+   *
+   * <p>Example Request:
+   *
+   * <p>POST /resetNativeUserCredentials -H "Authorization: Basic
+   * <system-client-id>:<system-client-secret>" { "userUrn": "urn:li:corpuser:test" "password":
+   * "password123" "resetToken": "abcd" }
+   *
+   * <p>Example Response:
+   *
+   * <p>{ "areNativeUserCredentialsReset": true }
+   */
+  @PostMapping(value = "/resetNativeUserCredentials", produces = "application/json;charset=utf-8")
+  CompletableFuture<ResponseEntity<String>> resetNativeUserCredentials(
+      final HttpServletRequest request, final HttpEntity<String> httpEntity) {
+    String jsonStr = httpEntity.getBody();
+
+    JsonNode bodyJson;
+    try {
+      bodyJson = mapper.readTree(jsonStr);
+    } catch (JsonProcessingException e) {
+      log.debug("Failed to parse json while attempting to create native user", e);
+      return CompletableFuture.completedFuture(new ResponseEntity<>(HttpStatus.BAD_REQUEST));
+    }
+    if (bodyJson == null) {
+      return CompletableFuture.completedFuture(new ResponseEntity<>(HttpStatus.BAD_REQUEST));
+    }
+    /*
+     * Extract username and password field
+     */
+    JsonNode userUrn = bodyJson.get(USER_URN_FIELD_NAME);
+    JsonNode password = bodyJson.get(PASSWORD_FIELD_NAME);
+    JsonNode resetToken = bodyJson.get(RESET_TOKEN_FIELD_NAME);
+    if (userUrn == null || password == null || resetToken == null) {
+      return CompletableFuture.completedFuture(new ResponseEntity<>(HttpStatus.BAD_REQUEST));
+    }
+
+    String userUrnString = userUrn.asText();
+    String passwordString = password.asText();
+    String resetTokenString = resetToken.asText();
+    final Optional<Authentication> maybeAuth = AuthenticationContext.maybeAuthentication();
+    if (maybeAuth.isEmpty()) {
+      return CompletableFuture.completedFuture(new ResponseEntity<>(HttpStatus.UNAUTHORIZED));
+    }
+    final Authentication auth = maybeAuth.get();
+    recordUsageSession(
+        httpEntity.getHeaders(), "resetNativeUserCredentials", UsageOperation.OTHER_WRITE);
+    log.info("Attempting to reset credentials for native user {}", userUrnString);
+    final OperationContext opContext =
+        OperationContext.asSession(
+            systemOperationContext,
+            RequestContext.builder()
+                .buildOpenapi(
+                    auth.getActor().toUrnStr(), request, "resetNativeUserCredentials", List.of()),
+            Authorizer.SYSTEM,
+            auth,
+            true);
+    if (!isTrustedAuthHelperCaller(opContext)) {
+      return CompletableFuture.completedFuture(new ResponseEntity<>(HttpStatus.UNAUTHORIZED));
+    }
+    return CompletableFuture.supplyAsync(
+        () -> {
+          try {
+            _nativeUserService.resetCorpUserCredentials(
+                opContext, userUrnString, passwordString, resetTokenString);
+            String response = buildResetNativeUserCredentialsResponse();
+            log.info("Reset credentials for native user {}", userUrnString);
+            return new ResponseEntity<>(response, HttpStatus.OK);
+          } catch (Exception e) {
+            log.error("Failed to reset credentials for native user {}", userUrnString, e);
+            return new ResponseEntity<>(HttpStatus.INTERNAL_SERVER_ERROR);
+          }
+        });
+  }
+
+  /**
+   * Verifies the credentials for a native DataHub user.
+   *
+   * <p>Example Request:
+   *
+   * <p>POST /verifyNativeUserCredentials -H "Authorization: Basic
+   * <system-client-id>:<system-client-secret>" { "userUrn": "urn:li:corpuser:test" "password":
+   * "password123" }
+   *
+   * <p>Example Response:
+   *
+   * <p>{ "passwordMatches": true }
+   */
+  @PostMapping(value = "/verifyNativeUserCredentials", produces = "application/json;charset=utf-8")
+  CompletableFuture<ResponseEntity<String>> verifyNativeUserCredentials(
+      final HttpServletRequest request, final HttpEntity<String> httpEntity) {
+    String jsonStr = httpEntity.getBody();
+
+    JsonNode bodyJson;
+    try {
+      bodyJson = mapper.readTree(jsonStr);
+    } catch (JsonProcessingException e) {
+      log.debug("Failed to parse json while attempting to verify native user password", e);
+      return CompletableFuture.completedFuture(new ResponseEntity<>(HttpStatus.BAD_REQUEST));
+    }
+    if (bodyJson == null) {
+      return CompletableFuture.completedFuture(new ResponseEntity<>(HttpStatus.BAD_REQUEST));
+    }
+    /*
+     * Extract username and password field
+     */
+    JsonNode userUrn = bodyJson.get(USER_URN_FIELD_NAME);
+    JsonNode password = bodyJson.get(PASSWORD_FIELD_NAME);
+    if (userUrn == null || password == null) {
+      return CompletableFuture.completedFuture(new ResponseEntity<>(HttpStatus.BAD_REQUEST));
+    }
+
+    String userUrnString = userUrn.asText();
+    String passwordString = password.asText();
+    final Optional<Authentication> maybeAuth = AuthenticationContext.maybeAuthentication();
+    if (maybeAuth.isEmpty()) {
+      return CompletableFuture.completedFuture(new ResponseEntity<>(HttpStatus.UNAUTHORIZED));
+    }
+    final Authentication auth = maybeAuth.get();
+    recordUsageSession(
+        httpEntity.getHeaders(), "verifyNativeUserCredentials", UsageOperation.OTHER_READ);
+    log.info(
+        "Attempting to verify credentials for native userRef={}",
+        LoginIdentityMask.mask(userUrnString));
+    final OperationContext opContext =
+        OperationContext.asSession(
+            systemOperationContext,
+            RequestContext.builder()
+                .buildOpenapi(
+                    auth.getActor().toUrnStr(), request, "verifyNativeUserCredentials", List.of()),
+            Authorizer.SYSTEM,
+            auth,
+            true);
+    if (!isTrustedAuthHelperCaller(opContext)) {
+      return CompletableFuture.completedFuture(new ResponseEntity<>(HttpStatus.UNAUTHORIZED));
+    }
+    return CompletableFuture.supplyAsync(
+        () -> {
+          try {
+            boolean doesPasswordMatch =
+                _nativeUserService.doesPasswordMatch(opContext, userUrnString, passwordString);
+            final boolean verboseAuthFailureLogging =
+                _configProvider.getAuthentication().isVerboseAuthFailureLogging();
+            final boolean enforceExistence =
+                _configProvider.getAuthentication().isEnforceExistenceEnabled();
+
+            LoginDenialReason sessionDenial = null;
+            if (doesPasswordMatch) {
+              final Optional<LoginDenialReason> eligibilityDenial =
+                  _userSessionEligibilityChecker.checkEligibility(
+                      opContext, userUrnString, enforceExistence);
+              if (eligibilityDenial.isPresent()) {
+                sessionDenial = eligibilityDenial.get();
+              }
+            }
+
+            final String loginSource =
+                resolveLoginSource(httpEntity.getHeaders(), LoginSource.PASSWORD_LOGIN.getSource());
+            if (!doesPasswordMatch) {
+              recordFailedLoginUsageEvent(
+                  httpEntity,
+                  userUrnString,
+                  LoginDenialReason.INVALID_CREDENTIALS,
+                  "failedPasswordLogin",
+                  loginSource);
+              emitLoginDenialLog(
+                  verboseAuthFailureLogging,
+                  userUrnString,
+                  LoginDenialReason.INVALID_CREDENTIALS,
+                  "verifyNativeUserCredentials");
+            } else if (sessionDenial != null) {
+              recordFailedLoginUsageEvent(
+                  httpEntity,
+                  userUrnString,
+                  sessionDenial,
+                  "failedLoginSessionEligibility",
+                  loginSource);
+              emitLoginDenialLog(
+                  verboseAuthFailureLogging,
+                  userUrnString,
+                  sessionDenial,
+                  "verifyNativeUserCredentials");
+            }
+
+            final LoginDenialReason denialForJson =
+                !doesPasswordMatch ? LoginDenialReason.INVALID_CREDENTIALS : sessionDenial;
+            String response =
+                buildVerifyNativeUserPasswordResponse(doesPasswordMatch, denialForJson);
+            log.info(
+                "Verified credentials for native userRef: {}, passwordMatch: {}",
+                LoginIdentityMask.mask(userUrnString),
+                doesPasswordMatch);
+            return new ResponseEntity<>(response, HttpStatus.OK);
+          } catch (Exception e) {
+            log.error(
+                "Failed to verify credentials for native userRef: {}",
+                LoginIdentityMask.mask(userUrnString),
+                e);
+            return new ResponseEntity<>(HttpStatus.INTERNAL_SERVER_ERROR);
+          }
+        });
+  }
+
+  /** Tracking endpoint */
+  // TODO: No longer used.
+  /*
+  @PostMapping(value = "/track", produces = "application/json;charset=utf-8")
+  CompletableFuture<ResponseEntity<String>> track(final HttpEntity<String> httpEntity) {
+    String jsonStr = httpEntity.getBody();
+    if (jsonStr == null) {
+      return CompletableFuture.completedFuture(new ResponseEntity<>(HttpStatus.BAD_REQUEST));
+    }
+    JsonNode bodyJson;
+    try {
+      bodyJson = mapper.readTree(jsonStr);
+    } catch (JsonProcessingException e) {
+      log.error("Failed to parse json while attempting to track analytics event", e);
+      return CompletableFuture.completedFuture(new ResponseEntity<>(HttpStatus.BAD_REQUEST));
+    }
+    if (bodyJson == null || !bodyJson.has("type")) {
+      log.warn("Invalid tracking request: missing `type` field");
+      return CompletableFuture.completedFuture(new ResponseEntity<>(HttpStatus.BAD_REQUEST));
+    }
+
+    return CompletableFuture.supplyAsync(
+        () -> {
+          try {
+            // Don't send to any destinations. This list will be changed as we change frontend
+            // tracking
+            // behavior to re-route traffic via backend.
+            int numDestinations =
+                _trackingService.track(
+                    bodyJson.get("type").asText(),
+                    systemOperationContext,
+                    null,
+                    null,
+                    bodyJson,
+                    Collections.emptySet());
+            if (numDestinations > 0) {
+              log.debug("Successfully tracked event to {} destinations.", numDestinations);
+            } else {
+              log.debug("Tracked event to 0 destinations");
+            }
+            return new ResponseEntity<>(HttpStatus.OK);
+          } catch (Exception e) {
+            log.error("Failed to track event: {}", e.getMessage(), e);
+            return new ResponseEntity<>(HttpStatus.INTERNAL_SERVER_ERROR);
+          }
+        });
+  }
+
+  */
+
+  /**
+   * Gets possible SSO settings.
+   *
+   * <p>Example Request:
+   *
+   * <p>POST /getSsoSettings -H "Authorization: Basic <system-client-id>:<system-client-secret>" {
+   * "userUrn": "urn:li:corpuser:test" "password": "password123" }
+   *
+   * <p>Example Response:
+   *
+   * <p>{ "clientId": "clientId", "clientSecret": "secret", "discoveryUri = "discoveryUri" }
+   */
+  @PostMapping(value = "/getSsoSettings", produces = "application/json;charset=utf-8")
+  CompletableFuture<ResponseEntity<String>> getSsoSettings(
+      final HttpServletRequest request, final HttpEntity<String> httpEntity) {
+    final Optional<Authentication> maybeAuth = AuthenticationContext.maybeAuthentication();
+    if (maybeAuth.isEmpty()) {
+      return CompletableFuture.completedFuture(new ResponseEntity<>(HttpStatus.UNAUTHORIZED));
+    }
+    final Authentication auth = maybeAuth.get();
+    recordUsageSession(
+        httpEntity != null ? httpEntity.getHeaders() : null,
+        "getSsoSettings",
+        UsageOperation.OTHER_READ);
+    final OperationContext opContext =
+        OperationContext.asSession(
+            systemOperationContext,
+            RequestContext.builder()
+                .buildOpenapi(auth.getActor().toUrnStr(), request, "getSsoSettings", List.of()),
+            Authorizer.SYSTEM,
+            auth,
+            true);
+    if (!isTrustedAuthHelperCaller(opContext)) {
+      return CompletableFuture.completedFuture(new ResponseEntity<>(HttpStatus.UNAUTHORIZED));
+    }
+    return CompletableFuture.supplyAsync(
+        () -> {
+          try {
+            GlobalSettingsInfo globalSettingsInfo =
+                (GlobalSettingsInfo)
+                    _entityService.getLatestAspect(
+                        opContext, GLOBAL_SETTINGS_URN, GLOBAL_SETTINGS_INFO_ASPECT_NAME);
+            if (globalSettingsInfo == null || !globalSettingsInfo.hasSso()) {
+              log.debug("There are no SSO settings available");
+              return new ResponseEntity<>(HttpStatus.NOT_FOUND);
+            }
+            SsoSettings ssoSettings =
+                Objects.requireNonNull(globalSettingsInfo.getSso(), "ssoSettings cannot be null");
+            String response = buildSsoSettingsResponse(ssoSettings);
+            return new ResponseEntity<>(response, HttpStatus.OK);
+          } catch (Exception e) {
+            return new ResponseEntity<>(HttpStatus.INTERNAL_SERVER_ERROR);
+          }
+        });
+  }
+
+  private void recordUsageSession(
+      HttpHeaders headers, String operation, UsageOperation usageOperation) {
+    final Optional<Authentication> maybeAuth = AuthenticationContext.maybeAuthentication();
+    if (maybeAuth.isEmpty()) {
+      return;
+    }
+    Authentication authentication = maybeAuth.get();
+    OperationContext.asSession(
+        systemOperationContext,
+        AuthUsageRequestContext.openapiUsage(
+            authentication.getActor().toUrnStr(), headers, operation, usageOperation),
+        authorizerChain,
+        authentication,
+        true);
+  }
+
+  /**
+   * UI session JWTs are never allowed. Otherwise allow the GMS system principal or a corp user with
+   * {@code CorpUserInfo.system} (same identity check as SecretService).
+   */
+  private boolean isTrustedAuthHelperCaller(@Nonnull OperationContext opContext) {
+    Authentication session = opContext.getSessionAuthentication();
+    if (isUiSessionToken(session)) {
+      return false;
+    }
+    if (ActorContext.isSystemSession(session, _systemAuthentication)) {
+      return true;
+    }
+    Urn actorUrn = opContext.getSessionActorContext().getActorUrn();
+    if (SYSTEM_ACTOR.equals(actorUrn.toString())) {
+      return true;
+    }
+    return isSystemCorpUser(actorUrn);
+  }
+
+  private boolean isUiSessionToken(@Nonnull Authentication authentication) {
+    Map<String, Object> claims = authentication.getClaims();
+    if (claims == null) {
+      return false;
+    }
+    Object tokenType = claims.get(TokenClaims.TOKEN_TYPE_CLAIM_NAME);
+    return TokenType.SESSION.name().equals(String.valueOf(tokenType));
+  }
+
+  private boolean isSystemCorpUser(@Nonnull Urn actorUrn) {
+    if (!CORP_USER_ENTITY_NAME.equals(actorUrn.getEntityType())) {
+      return false;
+    }
+    try {
+      RecordTemplate aspect =
+          _entityService.getLatestAspect(
+              systemOperationContext, actorUrn, CORP_USER_INFO_ASPECT_NAME);
+      if (!(aspect instanceof CorpUserInfo info)) {
+        return false;
+      }
+      return info.isSystem();
+    } catch (Exception e) {
+      log.debug("Failed to load CorpUserInfo for {} — deny auth helper", actorUrn, e);
+      return false;
+    }
+  }
+
+  private String buildTokenResponse(final String token) {
+    JSONObject json = new JSONObject();
+    json.put(ACCESS_TOKEN_FIELD_NAME, token);
+    return json.toString();
+  }
+
+  private String buildSignUpResponse() {
+    JSONObject json = new JSONObject();
+    json.put(IS_NATIVE_USER_CREATED_FIELD_NAME, true);
+    return json.toString();
+  }
+
+  private String buildResetNativeUserCredentialsResponse() {
+    JSONObject json = new JSONObject();
+    json.put(ARE_NATIVE_USER_CREDENTIALS_RESET_FIELD_NAME, true);
+    return json.toString();
+  }
+
+  private String buildVerifyNativeUserPasswordResponse(
+      final boolean doesPasswordMatch, final LoginDenialReason loginDenialReason) {
+    JSONObject json = new JSONObject();
+    json.put(DOES_PASSWORD_MATCH_FIELD_NAME, doesPasswordMatch);
+    if (loginDenialReason != null) {
+      json.put(LOGIN_DENIAL_REASON_FIELD_NAME, loginDenialReason.name());
+    }
+    return json.toString();
+  }
+
+  @Nonnull
+  private String resolveLoginSource(
+      @Nonnull final HttpHeaders headers, @Nonnull final String defaultSource) {
+    final List<String> loginSourceHeader = headers.getOrEmpty(DATAHUB_LOGIN_SOURCE_HEADER_NAME);
+    if (loginSourceHeader.isEmpty()) {
+      return defaultSource;
+    }
+    // Allow-list against LoginSource to keep Micrometer tag cardinality bounded.
+    final LoginSource knownSource = LoginSource.getSource(loginSourceHeader.get(0));
+    if (knownSource != null) {
+      return knownSource.getSource();
+    }
+    return LOGIN_SOURCE_UNKNOWN;
+  }
+
+  private void incrementLoginMetric(
+      @Nonnull final String outcome,
+      @Nonnull final String loginSource,
+      @Nonnull final String denialReason) {
+    systemOperationContext
+        .getMetricUtils()
+        .ifPresent(
+            metrics ->
+                metrics.incrementMicrometer(
+                    MetricUtils.DATAHUB_LOGIN,
+                    1,
+                    "outcome",
+                    outcome,
+                    "login_source",
+                    loginSource,
+                    "denial_reason",
+                    denialReason));
+  }
+
+  private void recordFailedLoginUsageEvent(
+      final HttpEntity<String> httpEntity,
+      final String userUrnString,
+      final LoginDenialReason denialReason,
+      final String spanName,
+      @Nonnull final String loginSource) {
+    // Uses systemOperationContext for span telemetry only; no entity reads/writes are performed
+    // here.
+    systemOperationContext.withSpan(
+        spanName,
+        () -> {
+          AttributesBuilder loginEventAttributes = Attributes.builder();
+          loginEventAttributes.put(USER_ID_ATTR, UrnUtils.getUrn(userUrnString).toString());
+          loginEventAttributes.put(
+              EVENT_TYPE_ATTR, DataHubUsageEventType.FAILED_LOGIN_EVENT.getType());
+          loginEventAttributes.put(LOGIN_SOURCE_ATTR, loginSource);
+          loginEventAttributes.put(LOGIN_DENIAL_REASON_ATTR, denialReason.name());
+          List<String> sourceIP = httpEntity.getHeaders().getOrEmpty(X_FORWARDED_FOR);
+          if (!sourceIP.isEmpty()) {
+            loginEventAttributes.put(SOURCE_IP, sourceIP.get(0));
+          }
+          Span.current().addEvent(LOGIN_EVENT, loginEventAttributes.build());
+        });
+    incrementLoginMetric(LOGIN_OUTCOME_FAILURE, loginSource, denialReason.name());
+  }
+
+  private void emitLoginDenialLog(
+      final boolean verboseAuthFailureLogging,
+      final String rawUserRef,
+      final LoginDenialReason reason,
+      final String operation) {
+    final String masked = LoginIdentityMask.mask(rawUserRef);
+    if (reason.logsAtWarn()) {
+      log.warn("loginDenied userRef={} loginDenialReason={}", masked, reason.name());
+      if (verboseAuthFailureLogging) {
+        log.warn(
+            "loginDenied userRef={} loginDenialReason={} operation={}",
+            rawUserRef,
+            reason.name(),
+            operation);
+      }
+    } else {
+      log.info("loginDenied userRef={} loginDenialReason={}", masked, reason.name());
+      if (verboseAuthFailureLogging) {
+        log.info(
+            "loginDenied userRef={} loginDenialReason={} operation={}",
+            rawUserRef,
+            reason.name(),
+            operation);
+      }
+    }
+  }
+
+  private String buildLoginDenialJsonBody(final LoginDenialReason reason) {
+    JSONObject json = new JSONObject();
+    json.put(LOGIN_DENIAL_REASON_FIELD_NAME, reason.name());
+    return json.toString();
+  }
+
+  private String buildSsoSettingsResponse(final SsoSettings ssoSettings) {
+    String baseUrl = Objects.requireNonNull(ssoSettings.getBaseUrl());
+    JSONObject json = new JSONObject();
+    json.put(BASE_URL, baseUrl);
+
+    if (ssoSettings.hasOidcSettings()) {
+      OidcSettings oidcSettings =
+          Objects.requireNonNull(ssoSettings.getOidcSettings(), "oidcSettings cannot be null");
+      buildOidcSettingsResponse(json, oidcSettings);
+    }
+
+    return json.toString();
+  }
+
+  private void buildOidcSettingsResponse(JSONObject json, final OidcSettings oidcSettings) {
+    json.put(OIDC_ENABLED, oidcSettings.isEnabled());
+    json.put(CLIENT_ID, oidcSettings.getClientId());
+    json.put(
+        CLIENT_SECRET,
+        _secretService.decrypt(systemOperationContext, oidcSettings.getClientSecret()));
+    json.put(DISCOVERY_URI, oidcSettings.getDiscoveryUri());
+    if (oidcSettings.hasUserNameClaim()) {
+      json.put(USER_NAME_CLAIM, oidcSettings.getUserNameClaim());
+    }
+    if (oidcSettings.hasUserNameClaimRegex()) {
+      json.put(USER_NAME_CLAIM_REGEX, oidcSettings.getUserNameClaimRegex());
+    }
+    if (oidcSettings.hasScope()) {
+      json.put(SCOPE, oidcSettings.getScope());
+    }
+    if (oidcSettings.hasClientAuthenticationMethod()) {
+      json.put(CLIENT_AUTHENTICATION_METHOD, oidcSettings.getClientAuthenticationMethod());
+    }
+    if (oidcSettings.hasJitProvisioningEnabled()) {
+      json.put(JIT_PROVISIONING_ENABLED, oidcSettings.isJitProvisioningEnabled());
+    }
+    if (oidcSettings.hasPreProvisioningRequired()) {
+      json.put(PRE_PROVISIONING_REQUIRED, oidcSettings.isPreProvisioningRequired());
+    }
+    if (oidcSettings.hasExtractGroupsEnabled()) {
+      json.put(EXTRACT_GROUPS_ENABLED, oidcSettings.isExtractGroupsEnabled());
+    }
+    if (oidcSettings.hasGroupsClaim()) {
+      json.put(GROUPS_CLAIM, oidcSettings.getGroupsClaim());
+    }
+    if (oidcSettings.hasResponseType()) {
+      json.put(RESPONSE_TYPE, oidcSettings.getResponseType());
+    }
+    if (oidcSettings.hasResponseMode()) {
+      json.put(RESPONSE_MODE, oidcSettings.getResponseMode());
+    }
+    if (oidcSettings.hasUseNonce()) {
+      json.put(USE_NONCE, oidcSettings.isUseNonce());
+    }
+    if (oidcSettings.hasReadTimeout()) {
+      json.put(READ_TIMEOUT, oidcSettings.getReadTimeout());
+    }
+    if (oidcSettings.hasExtractJwtAccessTokenClaims()) {
+      json.put(EXTRACT_JWT_ACCESS_TOKEN_CLAIMS, oidcSettings.isExtractJwtAccessTokenClaims());
+    }
+    if (oidcSettings.hasPreferredJwsAlgorithm2()) {
+      json.put(PREFERRED_JWS_ALGORITHM, oidcSettings.getPreferredJwsAlgorithm2());
+    }
+    if (oidcSettings.hasRequiredGroups()) {
+      json.put(REQUIRED_GROUPS, new JSONArray(oidcSettings.getRequiredGroups()));
+    }
+    if (oidcSettings.hasAccessDeniedMessage()) {
+      json.put(ACCESS_DENIED_MESSAGE, oidcSettings.getAccessDeniedMessage());
+    }
+    if (oidcSettings.hasAccessDeniedRedirectUrl()) {
+      json.put(ACCESS_DENIED_REDIRECT_URL, oidcSettings.getAccessDeniedRedirectUrl());
+    }
+  }
+}

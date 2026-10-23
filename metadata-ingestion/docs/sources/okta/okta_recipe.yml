@@ -1,0 +1,11 @@
+source:
+  type: okta
+  config:
+    # Coordinates
+    okta_domain: "dev-example.okta.com"
+
+    # Credentials
+    okta_api_token: "<YOUR_OKTA_API_TOKEN>"
+
+sink:
+  # sink configs

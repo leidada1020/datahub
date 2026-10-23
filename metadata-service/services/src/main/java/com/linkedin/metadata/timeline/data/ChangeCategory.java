@@ -1,0 +1,55 @@
+package com.linkedin.metadata.timeline.data;
+
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+public enum ChangeCategory {
+  // description, institutionalmemory, properties docs, field level docs/description etc.
+  DOCUMENTATION,
+  // (field or top level) add term, remove term, etc.
+  GLOSSARY_TERM,
+  // add new owner, remove owner, change ownership type etc.
+  OWNERSHIP,
+  // new field, remove field, field type change,
+  TECHNICAL_SCHEMA,
+  // (field or top level) add tag, remove tag,
+  TAG,
+  // Update the domain for an entity
+  DOMAIN,
+  // Update the deprecation for an entity
+  DEPRECATION,
+  // Entity Lifecycle events (create, soft delete, hard delete)
+  LIFECYCLE,
+  // Run event
+  RUN,
+
+  BUSINESS_ATTRIBUTE,
+  // Structured property assignment changes
+  STRUCTURED_PROPERTY,
+  // Application association changes
+  APPLICATION,
+  // Parent relationship changes (for hierarchical entities like documents)
+  PARENT,
+  // Related entities changes (Currently used for document related assets, related documents, etc.)
+  RELATED_ENTITIES,
+  // Asset membership changes (e.g. assets added/removed from a Data Product)
+  ASSET_MEMBERSHIP,
+  // Version lifecycle events — version created, promoted, or versionTag changed within a
+  // VersionSet. Emitted for any entity type that carries VersionProperties. Does NOT cover
+  // lifecycle-stage transitions (DRAFT → PUBLISHED etc.), which live on a separate aspect.
+  VERSIONING;
+
+  public static final Map<List<String>, ChangeCategory> COMPOUND_CATEGORIES;
+
+  // Add any compound categories here to support different cases in the API
+  static {
+    COMPOUND_CATEGORIES = new HashMap<>();
+    COMPOUND_CATEGORIES.put(Arrays.asList(GLOSSARY_TERM.name().split("_")), GLOSSARY_TERM);
+    COMPOUND_CATEGORIES.put(Arrays.asList(TECHNICAL_SCHEMA.name().split("_")), TECHNICAL_SCHEMA);
+    COMPOUND_CATEGORIES.put(
+        Arrays.asList(STRUCTURED_PROPERTY.name().split("_")), STRUCTURED_PROPERTY);
+    COMPOUND_CATEGORIES.put(Arrays.asList(ASSET_MEMBERSHIP.name().split("_")), ASSET_MEMBERSHIP);
+  }
+}

@@ -1,0 +1,290 @@
+import { Button, Modal, Stepper } from '@components';
+import React, { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components/macro';
+
+import { toast } from '@components/components/Toast/Toast';
+
+import PolicyActorForm from '@app/permissions/policy/PolicyActorForm';
+import PolicyPrivilegeForm from '@app/permissions/policy/PolicyPrivilegeForm';
+import PolicyTypeForm from '@app/permissions/policy/PolicyTypeForm';
+import { FIELD_TYPES } from '@app/permissions/policy/constants';
+import { PolicyPrivilegesConfig } from '@app/permissions/policy/policyTypes';
+import { EMPTY_POLICY } from '@app/permissions/policy/policyUtils';
+import { hasIncompleteStructuredProperties } from '@app/permissions/policy/structuredProperties/utils';
+import ClickOutside from '@app/sharedV2/ClickOutside';
+import { ConfirmationModal } from '@app/sharedV2/modals/ConfirmationModal';
+import { useEnterKeyListener } from '@app/sharedV2/useEnterKeyListener';
+
+import { ActorFilter, Policy, PolicyType, ResourceFilter } from '@types';
+
+type Props = {
+    policy: Omit<Policy, 'urn'>;
+    setPolicy: (policy: Omit<Policy, 'urn'>) => void;
+    open: boolean;
+    focusPolicyUrn: string | undefined;
+    onClose: () => void;
+    onSave: (savePolicy: Omit<Policy, 'urn'>) => void;
+    policyPrivileges?: PolicyPrivilegesConfig;
+};
+
+const StepsWrapper = styled.div`
+    padding: 0px 24px;
+`;
+
+const StepContent = styled.div`
+    padding: 0px 24px;
+    max-height: 75vh;
+    overflow-y: auto;
+`;
+
+const StepsControls = styled.div`
+    display: flex;
+    justify-content: space-between;
+    margin-top: 8px;
+    padding: 0px 20px;
+`;
+
+const PrevButtonContainer = styled.div`
+    display: flex;
+    justify-content: start;
+    margin-left: 12px;
+`;
+
+const NextButtonContainer = styled.div`
+    display: flex;
+    justify-content: end;
+    margin-right: 12px;
+`;
+
+const MODAL_BODY_STYLE = {
+    paddingLeft: '0px',
+    paddingRight: '0px',
+};
+
+/**
+ * Component used for constructing new policies. The purpose of this flow is to populate or edit a Policy
+ * object through a sequence of steps.
+ */
+export default function PolicyBuilderModal({
+    policy,
+    setPolicy,
+    open,
+    onClose,
+    onSave,
+    focusPolicyUrn,
+    policyPrivileges,
+}: Props) {
+    const { t } = useTranslation('settings.permissions');
+    const { t: tc } = useTranslation('common.actions');
+    // Step control-flow.
+    const [activeStepIndex, setActiveStepIndex] = useState(0);
+    const [isEditState, setEditState] = useState(true);
+
+    const [showConfirmationModal, setShowConfirmationModal] = useState(false);
+
+    // Go to next step
+    const next = () => {
+        // If on privilege step with incomplete structured properties, show error and don't proceed
+        if (activeStepIndex === 1) {
+            const structuredProps = policy.resources?.filter?.criteria?.find(
+                (c) => c.field === FIELD_TYPES.STRUCTURED_PROPERTY,
+            )?.structuredPropertyValues;
+
+            if (structuredProps && hasIncompleteStructuredProperties(structuredProps)) {
+                toast.error(t('privilegeForm.incompleteStructuredPropertiesMessage'));
+                return;
+            }
+        }
+        setActiveStepIndex(activeStepIndex + 1);
+    };
+
+    // Go to previous step
+    const prev = () => {
+        setActiveStepIndex(activeStepIndex - 1);
+    };
+
+    const filterEmptyStructuredProperties = () => {
+        if (!policy.resources?.filter?.criteria) {
+            return policy;
+        }
+
+        const cleanedCriteria = policy.resources.filter.criteria
+            .map((criterion) => {
+                if (criterion.field !== FIELD_TYPES.STRUCTURED_PROPERTY) {
+                    return criterion;
+                }
+
+                return {
+                    ...criterion,
+                    structuredPropertyValues: criterion.structuredPropertyValues?.filter(
+                        (prop) => prop.propertyUrn?.trim() && Array.isArray(prop.values) && prop.values.length > 0,
+                    ),
+                };
+            })
+            .filter(
+                (criterion) =>
+                    criterion.field !== FIELD_TYPES.STRUCTURED_PROPERTY ||
+                    (criterion.structuredPropertyValues?.length ?? 0) > 0,
+            );
+
+        return {
+            ...policy,
+            resources: {
+                ...policy.resources,
+                filter: {
+                    ...policy.resources.filter,
+                    criteria: cleanedCriteria,
+                },
+            },
+        };
+    };
+
+    // Save or create a policy
+    const onSavePolicy = () => {
+        onSave(filterEmptyStructuredProperties());
+    };
+
+    // Change the type of policy, either Metadata or Platform
+    const setPolicyType = (type: PolicyType) => {
+        // Important: If the policy type itself is changing, we need to clear policy state.
+        // Platform policies require empty resources, other types preserve theirs.
+        setPolicy({
+            ...policy,
+            type,
+            privileges: [],
+            ...(type === PolicyType.Platform && { resources: EMPTY_POLICY.resources }),
+        });
+    };
+
+    // Step 1: Choose Policy Type
+    const typeStep = () => {
+        return {
+            title: t('stepChoosePolicyType'),
+            content: (
+                <PolicyTypeForm
+                    policyType={policy.type}
+                    setPolicyType={(type: PolicyType) => setPolicyType(type)}
+                    policyName={policy.name}
+                    setPolicyName={(name: string) => setPolicy({ ...policy, name })}
+                    policyDescription={policy.description || ''}
+                    setPolicyDescription={(description: string) => setPolicy({ ...policy, description })}
+                />
+            ),
+            complete: policy.type && policy.name && policy.name.length > 0, // Whether the "next" button should appear.
+        };
+    };
+
+    // Step 2: Select privileges step.
+    const privilegeStep = () => ({
+        title: t('stepConfigurePrivileges'),
+        content: (
+            <PolicyPrivilegeForm
+                focusPolicyUrn={focusPolicyUrn}
+                policyType={policy.type}
+                // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+                resources={policy.resources!}
+                setResources={(resources: ResourceFilter) => {
+                    setPolicy({ ...policy, resources });
+                }}
+                setEditState={setEditState}
+                isEditState={isEditState}
+                privileges={policy.privileges}
+                setPrivileges={(privileges: string[]) => setPolicy({ ...policy, privileges })}
+                policyPrivileges={policyPrivileges}
+            />
+        ),
+        complete: policy.privileges && policy.privileges.length > 0, // Whether the "next" button should appear.
+    });
+
+    // Step 3: Assign Actors Step
+    const actorStep = () => {
+        return {
+            title: t('stepAssignUsersGroups'),
+            content: (
+                <PolicyActorForm
+                    policyType={policy.type}
+                    actors={policy.actors}
+                    setActors={(actors: ActorFilter) =>
+                        setPolicy({
+                            ...policy,
+                            actors,
+                        })
+                    }
+                />
+            ),
+            complete: true, // Whether the "next" button should appear.
+        };
+    };
+
+    // Construct final set of steps.
+    const policySteps = [typeStep(), privilegeStep(), actorStep()];
+
+    // Get active step.
+    const activeStep = policySteps[activeStepIndex];
+
+    // Whether we're editing or creating a policy.
+    const isEditing = policy !== undefined && policy !== null;
+
+    useEnterKeyListener({
+        querySelectorToExecuteClick: '#nextButton',
+    });
+
+    useEnterKeyListener({
+        querySelectorToExecuteClick: '#saveButton',
+    });
+
+    return (
+        <ClickOutside onClickOutside={() => setShowConfirmationModal(true)} wrapperClassName="PolicyBuilderModal">
+            <Modal
+                wrapClassName="PolicyBuilderModal"
+                title={isEditing ? t('editPolicyModalTitle') : t('createPolicyModalTitle')}
+                open={open}
+                onCancel={onClose}
+                closable
+                width={1000}
+                buttons={[]}
+                bodyStyle={MODAL_BODY_STYLE}
+            >
+                <StepsWrapper>
+                    <Stepper steps={policySteps} currentStepIndex={activeStepIndex} />
+                </StepsWrapper>
+                <StepContent>{activeStep.content}</StepContent>
+                <StepsControls>
+                    <PrevButtonContainer>
+                        {activeStepIndex > 0 && (
+                            <Button variant="outline" color="gray" onClick={() => prev()}>
+                                {tc('previous')}
+                            </Button>
+                        )}
+                    </PrevButtonContainer>
+                    <NextButtonContainer>
+                        {activeStepIndex < policySteps.length - 1 && activeStep.complete && (
+                            <Button id="nextButton" data-testid="next-button" onClick={() => next()}>
+                                {tc('next')}
+                            </Button>
+                        )}
+                        {activeStepIndex === policySteps.length - 1 && activeStep.complete && (
+                            <Button id="saveButton" data-testid="save-button" onClick={onSavePolicy}>
+                                {tc('save')}
+                            </Button>
+                        )}
+                    </NextButtonContainer>
+                </StepsControls>
+            </Modal>
+            <ConfirmationModal
+                isOpen={showConfirmationModal}
+                handleClose={() => {
+                    setShowConfirmationModal(false);
+                }}
+                handleConfirm={() => {
+                    setShowConfirmationModal(false);
+                    onClose();
+                }}
+                modalTitle={t('exitEditorTitle')}
+                modalText={t('exitEditorText')}
+                confirmButtonText={tc('yes')}
+            />
+        </ClickOutside>
+    );
+}

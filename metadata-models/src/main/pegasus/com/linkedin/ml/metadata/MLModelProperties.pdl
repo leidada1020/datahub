@@ -1,0 +1,175 @@
+namespace com.linkedin.ml.metadata
+
+import com.linkedin.common.Urn
+import com.linkedin.common.MLFeatureUrn
+import com.linkedin.common.Time
+import com.linkedin.common.VersionTag
+import com.linkedin.common.CustomProperties
+import com.linkedin.common.ExternalReference
+import com.linkedin.common.TimeStamp
+
+/**
+ * Properties associated with a ML Model
+ */
+@Aspect = {
+  "name": "mlModelProperties",
+  "schemaVersion": 2
+}
+record MLModelProperties includes CustomProperties, ExternalReference, MLModelLineageInfo {
+
+  /**
+   * Display name of the MLModel
+   */
+  @Searchable = {
+    "fieldType": "WORD_GRAM",
+    "enableAutocomplete": true,
+    "boostScore": 10.0,
+    "queryByDefault": true,
+    "v3": {
+      "searchLabel": "name",
+      "mappings": [
+        { "type": "KEYWORD" },
+        { "subfield": "text", "type": "TEXT" },
+        { "subfield": "stemmed", "type": "STEMMED" }
+      ]
+    }
+  }
+  name: optional string
+
+
+  /**
+   * Documentation of the MLModel
+   */
+  @Searchable = {
+    "fieldType": "TEXT",
+    "hasValuesFieldName": "hasDescription",
+    "sanitizeRichText": true,
+    "v3": {
+      "searchLabel": "description",
+      "mappings": [
+        { "type": "KEYWORD", "index": false, "docValues": false },
+        { "subfield": "text", "type": "TEXT" },
+        { "subfield": "stemmed", "type": "STEMMED" }
+      ]
+    }
+  }
+  description: optional string
+
+  /**
+   * Date when the MLModel was developed
+   */
+  @deprecated
+  date: optional Time
+
+  /**
+   * When this model was created in the source platform, and by whom.
+   */
+  @Searchable = {
+    "/time": {
+      "fieldName": "createdAt",
+      "fieldType": "DATETIME",
+      "queryByDefault": false,
+      "v3": {
+        "searchLabel": "sourceCreatedAt",
+        "mappings": [
+          { "type": "DATETIME" }
+        ]
+      }
+    }
+  }
+  created: optional TimeStamp
+
+  /**
+   * When this model was last modified in the source platform.
+   */
+  @Searchable = {
+    "/time": {
+      "fieldName": "lastModifiedAt",
+      "fieldType": "DATETIME",
+      "queryByDefault": false,
+      "v3": {
+        "searchLabel": "sourceLastModifiedAt",
+        "mappings": [
+          { "type": "DATETIME" }
+        ]
+      }
+    }
+  }
+  lastModified: optional TimeStamp
+
+  /**
+   * Version of the MLModel
+   */
+  version: optional VersionTag
+
+  /**
+   * Type of Algorithm or MLModel such as whether it is a Naive Bayes classifier, Convolutional Neural Network, etc
+   */
+  @Searchable = {
+    "fieldType": "TEXT_PARTIAL"
+  }
+  type: optional string
+
+  /**
+   * Hyper Parameters of the MLModel
+   * 
+   * NOTE: these are deprecated in favor of hyperParams
+   */
+  hyperParameters: optional map[string, HyperParameterValueType]
+
+  /**
+   * Hyperparameters of the MLModel
+   */
+  hyperParams: optional array[MLHyperParam]
+
+  /**
+   * Metrics of the MLModel used in training
+   */
+  trainingMetrics: optional array[MLMetric]
+
+  /**
+   * Metrics of the MLModel used in production
+   */
+  onlineMetrics: optional array[MLMetric]
+
+  /**
+   * List of features used for MLModel training
+   */
+  @Relationship = {
+    "/*": {
+      "name": "Consumes",
+      "entityTypes": [ "mlFeature" ],
+      "isLineage": true
+    }
+  }
+  mlFeatures: optional array[MLFeatureUrn]
+
+  /**
+   * Tags for the MLModel
+   */
+  tags: array[string] = [ ]
+
+  /**
+   * Deployments for the MLModel
+   */
+  @Relationship = {
+    "/*": {
+      "name": "DeployedTo",
+      "entityTypes": [ "mlModelDeployment" ]
+    }
+  }
+  deployments: optional array[Urn]
+
+  /**
+   * Groups the model belongs to
+   */
+  @Relationship = {
+    "/*": {
+      "name": "MemberOf",
+      "entityTypes": [ "mlModelGroup" ],
+      "isUpstream": false,
+      "isLineage": true
+    }
+  }
+  groups: optional array[Urn]
+}

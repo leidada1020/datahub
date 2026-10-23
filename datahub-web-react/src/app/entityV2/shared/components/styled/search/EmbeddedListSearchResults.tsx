@@ -1,0 +1,320 @@
+import { Icon, Loader, Pagination, Text } from '@components';
+import { Globe } from '@phosphor-icons/react/dist/csr/Globe';
+import React from 'react';
+import { Trans, useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { EntityAndType } from '@app/entity/shared/types';
+import {
+    EntityActionProps,
+    EntitySearchResults,
+} from '@app/entityV2/shared/components/styled/search/EntitySearchResults';
+import MatchingViewsLabel from '@app/entityV2/shared/components/styled/search/MatchingViewsLabel';
+import { SearchFiltersSection } from '@app/search/SearchFiltersSection';
+import { UnionType } from '@app/search/utils/constants';
+import { combineSiblingsInSearchResults } from '@app/searchV2/utils/combineSiblingsInSearchResults';
+import { useIsShowSeparateSiblingsEnabled } from '@app/useAppConfig';
+import { SearchCfg } from '@src/conf';
+
+import { DataHubView, FacetFilterInput, FacetMetadata, SearchResults as SearchResultType } from '@types';
+
+const SearchBody = styled.div<{ showFilters?: boolean }>`
+    height: 100%;
+    overflow: hidden;
+    background-color: ${(props) => props.theme.colors.bgSurface};
+    display: grid;
+    grid-template-rows: minmax(0, 1fr) auto;
+    grid-template-columns: ${(p) => (p.showFilters ? '0.2fr auto' : '1fr')};
+    grid-template-areas: ${(p) =>
+        p.showFilters
+            ? `
+                 "filters results"
+                 "footer  footer"
+               `
+            : `
+                 "results"
+                 "footer"
+               `};
+`;
+
+const PaginationInfo = styled(Text)`
+    padding: 0px;
+`;
+
+const FiltersContainer = styled.div`
+    grid-area: filters;
+    background-color: ${(props) => props.theme.colors.bg};
+    display: flex;
+    flex-direction: column;
+    max-width: 260px;
+    min-width: 260px;
+    border-right: 1px solid;
+    border-color: ${(props) => props.theme.colors.border};
+`;
+
+const ResultContainer = styled.div`
+    grid-area: results;
+    overflow: hidden;
+    position: relative;
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+`;
+
+const PaginationInfoContainer = styled.div`
+    grid-area: footer;
+    padding: 8px;
+    padding-left: 16px;
+    border-top: 1px solid;
+    border-color: ${(props) => props.theme.colors.border};
+    background-color: ${(props) => props.theme.colors.bg};
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+`;
+
+const PaginationRow = styled.div`
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 16px;
+`;
+
+const ViewMessageRow = styled.div`
+    display: flex;
+    justify-content: center;
+    align-items: center;
+`;
+
+const StyledPagination = styled(Pagination)`
+    margin: 0px;
+    padding: 0px;
+`;
+
+const LoadingContainer = styled.div`
+    padding-top: 40px;
+    padding-bottom: 40px;
+    width: 100%;
+    text-align: center;
+    flex: 1;
+`;
+
+const ViewsContainer = styled.div`
+    background-color: ${(props) => props.theme.colors.bgSurface};
+    padding: 10px 16px;
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+`;
+
+const Pill = styled.div<{ selected?: boolean }>`
+    border: 1px solid ${(props) => (props.selected ? props.theme.colors.borderBrand : props.theme.colors.border)};
+    white-space: nowrap;
+    border-radius: 20px;
+    padding: 5px 16px;
+    color: ${(props) => (props.selected ? props.theme.colors.textBrand : props.theme.colors.textTertiary)};
+    cursor: pointer;
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    background: ${(props) => (props.selected ? props.theme.colors.bgSurfaceBrand : 'none')};
+`;
+
+const Count = styled.div<{ selected: boolean }>`
+    background-color: ${(props) =>
+        props.selected ? props.theme.colors.buttonFillBrand : props.theme.colors.bgSurfaceDarker};
+    color: ${(props) => (props.selected ? props.theme.colors.textOnFillBrand : props.theme.colors.textSecondary)};
+    border-radius: 20px;
+    min-width: 25px;
+    padding: 2px 4px;
+
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
+    font-size: 11px;
+`;
+
+const ViewLabel = styled.span`
+    font-weight: 700;
+    color: ${(props) => props.theme.colors.textSecondary};
+    font-size: 16px;
+    margin-right: 8px;
+`;
+
+interface Props {
+    page: number;
+    searchResponse?: SearchResultType | null;
+    filters?: Array<FacetMetadata> | null;
+    selectedFilters: Array<FacetFilterInput>;
+    loading: boolean;
+    showFilters?: boolean;
+    unionType: UnionType;
+    onChangeFilters: (filters: Array<FacetFilterInput>) => void;
+    onChangePage: (page: number) => void;
+    onChangeUnionType: (unionType: UnionType) => void;
+    isSelectMode: boolean;
+    selectedEntities: EntityAndType[];
+    setSelectedEntities: (entities: EntityAndType[]) => any;
+    numResultsPerPage: number;
+    setNumResultsPerPage: (numResults: number) => void;
+    entityAction?: React.FC<EntityActionProps>;
+    applyView?: boolean;
+    selectedViewUrn?: string;
+    setSelectedViewUrn?: (selectedViewUrn: string | undefined) => void;
+    compactUserSearchCardStyle?: boolean;
+    defaultViewUrn?: string | undefined;
+    defaultViewCount?: number;
+    allSearchCount?: number;
+    view?: DataHubView;
+    errorMessage?: string;
+    selectLimit?: number;
+}
+
+export const EmbeddedListSearchResults = ({
+    page,
+    searchResponse,
+    filters,
+    selectedFilters,
+    loading,
+    showFilters,
+    unionType,
+    onChangeUnionType,
+    onChangeFilters,
+    onChangePage,
+    isSelectMode,
+    selectedEntities,
+    setSelectedEntities,
+    numResultsPerPage,
+    setNumResultsPerPage,
+    entityAction,
+    applyView,
+    compactUserSearchCardStyle,
+    selectedViewUrn,
+    setSelectedViewUrn,
+    defaultViewUrn,
+    defaultViewCount = 0,
+    allSearchCount = 0,
+    view,
+    errorMessage,
+    selectLimit,
+}: Props) => {
+    const { t } = useTranslation('entity.shared.components');
+    const { t: tc } = useTranslation('common.actions');
+    const showSeparateSiblings = useIsShowSeparateSiblingsEnabled();
+    const combinedSiblingSearchResults = combineSiblingsInSearchResults(
+        showSeparateSiblings,
+        searchResponse?.searchResults,
+    );
+
+    const pageStart = searchResponse?.start || 0;
+    const pageSize = searchResponse?.count || 0;
+    const totalResults = searchResponse?.total || 0;
+    const lastResultIndex = pageStart + pageSize > totalResults ? totalResults : pageStart + pageSize;
+
+    return (
+        <>
+            <SearchBody showFilters={!!showFilters}>
+                {!!showFilters && (
+                    <FiltersContainer>
+                        <SearchFiltersSection
+                            filters={filters}
+                            selectedFilters={selectedFilters}
+                            unionType={unionType}
+                            loading={loading}
+                            onChangeFilters={onChangeFilters}
+                            onChangeUnionType={onChangeUnionType}
+                        />
+                    </FiltersContainer>
+                )}
+
+                <ResultContainer data-testid="embedded-list-search-results">
+                    {applyView && view && (
+                        <ViewsContainer>
+                            <ViewLabel>{t('embeddedSearch.viewLabel')}</ViewLabel>
+                            <Pill selected={!selectedViewUrn} onClick={() => setSelectedViewUrn?.(undefined)}>
+                                <Icon icon={Globe} size="xl" color={!selectedViewUrn ? 'iconBrand' : 'icon'} />
+                                <span>{tc('all')}</span>
+                                {allSearchCount > 0 && <Count selected={!selectedViewUrn}>{allSearchCount}</Count>}
+                            </Pill>
+                            {defaultViewUrn === view.urn && (
+                                <Pill
+                                    selected={selectedViewUrn === view.urn}
+                                    onClick={() => setSelectedViewUrn?.(view?.urn)}
+                                >
+                                    <span>{view.name}</span>
+                                    {defaultViewCount > 0 && (
+                                        <Count selected={selectedViewUrn === view.urn}>{defaultViewCount}</Count>
+                                    )}
+                                </Pill>
+                            )}
+                        </ViewsContainer>
+                    )}
+                    {loading && (
+                        <LoadingContainer>
+                            <Loader size="md" />
+                        </LoadingContainer>
+                    )}
+                    {!loading && (
+                        <EntitySearchResults
+                            noResultsMessage={errorMessage}
+                            searchResults={combinedSiblingSearchResults || []}
+                            additionalPropertiesList={
+                                combinedSiblingSearchResults?.map((searchResult) => ({
+                                    // when we add impact analysis, we will want to pipe the path to each element to the result this
+                                    // eslint-disable-next-line @typescript-eslint/dot-notation
+                                    degree: searchResult['degree'], // eslint-disable-next-line @typescript-eslint/dot-notation
+                                    paths: searchResult['paths'],
+                                })) || []
+                            }
+                            isSelectMode={isSelectMode}
+                            selectLimit={selectLimit}
+                            selectedEntities={selectedEntities}
+                            setSelectedEntities={setSelectedEntities}
+                            bordered={false}
+                            entityAction={entityAction}
+                            compactUserSearchCardStyle={compactUserSearchCardStyle}
+                        />
+                    )}
+                </ResultContainer>
+                <PaginationInfoContainer data-testid="embedded-list-search-pagination">
+                    <PaginationRow>
+                        <PaginationInfo>
+                            <Trans
+                                t={t}
+                                i18nKey="embeddedSearch.paginationRange"
+                                components={{ bold: <b /> }}
+                                values={{
+                                    rangeStart: lastResultIndex > 0 ? (page - 1) * pageSize + 1 : 0,
+                                    rangeEnd: lastResultIndex,
+                                    total: totalResults,
+                                }}
+                            />
+                        </PaginationInfo>
+                        <StyledPagination
+                            currentPage={page}
+                            itemsPerPage={numResultsPerPage}
+                            total={totalResults}
+                            showLessItems
+                            onPageChange={onChangePage}
+                            showSizeChanger={totalResults > SearchCfg.RESULTS_PER_PAGE}
+                            onShowSizeChange={(_currNum, newNum) => setNumResultsPerPage(newNum)}
+                            pageSizeOptions={['10', '20', '30']}
+                        />
+                    </PaginationRow>
+                    {applyView && view && selectedViewUrn === view.urn && (
+                        <ViewMessageRow>
+                            <MatchingViewsLabel
+                                view={view}
+                                selectedViewUrn={selectedViewUrn}
+                                setSelectedViewUrn={setSelectedViewUrn}
+                            />
+                        </ViewMessageRow>
+                    )}
+                </PaginationInfoContainer>
+            </SearchBody>
+        </>
+    );
+};

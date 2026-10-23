@@ -1,0 +1,421 @@
+fragment assertionInfo on AssertionInfo {
+    type
+    description
+    customProperties {
+        key
+        value
+    }
+    lastUpdated {
+        time
+        actor
+    }
+    datasetAssertion {
+        datasetUrn
+        scope
+        aggregation
+        operator
+        parameters {
+            value {
+                value
+                type
+            }
+            minValue {
+                value
+                type
+            }
+            maxValue {
+                value
+                type
+            }
+        }
+        fields {
+            urn
+            path
+        }
+        nativeType
+        nativeParameters {
+            key
+            value
+        }
+        logic
+    }
+    freshnessAssertion {
+        type
+        entityUrn
+        schedule {
+            type
+            cron {
+                cron
+                timezone
+            }
+            fixedInterval {
+                unit
+                multiple
+            }
+        }
+        filter {
+            type
+            sql
+        }
+    }
+    sqlAssertion {
+        type
+        entityUrn
+        statement
+        changeType
+        operator
+        parameters {
+            ...assertionStdParametersDetails
+        }
+    }
+    fieldAssertion {
+        type
+        entityUrn
+        filter {
+            type
+            sql
+        }
+        fieldValuesAssertion {
+            field {
+                path
+                type
+                nativeType
+            }
+            transform {
+                type
+            }
+            operator
+            parameters {
+                ...assertionStdParametersDetails
+            }
+            failThreshold {
+                type
+                value
+            }
+            excludeNulls
+        }
+        fieldMetricAssertion {
+            field {
+                path
+                type
+                nativeType
+            }
+            metric
+            operator
+            parameters {
+                ...assertionStdParametersDetails
+            }
+        }
+    }
+    volumeAssertion {
+        type
+        entityUrn
+        filter {
+            type
+            sql
+        }
+        rowCountTotal {
+            operator
+            parameters {
+                ...assertionStdParametersDetails
+            }
+        }
+        rowCountChange {
+            type
+            operator
+            parameters {
+                ...assertionStdParametersDetails
+            }
+        }
+        incrementingSegmentRowCountTotal {
+            operator
+            parameters {
+                ...assertionStdParametersDetails
+            }
+            segment {
+                ...incrementingSegmentSpecDetails
+            }
+        }
+        incrementingSegmentRowCountChange {
+            type
+            operator
+            parameters {
+                ...assertionStdParametersDetails
+            }
+            segment {
+                ...incrementingSegmentSpecDetails
+            }
+        }
+    }
+    schemaAssertion {
+        entityUrn
+        compatibility
+        fields {
+            path
+            type
+            nativeType
+        }
+        schema {
+            fields {
+                fieldPath
+                type
+                nativeDataType
+            }
+        }
+    }
+    customAssertion {
+        type
+        entityUrn
+        field {
+            urn
+            path
+        }
+        fields {
+            urn
+            path
+        }
+        scope
+        aggregation
+        operator
+        parameters {
+            value {
+                value
+                type
+            }
+            minValue {
+                value
+                type
+            }
+            maxValue {
+                value
+                type
+            }
+        }
+        nativeType
+        nativeParameters {
+            key
+            value
+        }
+        logic
+    }
+    source {
+        type
+        created {
+            time
+            actor
+        }
+    }
+    externalUrl
+}
+
+fragment assertionDetails on Assertion {
+    urn
+    type
+    platform {
+        urn
+        name
+        properties {
+            displayName
+            logoUrl
+        }
+        info {
+            displayName
+            logoUrl
+        }
+    }
+    dataPlatformInstance {
+        ...dataPlatformInstanceFields
+    }
+    info {
+        ...assertionInfo
+    }
+    actions {
+        onSuccess {
+            type
+        }
+        onFailure {
+            type
+        }
+    }
+    tags {
+        ...globalTagsFields
+    }
+    ownership {
+        ...ownershipFields
+    }
+    dataset {
+        urn
+        privileges {
+            canEditAssertionOwners
+            canEditAssertions
+        }
+    }
+}
+
+fragment incrementingSegmentSpecDetails on IncrementingSegmentSpec {
+    field {
+        path
+        type
+        nativeType
+    }
+    transformer {
+        type
+        nativeType
+    }
+}
+
+fragment assertionStdParametersDetails on AssertionStdParameters {
+    value {
+        value
+        type
+    }
+    minValue {
+        value
+        type
+    }
+    maxValue {
+        value
+        type
+    }
+}
+
+fragment assertionDetailsWithRunEvents on Assertion {
+    ...assertionDetails
+    runEvents(status: COMPLETE, limit: 1) {
+        total
+        failed
+        succeeded
+        runEvents {
+            ...assertionRunEventDetails
+        }
+    }
+}
+
+fragment assertionResultDetails on AssertionResult {
+    type
+    severity
+    actualAggValue
+    rowCount
+    missingCount
+    unexpectedCount
+    externalUrl
+    nativeResults {
+        key
+        value
+    }
+    error {
+        type
+        properties {
+            key
+            value
+        }
+    }
+}
+
+fragment assertionRunEventDetails on AssertionRunEvent {
+    timestampMillis
+    lastObservedMillis
+    assertionUrn
+    status
+    runId
+    partitionSpec {
+        type
+        partition
+    }
+    runtimeContext {
+        key
+        value
+    }
+    result {
+        ...assertionResultDetails
+    }
+}
+
+query getAssertionRuns($assertionUrn: String!, $startTime: Long, $endTime: Long, $limit: Int) {
+    assertion(urn: $assertionUrn) {
+        urn
+        ...assertionDetails
+        runEvents(status: COMPLETE, startTimeMillis: $startTime, endTimeMillis: $endTime, limit: $limit) {
+            total
+            failed
+            succeeded
+            runEvents {
+                ...assertionRunEventDetails
+            }
+        }
+    }
+}
+
+mutation deleteAssertion($urn: String!) {
+    deleteAssertion(urn: $urn)
+}
+
+query getAssertionWithRunEvents($assertionUrn: String!) {
+    assertion(urn: $assertionUrn) {
+        urn
+        ...assertionDetailsWithRunEvents
+    }
+}
+
+fragment assertionDetailsForSearch on Assertion {
+    ...assertionDetails
+    runEvents(status: COMPLETE, limit: $runEventsLimit) {
+        total
+        failed
+        succeeded
+        errored
+        runEvents {
+            ...assertionRunEventDetails
+        }
+    }
+}
+
+fragment assertionSearchResultFields on Entity {
+    ... on Assertion {
+        ...assertionDetailsForSearch
+    }
+}
+
+query searchAssertions($input: SearchAcrossEntitiesInput!, $runEventsLimit: Int = 1) {
+    searchAcrossEntities(input: $input) {
+        start
+        count
+        total
+        searchResults {
+            entity {
+                ...assertionSearchResultFields
+            }
+        }
+        facets {
+            field
+            displayName
+            aggregations {
+                value
+                count
+                entity {
+                    urn
+                    type
+                    ... on Tag {
+                        name
+                        properties {
+                            name
+                        }
+                    }
+                    ... on CorpUser {
+                        username
+                        properties {
+                            displayName
+                            fullName
+                        }
+                    }
+                    ... on CorpGroup {
+                        name
+                        info {
+                            displayName
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,68 @@
+// If you change these feature cards, also update FEATURE_CARD_SECTION_MD in
+// docs-website/generateDocsDir.ts, which mirrors them as plain markdown for the
+// AI-tools "Copy page" feature.
+import React from "react";
+import FeatureCard from '../FeatureCard'
+import {
+  EyeTwoTone,
+  HeartTwoTone,
+  ApiTwoTone,
+  AlertTwoTone,
+  CompassTwoTone,
+  ProfileTwoTone,
+} from "@ant-design/icons";
+
+const featureCardContent =  [
+{
+    title: "Data Discovery",
+    description: "Search your entire data ecosystem, including dashboards, datasets, ML models, and raw files.",
+    to: "docs/how/search",
+    icon: <EyeTwoTone />
+  },
+{
+    title: "Data Governance",
+    description: "Define ownership and track PII.",
+    to: "https://datahub.com/blog/",
+    icon: <CompassTwoTone />
+  },
+{
+    title: "Data Quality & Observability",
+    description: "Detect and resolve quality issues before they impact production. Automated anomaly detection, assertions, and data contracts keep data reliable.",
+    to: "docs/managed-datahub/observe/overview",
+    icon: <AlertTwoTone />
+  },
+{
+  title: "UI-based Ingestion",
+  description: "Easily set up integrations in minutes using DataHub's intuitive UI-based ingestion feature.",
+  to: "docs/ui-ingestion",
+  icon: <ProfileTwoTone />
+},
+{
+  title: "APIs and SDKs",
+  description: "For users who prefer programmatic control, DataHub offers a comprehensive set of APIs and SDKs.",
+  to: "docs/api/datahub-apis",
+  icon: <ApiTwoTone />
+},
+{
+  title: "Vibrant Community",
+  description: "Our community provides support through office hours, workshops, and a Slack channel.",
+  to: "docs/slack",
+  icon: <HeartTwoTone />
+}
+]
+
+const FeatureCards = () => {
+return (
+    <div style={{ padding: "2vh 0" }}>
+      <div className="container" style={{ padding: "0"}}>
+        <div className="row row--no-gutters">
+          {featureCardContent.map((props, idx) => (
+            <FeatureCard key={idx} {...props} />
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default FeatureCards;

@@ -1,0 +1,562 @@
+import { ArrowCounterClockwise } from '@phosphor-icons/react/dist/csr/ArrowCounterClockwise';
+import { ArrowsCounterClockwise } from '@phosphor-icons/react/dist/csr/ArrowsCounterClockwise';
+import { Checks } from '@phosphor-icons/react/dist/csr/Checks';
+import { ClockClockwise } from '@phosphor-icons/react/dist/csr/ClockClockwise';
+import { Prohibit } from '@phosphor-icons/react/dist/csr/Prohibit';
+import { Spinner } from '@phosphor-icons/react/dist/csr/Spinner';
+import { X } from '@phosphor-icons/react/dist/csr/X';
+import { Maybe } from 'graphql/jsutils/Maybe';
+import i18next from 'i18next';
+import { DefaultTheme } from 'styled-components';
+import YAML from 'yamljs';
+
+import EntityRegistry from '@app/entityV2/EntityRegistry';
+import { SourceConfig } from '@app/ingest/source/builder/types';
+import { StructuredReport, StructuredReportItemLevel, StructuredReportLogEntry } from '@app/ingest/source/types';
+import { capitalizeFirstLetterOnly } from '@app/sharedV2/textUtil';
+
+import { ListIngestionSourcesDocument, ListIngestionSourcesQuery } from '@graphql/ingestion.generated';
+import { EntityType, ExecutionRequestResult, FacetMetadata } from '@types';
+
+export const getSourceConfigs = (ingestionSources: SourceConfig[], sourceType: string) => {
+    const sourceConfigs = ingestionSources.find((source) => source.name === sourceType);
+    if (!sourceConfigs) {
+        console.error(`Failed to find source configs with source type ${sourceType}`);
+    }
+    return sourceConfigs;
+};
+
+export const yamlToJson = (yaml: string): string => {
+    const obj = YAML.parse(yaml);
+    const jsonStr = JSON.stringify(obj);
+    return jsonStr;
+};
+export const removeEmptyArrays = (obj) => {
+    if (Array.isArray(obj)) {
+        // Filter out empty arrays
+        return obj.filter((item) => !(Array.isArray(item) && item.length === 0));
+    }
+    if (typeof obj === 'object' && obj !== null) {
+        // Recursively remove empty arrays from object properties
+        const cleanedObj = Object.fromEntries(
+            Object.entries(obj).map(([key, value]) => [key, removeEmptyArrays(value)]),
+        );
+        if (cleanedObj.conditions) {
+            const propertiesToDelete = Object.keys(cleanedObj.conditions);
+            if (propertiesToDelete.some((prop) => cleanedObj.conditions[prop]?.length === 0)) {
+                delete cleanedObj.conditions;
+            }
+        }
+        // Filter out undefined properties but leave nulls
+        return Object.fromEntries(Object.entries(cleanedObj).filter(([_, v]) => v !== undefined));
+    }
+    // Return non-array, non-object values as it is
+    return obj;
+};
+
+export const jsonToYaml = (json: string): string => {
+    const obj = JSON.parse(json);
+    const result = removeEmptyArrays(obj);
+    const yamlStr = YAML.stringify(result, 6);
+    return yamlStr;
+};
+
+export function getPlaceholderRecipe(ingestionSources: SourceConfig[], type?: string) {
+    const selectedSource = ingestionSources.find((source) => source.name === type);
+    return selectedSource?.recipe || '';
+}
+
+export const RUNNING = 'RUNNING';
+export const SUCCESS = 'SUCCESS';
+export const SUCCEEDED_WITH_WARNINGS = 'SUCCEEDED_WITH_WARNINGS';
+export const FAILURE = 'FAILURE';
+const CANCELLED = 'CANCELLED';
+const ABORTED = 'ABORTED';
+const DUPLICATE = 'DUPLICATE';
+const UP_FOR_RETRY = 'UP_FOR_RETRY';
+export const ROLLING_BACK = 'ROLLING_BACK';
+export const ROLLED_BACK = 'ROLLED_BACK';
+const ROLLBACK_FAILED = 'ROLLBACK_FAILED';
+
+export const CLI_EXECUTOR_ID = '__datahub_cli_';
+export const MANUAL_INGESTION_SOURCE = 'MANUAL_INGESTION_SOURCE';
+export const SCHEDULED_INGESTION_SOURCE = 'SCHEDULED_INGESTION_SOURCE';
+export const CLI_INGESTION_SOURCE = 'CLI_INGESTION_SOURCE';
+
+export const getExecutionRequestStatusIcon = (status?: string) => {
+    return (
+        (status === RUNNING && Spinner) ||
+        (status === SUCCESS && Checks) ||
+        (status === SUCCEEDED_WITH_WARNINGS && Checks) ||
+        (status === FAILURE && X) ||
+        (status === CANCELLED && Prohibit) ||
+        (status === UP_FOR_RETRY && ClockClockwise) ||
+        (status === ROLLED_BACK && ArrowCounterClockwise) ||
+        (status === ROLLING_BACK && ArrowsCounterClockwise) ||
+        (status === ROLLBACK_FAILED && X) ||
+        (status === ABORTED && X) ||
+        (status === DUPLICATE && Prohibit) ||
+        ClockClockwise
+    );
+};
+
+export const getExecutionRequestStatusDisplayText = (status?: string) => {
+    return (
+        (status === RUNNING && i18next.t('ingestion:status.running')) ||
+        (status === SUCCESS && i18next.t('ingestion:status.succeeded')) ||
+        (status === SUCCEEDED_WITH_WARNINGS && i18next.t('ingestion:status.succeededWithWarnings')) ||
+        (status === FAILURE && i18next.t('ingestion:status.failed')) ||
+        (status === CANCELLED && i18next.t('ingestion:status.cancelled')) ||
+        (status === UP_FOR_RETRY && i18next.t('ingestion:status.upForRetry')) ||
+        (status === ROLLED_BACK && i18next.t('ingestion:status.rolledBack')) ||
+        (status === ROLLING_BACK && i18next.t('ingestion:status.rollingBack')) ||
+        (status === ROLLBACK_FAILED && i18next.t('ingestion:status.rollbackFailed')) ||
+        (status === ABORTED && i18next.t('ingestion:status.aborted')) ||
+        (status === DUPLICATE && i18next.t('ingestion:status.duplicate')) ||
+        /* untranslated-text -- raw status enum fallback when status is unrecognized */
+        status
+    );
+};
+
+export const getExecutionRequestSummaryText = (status: string) => {
+    switch (status) {
+        case RUNNING:
+            return i18next.t('ingestion:executions.summaryRunning');
+        case SUCCESS:
+            return i18next.t('ingestion:executions.summarySuccess');
+        case SUCCEEDED_WITH_WARNINGS:
+            return i18next.t('ingestion:executions.summarySucceededWithWarnings');
+        case FAILURE:
+            return i18next.t('ingestion:executions.summaryFailure');
+        case CANCELLED:
+            return i18next.t('ingestion:executions.summaryCancelled');
+        case ROLLED_BACK:
+            return i18next.t('ingestion:executions.summaryRolledBack');
+        case ROLLING_BACK:
+            return i18next.t('ingestion:executions.summaryRollingBack');
+        case ROLLBACK_FAILED:
+            return i18next.t('ingestion:executions.summaryRollbackFailed');
+        case ABORTED:
+            return i18next.t('ingestion:executions.summaryAborted');
+        case DUPLICATE:
+            return i18next.t('ingestion:executions.summaryDuplicate');
+        default:
+            return i18next.t('ingestion:executions.summaryUnknown');
+    }
+};
+
+export const getExecutionRequestStatusDisplayColor = (theme: DefaultTheme, status?: string) => {
+    return (
+        (status === RUNNING && theme.colors.iconInformation) ||
+        (status === SUCCESS && theme.colors.iconSuccess) ||
+        (status === SUCCEEDED_WITH_WARNINGS && theme.colors.iconWarning) ||
+        (status === FAILURE && theme.colors.iconError) ||
+        (status === UP_FOR_RETRY && theme.colors.iconBrand) ||
+        (status === CANCELLED && theme.colors.icon) ||
+        (status === ROLLED_BACK && theme.colors.iconWarning) ||
+        (status === ROLLING_BACK && theme.colors.iconWarning) ||
+        (status === ROLLBACK_FAILED && theme.colors.iconError) ||
+        (status === ABORTED && theme.colors.iconError) ||
+        theme.colors.icon
+    );
+};
+
+export const checkIsExecutionRequestRunning = (executionRequestResult?: Maybe<ExecutionRequestResult>): boolean => {
+    return !executionRequestResult || executionRequestResult.status === RUNNING;
+};
+
+export const validateURL = (fieldName: string) => {
+    return {
+        validator(_, value) {
+            const URLPattern = new RegExp(
+                /^(?:http(s)?:\/\/)?[\w.-]+(?:\.[a-zA-Z0-9.-]{2,})+[\w\-._~:/?#[\]@!$&'()*+,;=.]+$/,
+            );
+            const isURLValid = URLPattern.test(value);
+            if (!value || isURLValid) {
+                return Promise.resolve();
+            }
+            return Promise.reject(new Error(i18next.t('ingestion:source.validUrlRequired', { fieldName })));
+        },
+    };
+};
+
+const createStructuredReport = (items: StructuredReportLogEntry[]): StructuredReport => {
+    const errorCount = items.filter((item) => item.level === StructuredReportItemLevel.ERROR).length;
+    const warnCount = items.filter((item) => item.level === StructuredReportItemLevel.WARN).length;
+    const infoCount = items.filter((item) => item.level === StructuredReportItemLevel.INFO).length;
+    return {
+        errorCount,
+        warnCount,
+        infoCount,
+        items,
+    };
+};
+
+const transformToStructuredReport = (structuredReportObj: any): StructuredReport | null => {
+    if (!structuredReportObj) {
+        return null;
+    }
+
+    /* Legacy helper function to map backend failure or warning ingestion objects into StructuredReportLogEntry[] */
+    const mapItemObject = (
+        items: { [key: string]: string[] },
+        level: StructuredReportItemLevel,
+    ): StructuredReportLogEntry[] => {
+        return Object.entries(items).map(([rawMessage, context]) => ({
+            level,
+            title: i18next.t('ingestion:report.unexpectedIssue'),
+            message: rawMessage,
+            context,
+        }));
+    };
+
+    /* V2 helper function to map backend failure or warning lists into StructuredReportLogEntry[] */
+    const mapItemArray = (items, level: StructuredReportItemLevel): StructuredReportLogEntry[] => {
+        return items
+            .map((item) => {
+                if (typeof item === 'string') {
+                    // Handle "sampled from" case..
+                    return null;
+                }
+
+                return {
+                    level,
+                    title: item.title || i18next.t('ingestion:report.unexpectedIssue'),
+                    message: item.message,
+                    context: item.context,
+                };
+            })
+            .filter((item) => item != null);
+    };
+
+    try {
+        const sourceReport = structuredReportObj.source?.report;
+
+        if (!sourceReport) {
+            return null;
+        }
+
+        // Else fallback to using the legacy fields
+        const failures = Array.isArray(sourceReport.failures)
+            ? /* Use V2 failureList if present */
+              mapItemArray(sourceReport.failures || [], StructuredReportItemLevel.ERROR)
+            : /* Else use the legacy object type */
+              mapItemObject(sourceReport.failures || {}, StructuredReportItemLevel.ERROR);
+
+        const warnings = Array.isArray(sourceReport.warnings)
+            ? /* Use V2 warning if present */
+              mapItemArray(sourceReport.warnings || [], StructuredReportItemLevel.WARN)
+            : /* Else use the legacy object type */
+              mapItemObject(sourceReport.warnings || {}, StructuredReportItemLevel.WARN);
+
+        const infos = Array.isArray(sourceReport.infos)
+            ? /* Use V2 infos if present */
+              mapItemArray(sourceReport.infos || [], StructuredReportItemLevel.INFO)
+            : /* Else use the legacy object type */
+              mapItemObject(sourceReport.infos || {}, StructuredReportItemLevel.INFO);
+
+        return createStructuredReport([...failures, ...warnings, ...infos]);
+    } catch (e) {
+        console.warn('Failed to extract structured report from ingestion report!', e);
+        return null;
+    }
+};
+
+const extractStructuredReportPOJO = (result: Partial<ExecutionRequestResult>): any | null => {
+    const structuredReportStr = result?.structuredReport?.serializedValue;
+    if (!structuredReportStr) {
+        return null;
+    }
+    try {
+        return JSON.parse(structuredReportStr);
+    } catch (e) {
+        console.error(`Caught exception while parsing structured report!`, e);
+        return null;
+    }
+};
+
+export const getStructuredReport = (result: Partial<ExecutionRequestResult>): StructuredReport | null => {
+    // 1. Extract Serialized Structured Report
+    const structuredReportObject = extractStructuredReportPOJO(result);
+    if (!structuredReportObject) {
+        return null;
+    }
+
+    // 2. Transform into the typed model that we have.
+    const structuredReport = transformToStructuredReport(structuredReportObject);
+
+    // 3. Return JSON report
+    return structuredReport;
+};
+
+/**
+ * This function is used to get the total number of entities ingested from the structured report.
+ *
+ * @param result - The result of the execution request.
+ * @returns {number | null}
+ */
+export const getTotalEntitiesIngested = (result: Partial<ExecutionRequestResult>) => {
+    const structuredReportObject = extractStructuredReportPOJO(result);
+    if (!structuredReportObject) {
+        return null;
+    }
+
+    try {
+        return structuredReportObject.sink.report.total_records_written;
+    } catch (e) {
+        console.error(`Caught exception while parsing structured report!`, e);
+        return null;
+    }
+};
+
+/** *
+ * This function is used to get the entities ingested by type from the structured report.
+ * It returns an array of objects with the entity type and the count of entities ingested.
+ *
+ * Example input:
+ *
+ * {
+ *     "source": {
+ *         "report": {
+ *             "aspects": {
+ *                 "container": {
+ *                     "containerProperties": 156,
+ *                     ...
+ *                     "container": 117
+ *                 },
+ *                 "dataset": {
+ *                     "datasetProperties": 1505,
+ *                     ...
+ *                     "operation": 1521
+ *                 },
+ *                 ...
+ *             }
+ *             ...
+ *         }
+ *     }
+ *     ...
+ * }
+ *
+ * Example output:
+ *
+ * [
+ *     {
+ *         "count": 156,
+ *         "displayName": "container"
+ *     },
+ *     ...
+ * ]
+ *
+ * @param result - The result of the execution request.
+ * @returns {EntityTypeCount[] | null}
+ */
+export const getEntitiesIngestedByType = (result: Partial<ExecutionRequestResult>): EntityTypeCount[] | null => {
+    const structuredReportObject = extractStructuredReportPOJO(result);
+    if (!structuredReportObject) {
+        return null;
+    }
+
+    try {
+        /**
+         * This is what the aspects object looks like in the structured report:
+         *
+         * "aspects": {
+         *     "container": {
+         *         "containerProperties": 156,
+         *         ...
+         *         "container": 117
+         *     },
+         *     "dataset": {
+         *         "status": 1505,
+         *         "schemaMetadata": 1505,
+         *         "datasetProperties": 1505,
+         *         "container": 1505,
+         *         ...
+         *         "operation": 1521
+         *     },
+         *     ...
+         * }
+         */
+        const entities = structuredReportObject.source.report.aspects;
+        const entitiesIngestedByType: { [key: string]: number } = {};
+        Object.entries(entities).forEach(([entityName, aspects]) => {
+            // Get the max count of all the sub-aspects for this entity type.
+            entitiesIngestedByType[entityName] = Math.max(...(Object.values(aspects as object) as number[]));
+        });
+
+        if (Object.keys(entitiesIngestedByType).length === 0) {
+            return null;
+        }
+
+        return Object.entries(entitiesIngestedByType).map(([entityName, count]) => ({
+            count,
+            displayName: entityName,
+        }));
+    } catch (e) {
+        console.error(`Caught exception while parsing structured report!`, e);
+        return null;
+    }
+};
+
+export const getIngestionSourceStatus = (result?: Partial<ExecutionRequestResult> | null) => {
+    if (!result) {
+        return undefined;
+    }
+
+    const { status } = result;
+    const structuredReport = getStructuredReport(result);
+
+    /**
+     * Simply map SUCCESS in the presence of warnings to SUCCEEDED_WITH_WARNINGS
+     *
+     * This is somewhat of a hack - ideally the ingestion source should report this status back to us.
+     */
+    if (status === SUCCESS && (structuredReport?.warnCount || 0) > 0) {
+        return SUCCEEDED_WITH_WARNINGS;
+    }
+    // Else return the raw status.
+    return status;
+};
+
+const ENTITIES_WITH_SUBTYPES = new Set([
+    EntityType.Dataset.toLowerCase(),
+    EntityType.Container.toLowerCase(),
+    EntityType.Notebook.toLowerCase(),
+    EntityType.Dashboard.toLowerCase(),
+]);
+
+type EntityTypeCount = {
+    count: number;
+    displayName: string;
+};
+
+/**
+ * Extract entity type counts to display in the ingestion summary.
+ *
+ * @param entityTypeFacets the filter facets for entity type.
+ * @param subTypeFacets the filter facets for sub types.
+ */
+export const extractEntityTypeCountsFromFacets = (
+    entityRegistry: EntityRegistry,
+    entityTypeFacets: FacetMetadata,
+    subTypeFacets?: FacetMetadata | null,
+): EntityTypeCount[] => {
+    const finalCounts: EntityTypeCount[] = [];
+
+    if (subTypeFacets) {
+        subTypeFacets.aggregations
+            .filter((agg) => agg.count > 0)
+            .forEach((agg) =>
+                finalCounts.push({
+                    count: agg.count,
+                    displayName: i18next.t('ingestion:source.entityTypeNameCount', {
+                        count: agg.count,
+                        type: capitalizeFirstLetterOnly(agg.value) || '',
+                    }),
+                }),
+            );
+        entityTypeFacets.aggregations
+            .filter((agg) => agg.count > 0)
+            .filter((agg) => !ENTITIES_WITH_SUBTYPES.has(agg.value.toLowerCase()))
+            .forEach((agg) =>
+                finalCounts.push({
+                    count: agg.count,
+                    displayName: entityRegistry.getCollectionName(agg.value as EntityType),
+                }),
+            );
+    } else {
+        // Only use Entity Types- no subtypes.
+        entityTypeFacets.aggregations
+            .filter((agg) => agg.count > 0)
+            .forEach((agg) =>
+                finalCounts.push({
+                    count: agg.count,
+                    displayName: entityRegistry.getCollectionName(agg.value as EntityType),
+                }),
+            );
+    }
+
+    return finalCounts;
+};
+
+/**
+ * Add an entry to the ListIngestionSources cache.
+ */
+export const addToListIngestionSourcesCache = (client, newSource, pageSize, query) => {
+    // Read the data from our cache for this query.
+    const currData: ListIngestionSourcesQuery | null = client.readQuery({
+        query: ListIngestionSourcesDocument,
+        variables: {
+            input: {
+                start: 0,
+                count: pageSize,
+                query,
+            },
+        },
+    });
+
+    // Add our new source into the existing list.
+    const newSources = [newSource, ...(currData?.listIngestionSources?.ingestionSources || [])];
+
+    // Write our data back to the cache.
+    client.writeQuery({
+        query: ListIngestionSourcesDocument,
+        variables: {
+            input: {
+                start: 0,
+                count: pageSize,
+                query,
+            },
+        },
+        data: {
+            listIngestionSources: {
+                start: 0,
+                count: (currData?.listIngestionSources?.count || 0) + 1,
+                total: (currData?.listIngestionSources?.total || 0) + 1,
+                ingestionSources: newSources,
+            },
+        },
+    });
+};
+
+/**
+ * Remove an entry from the ListIngestionSources cache.
+ */
+export const removeFromListIngestionSourcesCache = (client, urn, page, pageSize, query) => {
+    // Read the data from our cache for this query.
+    const currData: ListIngestionSourcesQuery | null = client.readQuery({
+        query: ListIngestionSourcesDocument,
+        variables: {
+            input: {
+                start: (page - 1) * pageSize,
+                count: pageSize,
+                query,
+            },
+        },
+    });
+
+    // Remove the source from the existing sources set.
+    const newSources = [
+        ...(currData?.listIngestionSources?.ingestionSources || []).filter((source) => source.urn !== urn),
+    ];
+
+    // Write our data back to the cache.
+    client.writeQuery({
+        query: ListIngestionSourcesDocument,
+        variables: {
+            input: {
+                start: (page - 1) * pageSize,
+                count: pageSize,
+                query,
+            },
+        },
+        data: {
+            listIngestionSources: {
+                start: currData?.listIngestionSources?.start || 0,
+                count: (currData?.listIngestionSources?.count || 1) - 1,
+                total: (currData?.listIngestionSources?.total || 1) - 1,
+                ingestionSources: newSources,
+            },
+        },
+    });
+};

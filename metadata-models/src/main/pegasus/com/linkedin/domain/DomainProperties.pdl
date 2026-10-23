@@ -1,0 +1,79 @@
+namespace com.linkedin.domain
+
+import com.linkedin.common.AuditStamp
+import com.linkedin.common.CustomProperties
+import com.linkedin.common.Urn
+
+/**
+ * Information about a Domain
+ */
+@Aspect = {
+  "name": "domainProperties"
+}
+record DomainProperties includes CustomProperties {
+
+  /**
+   * Display name of the Domain
+   */
+  @Searchable = {
+    "fieldType": "WORD_GRAM",
+    "enableAutocomplete": true,
+    "boostScore": 10.0,
+    "fieldNameAliases": [ "_entityName" ],
+    "v3": {
+      "searchLabel": "name",
+      "mappings": [
+        { "type": "KEYWORD" },
+        { "subfield": "text", "type": "TEXT" },
+        { "subfield": "stemmed", "type": "STEMMED" }
+      ]
+    }
+  }
+  name: string
+
+  /**
+   * Description of the Domain
+   */
+  @Searchable = {
+    "fieldType": "TEXT",
+    "hasValuesFieldName": "hasDescription",
+    "v3": {
+      "searchLabel": "description",
+      "mappings": [
+        { "type": "KEYWORD", "index": false, "docValues": false },
+        { "subfield": "text", "type": "TEXT" },
+        { "subfield": "stemmed", "type": "STEMMED" }
+      ]
+    }
+  }
+  description: optional string
+
+  /**
+   * When this domain was created in DataHub.
+   * Search V3 does not index this time. It is systemMetadata.aspectCreated,
+   * copied to _system.created.time.
+   */
+  @deprecated = "Use systemMetadata.aspectCreated instead."
+  @Searchable = {
+    "/time": {
+      "fieldName": "createdTime",
+      "fieldType": "DATETIME",
+      "v3": { "enabled": false }
+    }
+  }
+  created: optional AuditStamp
+
+  /**
+   * Optional: Parent of the domain
+   */
+  @Relationship = {
+    "name": "IsPartOf",
+    "entityTypes": [ "domain" ],
+  }
+  @Searchable = {
+    "fieldName": "parentDomain",
+    "fieldType": "URN",
+    "hasValuesFieldName": "hasParentDomain"
+  }
+  parentDomain: optional Urn
+}

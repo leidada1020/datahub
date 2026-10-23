@@ -1,0 +1,122 @@
+namespace com.linkedin.assertion
+
+import com.linkedin.common.CustomProperties
+import com.linkedin.common.ExternalReference
+import com.linkedin.common.AuditStamp
+import com.linkedin.common.Urn
+
+/**
+ * Information about an assertion
+ */
+@Aspect = {
+  "name": "assertionInfo",
+  "schemaVersion": 7
+}
+record AssertionInfo includes CustomProperties, ExternalReference {
+    /**
+    * Type of assertion.
+    */
+    @Searchable = {
+      "fieldName": "assertionType",
+      "fieldType": "KEYWORD",
+      "addToFilters": true
+    }
+    type: AssertionType
+
+    /**
+    * @deprecated A Dataset Assertion definition. This field is populated when the type is DATASET.
+    * Prefer customAssertion with AssertionType.CUSTOM for external assertions.
+    */
+    @deprecated = "Use customAssertion with AssertionType.CUSTOM for external assertions."
+    datasetAssertion: optional DatasetAssertionInfo
+
+    /**
+    * An Freshness Assertion definition. This field is populated when the type is FRESHNESS.
+    */
+    freshnessAssertion: optional FreshnessAssertionInfo
+
+    /**
+    * An Volume Assertion definition. This field is populated when the type is VOLUME.
+    */
+    volumeAssertion: optional VolumeAssertionInfo
+
+    /**
+    * A SQL Assertion definition. This field is populated when the type is SQL.
+    */
+    sqlAssertion: optional SqlAssertionInfo
+
+    /**
+    * A Field Assertion definition. This field is populated when the type is FIELD.
+    */
+    fieldAssertion: optional FieldAssertionInfo
+
+    /**
+    * An schema Assertion definition. This field is populated when the type is DATA_SCHEMA
+    */
+    schemaAssertion: optional SchemaAssertionInfo
+
+    /**
+    * A Custom Assertion definition. This field is populated when type is CUSTOM.
+    */
+    customAssertion: optional CustomAssertionInfo
+
+    /**
+    * The source or origin of the Assertion definition.
+    *
+    * If the source type of the Assertion is EXTERNAL, it is expected to have a corresponding dataPlatformInstance aspect detailing
+    * the platform where it was ingested from.
+    */
+    @Searchable = {
+      "/created/actor": {
+        "fieldName": "creator",
+        "fieldType": "URN",
+        "hasValuesFieldName": "hasCreator",
+        "filterNameOverride": "Created By"
+      }
+    }
+    source: optional AssertionSource
+
+    /**
+      * The time at which the assertion was last updated and the actor who updated it.
+      * This field is only present for Native assertions updated after this field was introduced.
+      */
+    lastUpdated: optional AuditStamp
+
+    /**
+    * An optional human-readable description of the assertion
+    */
+    @Searchable = {
+      "fieldName": "assertionDescription",
+      "fieldType": "TEXT",
+      "hasValuesFieldName": "hasDescription",
+      "sanitizeRichText": true,
+      "v3": {
+        "searchLabel": "description",
+        "mappings": [
+          { "type": "KEYWORD", "index": false, "docValues": false },
+          { "subfield": "text", "type": "TEXT" },
+          { "subfield": "stemmed", "type": "STEMMED" }
+        ]
+      }
+  }
+    description: optional string
+
+    /**
+    * @deprecated Use the assertionNote aspect instead. This field is retained for backward
+    * compatibility during migration and will be removed in a future release.
+    *
+    * An optional note to give technical owners more context about the assertion, and how to troubleshoot it.
+    * The UI will render this in markdown format.
+    */
+    @deprecated = "Use the assertionNote aspect instead."
+    note: optional AssertionNote
+
+    /**
+    * The entity targeted by this assertion. Automatically populated from the type-specific assertion definition.
+    */
+    @Searchable = {
+      "fieldType": "URN",
+      "fieldName": "entity"
+    }
+    entityUrn: optional Urn
+}

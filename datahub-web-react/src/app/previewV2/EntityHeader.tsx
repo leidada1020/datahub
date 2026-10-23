@@ -1,0 +1,126 @@
+import { Tooltip } from '@components';
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import { Link } from 'react-router-dom';
+import styled from 'styled-components';
+
+import { GenericEntityProperties } from '@app/entity/shared/types';
+import { DeprecationFormData } from '@app/entityV2/shared/EntityDropdown/useHandleDeprecateDomain';
+import { DeprecationIcon } from '@app/entityV2/shared/components/styled/DeprecationIcon';
+import StructuredPropertyBadge from '@app/entityV2/shared/containers/profile/header/StructuredPropertyBadge';
+import { getNumberWithOrdinal } from '@app/entityV2/shared/utils';
+import VersioningBadge from '@app/entityV2/shared/versioning/VersioningBadge';
+import HealthIcon from '@app/previewV2/HealthIcon';
+import SearchTextHighlighter from '@app/searchV2/matches/SearchTextHighlighter';
+import { useEmbeddedProfileLinkProps } from '@app/sharedV2/useEmbeddedProfileLinkProps';
+
+import { DataPlatform, Deprecation, Health, Maybe } from '@types';
+
+const EntityTitleContainer = styled.div`
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 16px;
+    min-width: 15em;
+`;
+
+const StyledLink = styled(Link)`
+    min-width: 0;
+`;
+
+const EntityTitle = styled.div<{ $titleSizePx?: number }>`
+    &&& {
+        font-size: ${(props) => props.$titleSizePx || 16}px;
+        font-weight: 500;
+        vertical-align: middle;
+
+        :hover {
+            color: ${(p) => p.theme.colors.textHover};
+        }
+    }
+
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: 13px;
+    color: ${(p) => p.theme.colors.textBrand};
+    height: 100%;
+`;
+
+const DegreeText = styled.div`
+    border-radius: 18px;
+    background: ${(props) => props.theme.colors.bgSurface};
+    padding: 3px 5px;
+    font-size: 12px;
+    font-weight: 700;
+    width: fit-content;
+    color: ${(props) => props.theme.colors.textTertiary};
+`;
+
+interface EntityHeaderProps {
+    name: string;
+    onClick?: () => void;
+    titleSizePx?: number;
+    url: string;
+    urn: string;
+    deprecation: Deprecation | null | undefined;
+    health: Health[] | undefined;
+    degree?: number;
+    connectionName?: Maybe<string>;
+    previewData?: GenericEntityProperties | null;
+    refetchDeprecation?: (formData?: DeprecationFormData) => void;
+}
+
+const EntityHeader: React.FC<EntityHeaderProps> = ({
+    name,
+    onClick,
+    titleSizePx,
+    url,
+    urn,
+    deprecation,
+    health,
+    degree,
+    connectionName,
+    previewData,
+    refetchDeprecation,
+}) => {
+    const { t } = useTranslation('entity.preview');
+    const linkProps = useEmbeddedProfileLinkProps();
+
+    return (
+        <EntityTitleContainer>
+            <StyledLink to={`${url}/`} {...linkProps} onClick={() => onClick?.()}>
+                <EntityTitle title={name} $titleSizePx={titleSizePx} data-testid="entity-title">
+                    <SearchTextHighlighter field="name" text={name || urn} />
+                </EntityTitle>
+            </StyledLink>
+            {degree !== undefined && (
+                <Tooltip
+                    title={t('degreeConnectionTooltip', {
+                        ordinalText: getNumberWithOrdinal(degree),
+                        connectionName: connectionName || t('sourceEntityFallback'),
+                    })}
+                >
+                    <DegreeText>{getNumberWithOrdinal(degree)}</DegreeText>
+                </Tooltip>
+            )}
+            {deprecation?.deprecated && (
+                <DeprecationIcon
+                    urn={urn}
+                    deprecation={deprecation}
+                    showUndeprecate
+                    showText={false}
+                    refetch={refetchDeprecation}
+                />
+            )}
+            {health && <HealthIcon urn={urn} health={health} baseUrl={url} />}
+            <StructuredPropertyBadge
+                structuredProperties={previewData?.structuredProperties}
+                platformUrn={(previewData?.platform as DataPlatform | undefined)?.urn}
+            />
+            <VersioningBadge versionProperties={previewData?.versionProperties ?? undefined} showPopover={false} />
+        </EntityTitleContainer>
+    );
+};
+
+export default EntityHeader;

@@ -1,0 +1,52 @@
+source:
+  type: redshift
+  config:
+    # Coordinates
+    host_port: example.something.us-west-2.redshift.amazonaws.com:5439
+    database: DemoDatabase
+
+    # Credentials
+    username: user
+    password: pass
+
+    # Options
+    options:
+      # driver_option: some-option
+
+    include_table_lineage: true
+    include_usage_statistics: true
+    # Appends the domain to Redshift usernames to form DataHub user URNs (e.g. username@email_domain).
+    # Used for both usage statistics and ownership extraction.
+    email_domain: mydomain.com
+
+    # Ownership extraction (disabled by default)
+    # When enabled, extracts table/view/schema owners from pg_catalog.pg_user (no extra grants needed)
+    # and emits them as TECHNICAL_OWNER in DataHub. Note: overwrites any manually-set owners on each run.
+    # extract_ownership: true
+
+    profiling:
+      enabled: true
+      # Only collect table level profiling information
+      profile_table_level_only: true
+
+  sink:
+  # sink configs
+
+#------------------------------------------------------------------------------
+# Extra options when running Redshift behind a proxy</summary>
+# This requires you to have already installed the Microsoft ODBC Driver for SQL Server.
+# See https://docs.microsoft.com/en-us/sql/connect/python/pyodbc/step-1-configure-development-environment-for-pyodbc-python-development?view=sql-server-ver15
+#------------------------------------------------------------------------------
+
+source:
+  type: redshift
+  config:
+    host_port: my-proxy-hostname:5439
+
+    options:
+      connect_args:
+        # check all available options here: https://pypi.org/project/redshift-connector/
+        ssl_insecure: "false" # Specifies if IDP hosts server certificate will be verified
+
+sink:
+  # sink configs

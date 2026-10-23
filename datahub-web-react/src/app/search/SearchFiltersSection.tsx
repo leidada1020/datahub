@@ -1,0 +1,171 @@
+import { Button } from 'antd';
+import React, { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components/macro';
+
+import { useUserContext } from '@app/context/useUserContext';
+import { ViewBuilder } from '@app/entity/view/builder/ViewBuilder';
+import { ViewBuilderMode } from '@app/entity/view/builder/types';
+import { buildInitialViewState, fromUnionType } from '@app/entity/view/builder/utils';
+import { SEARCH_RESULTS_ADVANCED_SEARCH_ID } from '@app/onboarding/config/SearchOnboardingConfig';
+import { AdvancedSearchFilters } from '@app/search/AdvancedSearchFilters';
+import { SaveAsViewButton } from '@app/search/SaveAsViewButton';
+import { SimpleSearchFilters } from '@app/search/SimpleSearchFilters';
+import {
+    COMPLETED_FORMS_COMPLETED_PROMPT_IDS_FILTER_NAME,
+    COMPLETED_FORMS_FILTER_NAME,
+    INCOMPLETE_FORMS_COMPLETED_PROMPT_IDS_FILTER_NAME,
+    INCOMPLETE_FORMS_FILTER_NAME,
+    UnionType,
+    VERIFIED_FORMS_FILTER_NAME,
+} from '@app/search/utils/constants';
+import { hasAdvancedFilters } from '@app/search/utils/hasAdvancedFilters';
+
+import { FacetFilterInput, FacetMetadata } from '@types';
+
+type Props = {
+    filters?: Array<FacetMetadata> | null;
+    selectedFilters: Array<FacetFilterInput>;
+    unionType: UnionType;
+    loading: boolean;
+    onChangeFilters: (filters: Array<FacetFilterInput>) => void;
+    onChangeUnionType: (unionType: UnionType) => void;
+};
+
+const FiltersContainer = styled.div`
+    display: flex;
+    flex-direction: column;
+    max-width: 260px;
+    min-width: 260px;
+    overflow-wrap: break-word;
+    border-right: 1px solid;
+    border-color: ${(props) => props.theme.colors.border};
+    height: 100%;
+`;
+
+const FiltersHeader = styled.div`
+    font-size: 14px;
+    font-weight: 600;
+
+    padding-left: 20px;
+    padding-right: 4px;
+    padding-bottom: 8px;
+
+    width: 100%;
+    height: 47px;
+    line-height: 47px;
+    border-bottom: 1px solid;
+    border-color: ${(props) => props.theme.colors.border};
+
+    justify-content: space-between;
+    display: flex;
+`;
+
+const SearchFiltersWrapper = styled.div`
+    max-height: 100%;
+    padding-top: 10px;
+    overflow: auto;
+
+    &::-webkit-scrollbar {
+        height: 12px;
+        width: 1px;
+        background: ${(props) => props.theme.colors.scrollbarTrack};
+    }
+    &::-webkit-scrollbar-thumb {
+        background: ${(props) => props.theme.colors.scrollbarThumb};
+        -webkit-border-radius: 1ex;
+        -webkit-box-shadow: ${(props) => props.theme.colors.shadowXs};
+    }
+`;
+
+const AdvancedSearchFiltersWrapper = styled.div`
+    margin-top: 6px;
+    margin-left: 12px;
+    margin-right: 12px;
+`;
+
+const FILTERS_TO_REMOVE = [
+    // remove form-related filters for bulk form search and browse experience
+    COMPLETED_FORMS_FILTER_NAME,
+    INCOMPLETE_FORMS_FILTER_NAME,
+    VERIFIED_FORMS_FILTER_NAME,
+    COMPLETED_FORMS_COMPLETED_PROMPT_IDS_FILTER_NAME,
+    INCOMPLETE_FORMS_COMPLETED_PROMPT_IDS_FILTER_NAME,
+];
+
+// This component renders the entire filters section that allows toggling
+// between the simplified search experience and advanced search
+export const SearchFiltersSection = ({
+    filters,
+    selectedFilters,
+    unionType,
+    loading,
+    onChangeFilters,
+    onChangeUnionType,
+}: Props) => {
+    const { t } = useTranslation('search');
+    const { t: tc } = useTranslation('common.actions');
+    const filteredFilters = filters?.filter((f) => !FILTERS_TO_REMOVE.includes(f.field));
+    const userContext = useUserContext();
+    const onlyShowAdvancedFilters = hasAdvancedFilters(selectedFilters, unionType);
+    const [showViewBuilder, setShowViewBuilder] = useState(false);
+    const [seeAdvancedFilters, setSeeAdvancedFilters] = useState(onlyShowAdvancedFilters);
+
+    const onSaveAsView = () => {
+        setShowViewBuilder(true);
+    };
+
+    // Only show "Save As View" if there are selected Filters, and there is no
+    // current View applied (creating a new Filter on top of an existing View is not currently supported).
+    const selectedViewUrn = userContext?.localState?.selectedViewUrn;
+    const showSaveAsView = selectedFilters?.length > 0 && selectedViewUrn === undefined;
+
+    return (
+        <FiltersContainer>
+            <FiltersHeader>
+                <span>{tc('filter')}</span>
+                <span>
+                    <Button
+                        disabled={onlyShowAdvancedFilters}
+                        type="link"
+                        onClick={() => setSeeAdvancedFilters(!seeAdvancedFilters)}
+                        id={SEARCH_RESULTS_ADVANCED_SEARCH_ID}
+                        data-testid={SEARCH_RESULTS_ADVANCED_SEARCH_ID}
+                    >
+                        {seeAdvancedFilters ? t('filtersSection.basic') : t('filtersSection.advanced')}
+                    </Button>
+                </span>
+            </FiltersHeader>
+            <SearchFiltersWrapper>
+                {seeAdvancedFilters ? (
+                    <AdvancedSearchFiltersWrapper>
+                        <AdvancedSearchFilters
+                            unionType={unionType}
+                            selectedFilters={selectedFilters}
+                            onFilterSelect={(newFilters) => onChangeFilters(newFilters)}
+                            onChangeUnionType={onChangeUnionType}
+                            facets={filteredFilters || []}
+                            loading={loading}
+                        />
+                        {showSaveAsView && <SaveAsViewButton onClick={onSaveAsView} />}
+                        {showViewBuilder && (
+                            <ViewBuilder
+                                mode={ViewBuilderMode.EDITOR}
+                                initialState={buildInitialViewState(selectedFilters, fromUnionType(unionType))}
+                                onSubmit={() => setShowViewBuilder(false)}
+                                onCancel={() => setShowViewBuilder(false)}
+                            />
+                        )}
+                    </AdvancedSearchFiltersWrapper>
+                ) : (
+                    <SimpleSearchFilters
+                        loading={loading}
+                        facets={filteredFilters || []}
+                        selectedFilters={selectedFilters}
+                        onFilterSelect={(newFilters) => onChangeFilters(newFilters)}
+                    />
+                )}
+            </SearchFiltersWrapper>
+        </FiltersContainer>
+    );
+};

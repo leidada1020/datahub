@@ -1,0 +1,1019 @@
+import contextlib
+import enum
+import itertools
+import logging
+import os
+import platform
+import shutil
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, Iterator, List, Optional
+
+import click
+import humanfriendly
+import psutil
+import requests
+
+from datahub._version import nice_version_name
+from datahub.cli import config_utils
+from datahub.configuration.common import (
+    ConfigModel,
+    IgnorableError,
+    PipelineExecutionError,
+)
+from datahub.configuration.env_vars import (
+    DEFAULT_SINK_KAFKA,
+    DEFAULT_SINK_REST,
+    get_ingestion_default_sink,
+    get_kafka_schema_registry_url,
+    get_kafka_sink_bootstrap,
+    get_kafka_sink_init_probe_timeout,
+    get_kafka_sink_linger_ms,
+    get_kafka_sink_max_message_bytes,
+    get_kafka_sink_queue_max_kbytes,
+    get_kafka_sink_queue_max_messages,
+)
+from datahub.ingestion.api.committable import CommitPolicy
+from datahub.ingestion.api.common import EndOfStream, PipelineContext, RecordEnvelope
+from datahub.ingestion.api.global_context import set_graph_context
+from datahub.ingestion.api.pipeline_run_listener import PipelineRunListener
+from datahub.ingestion.api.report import Report
+from datahub.ingestion.api.sink import Sink, SinkReport
+from datahub.ingestion.api.source import Extractor, Source
+from datahub.ingestion.api.transform import Transformer
+from datahub.ingestion.extractor.extractor_registry import extractor_registry
+from datahub.ingestion.graph.client import DataHubGraph, get_default_graph
+from datahub.ingestion.graph.config import ClientMode
+from datahub.ingestion.reporting.reporting_provider_registry import (
+    reporting_provider_registry,
+)
+from datahub.ingestion.run.pipeline_config import PipelineConfig, ReporterConfig
+from datahub.ingestion.run.sink_callback import DeadLetterQueueCallback, LoggingCallback
+from datahub.ingestion.sink.datahub_rest import (
+    DatahubRestSink,
+    DatahubRestSinkConfig,
+)
+from datahub.ingestion.sink.sink_registry import sink_registry
+from datahub.ingestion.source.source_registry import source_registry
+from datahub.ingestion.transformer.transform_registry import transform_registry
+from datahub.sdk._attribution import KnownAttribution, change_default_attribution
+from datahub.telemetry import stats
+from datahub.telemetry.telemetry import telemetry_instance
+from datahub.upgrade.upgrade import (
+    is_server_default_cli_ahead,
+    retrieve_version_stats,
+)
+from datahub.utilities._custom_package_loader import model_version_name
+from datahub.utilities.global_warning_util import (
+    clear_global_warnings,
+    get_global_warnings,
+)
+from datahub.utilities.lossy_collections import LossyList
+
+logger = logging.getLogger(__name__)
+_REPORT_PRINT_INTERVAL_SECONDS = 60
+
+
+class PipelineInitError(Exception):
+    pass
+
+
+class PipelineStatus(enum.Enum):
+    UNKNOWN = enum.auto()
+    COMPLETED = enum.auto()
+    ERROR = enum.auto()
+    CANCELLED = enum.auto()
+
+
+@contextlib.contextmanager
+def _add_init_error_context(step: str) -> Iterator[None]:
+    """Enriches any exceptions raised with information about the step that failed."""
+
+    try:
+        yield
+    except PipelineInitError:
+        raise
+    except Exception as e:
+        raise PipelineInitError(f"Failed to {step}: {e}") from e
+
+
+@dataclass
+class CliReport(Report):
+    cli_version: str = nice_version_name()
+    cli_entry_location: str = __file__
+    models_version: str = model_version_name()
+    py_version: str = sys.version
+    py_exec_path: str = sys.executable
+    os_details: str = platform.platform()
+
+    mem_info: Optional[str] = None
+    peak_memory_usage: Optional[str] = None
+    _peak_memory_usage: int = 0
+
+    disk_info: Optional[dict] = None
+    peak_disk_usage: Optional[str] = None
+    _initial_disk_usage: int = -1
+    _peak_disk_usage: int = 0
+
+    thread_count: Optional[int] = None
+    peak_thread_count: Optional[int] = None
+
+    def compute_stats(self) -> None:
+        try:
+            mem_usage = psutil.Process(os.getpid()).memory_info().rss
+            if self._peak_memory_usage < mem_usage:
+                self._peak_memory_usage = mem_usage
+                self.peak_memory_usage = humanfriendly.format_size(
+                    self._peak_memory_usage
+                )
+            self.mem_info = humanfriendly.format_size(mem_usage)
+        except Exception as e:
+            logger.warning(f"Failed to compute memory usage: {e}")
+
+        try:
+            disk_usage = shutil.disk_usage("/")
+            if self._initial_disk_usage < 0:
+                self._initial_disk_usage = disk_usage.used
+            if self._peak_disk_usage < disk_usage.used:
+                self._peak_disk_usage = disk_usage.used
+                self.peak_disk_usage = humanfriendly.format_size(self._peak_disk_usage)
+            self.disk_info = {
+                "total": humanfriendly.format_size(disk_usage.total),
+                "used": humanfriendly.format_size(disk_usage.used),
+                "used_initally": humanfriendly.format_size(self._initial_disk_usage),
+                "free": humanfriendly.format_size(disk_usage.free),
+            }
+        except Exception as e:
+            logger.warning(f"Failed to compute disk usage: {e}")
+
+        try:
+            self.thread_count = threading.active_count()
+            self.peak_thread_count = max(self.peak_thread_count or 0, self.thread_count)
+        except Exception as e:
+            logger.warning(f"Failed to compute thread count: {e}")
+
+        return super().compute_stats()
+
+
+def _make_default_rest_sink(ctx: PipelineContext) -> DatahubRestSink:
+    graph = get_default_graph(ClientMode.INGESTION)
+    sink_config = graph._make_rest_sink_config()
+    return DatahubRestSink(ctx, sink_config)
+
+
+def _kafka_endpoints_reachable(bootstrap: str, schema_registry_url: str) -> bool:
+    """Bounded reachability check for the broker and schema registry.
+
+    The Kafka clients connect lazily -- without this, a wrong/unreachable
+    bootstrap or schema-registry URL isn't noticed until flush() stalls for
+    ~max_queue_full_block_seconds (~300s) at the end of an otherwise
+    healthy-looking run. This checks at init so the caller can fall back to REST
+    instead.
+
+    Returns True if both endpoints answer within the timeout, else False (and
+    logs why). Does NOT close the reachable-but-wrong-broker case (a valid broker
+    on the wrong cluster still answers) -- that's a coordinator-side concern.
+    """
+    timeout_s = get_kafka_sink_init_probe_timeout()
+
+    # Broker: a metadata fetch round-trips to the bootstrap server and raises
+    # within `timeout_s` if it's unreachable.
+    try:
+        from confluent_kafka import Producer
+
+        Producer(
+            {
+                "bootstrap.servers": bootstrap,
+                "socket.timeout.ms": timeout_s * 1000,
+            }
+        ).list_topics(timeout=timeout_s)
+    except Exception as e:
+        logger.warning(
+            f"Kafka broker at {bootstrap!r} is not reachable within {timeout_s}s "
+            f"(KAFKA_BOOTSTRAP_SERVER for the Kafka default sink): {e}"
+        )
+        return False
+
+    # Schema registry: a bounded GET against the subjects endpoint. MCP schemas
+    # can't be registered if this is wrong.
+    try:
+        resp = requests.get(
+            f"{schema_registry_url.rstrip('/')}/subjects",
+            timeout=timeout_s,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        if not get_kafka_schema_registry_url():
+            # URL was never set, so it resolved to a localhost default that is
+            # wrong in a container. Flag as a config gap, not a Kafka outage, so
+            # ops sets KAFKA_SCHEMAREGISTRY_URL instead of chasing a phantom
+            # broker problem.
+            logger.warning(
+                f"KAFKA_SCHEMAREGISTRY_URL is not set; schema registry defaulted "
+                f"to {schema_registry_url!r}, which is not reachable within "
+                f"{timeout_s}s. This is a config gap for the Kafka default sink -- "
+                f"set KAFKA_SCHEMAREGISTRY_URL to the GMS-hosted registry. "
+                f"Falling back to REST: {e}"
+            )
+        else:
+            logger.warning(
+                f"Kafka schema registry at {schema_registry_url!r} is not reachable "
+                f"within {timeout_s}s (KAFKA_SCHEMAREGISTRY_URL). Falling back to "
+                f"REST: {e}"
+            )
+        return False
+
+    return True
+
+
+def _make_default_kafka_sink(ctx: PipelineContext) -> Sink:
+    # Lazy: datahub_kafka pulls the optional confluent_kafka extra at module load.
+    # Keep it off the CLI import path so minimal installs (no kafka extra) work.
+    from datahub.ingestion.sink.datahub_kafka import (
+        DatahubKafkaSink,
+        KafkaSinkConfig,
+    )
+
+    # Bootstrap defaults to localhost:9092 in KafkaSinkConfig, which is wrong in
+    # a container. If it's unset, the Kafka default was selected without a broker
+    # configured -- degrade to REST rather than using a bogus default and failing
+    # the run.
+    bootstrap = get_kafka_sink_bootstrap()
+    if not bootstrap:
+        logger.warning(
+            "DATAHUB_INGESTION_DEFAULT_SINK=datahub-kafka but KAFKA_BOOTSTRAP_SERVER "
+            "is not set; falling back to the REST default sink for this run."
+        )
+        return _make_default_rest_sink(ctx)
+
+    # DELETE/RESTATE change types aren't supported over async Kafka; wire a REST
+    # fallback from the same client config the REST default sink uses so those
+    # MCPs degrade to synchronous REST. Spread (not a hand-picked subset) so new
+    # client-config fields flow through as they do for the REST default sink.
+    rest_fallback = DatahubRestSinkConfig(
+        **config_utils.load_client_config().model_dump()
+    )
+    sink_config = KafkaSinkConfig(
+        connection={
+            "bootstrap": bootstrap,
+            # Cap the producer's local send buffer so backpressure engages at a
+            # bounded memory ceiling instead of librdkafka's ~1 GiB default
+            # (OOM protection in memory-constrained executor pods). Tunable via
+            # DATAHUB_KAFKA_SINK_QUEUE_MAX_KBYTES / _QUEUE_MAX_MESSAGES / _LINGER_MS.
+            #
+            # message.max.bytes: raise librdkafka's ~1 MiB default to the MCP
+            # topic's max so aspects REST would accept aren't rejected purely by
+            # the Kafka sink's message-size ceiling. Must stay <= the broker/topic
+            # max.message.bytes. An oversized aspect degrades to the sink's REST
+            # fallback (parity with the REST sink's ~16 MiB cap); with no fallback
+            # it fails the record (reported), never silently.
+            "producer_config": {
+                "queue.buffering.max.kbytes": get_kafka_sink_queue_max_kbytes(),
+                "queue.buffering.max.messages": get_kafka_sink_queue_max_messages(),
+                "linger.ms": get_kafka_sink_linger_ms(),
+                "message.max.bytes": get_kafka_sink_max_message_bytes(),
+            },
+        },
+        rest_fallback=rest_fallback,
+    )
+    # Kafka default is an infra optimization the recipe didn't opt into; if the
+    # broker / schema registry is unreachable (e.g. the flag reached an executor
+    # with no in-cluster Kafka access), degrade to REST rather than fail the run.
+    # WARNING not error so ops can alert on sustained fallback -- which quietly
+    # restores the GMS load we were offloading.
+    if not _kafka_endpoints_reachable(
+        bootstrap, sink_config.connection.schema_registry_url
+    ):
+        logger.warning(
+            "Kafka default sink endpoints unreachable; falling back to the REST "
+            "default sink for this run. Metadata is still written to GMS over "
+            "REST. Sustained fallback across runs indicates a Kafka / schema-"
+            "registry outage or misconfiguration -- alert on this."
+        )
+        return _make_default_rest_sink(ctx)
+    return DatahubKafkaSink(ctx, sink_config)
+
+
+class Pipeline:
+    config: PipelineConfig
+    ctx: PipelineContext
+    source: Source
+    extractor: Extractor
+    sink_type: str
+    sink: Sink[ConfigModel, SinkReport]
+    transformers: List[Transformer]
+
+    def __init__(
+        self,
+        config: PipelineConfig,
+        dry_run: bool = False,
+        preview_mode: bool = False,
+        preview_workunits: int = 10,
+        report_to: Optional[str] = "datahub",
+        no_progress: bool = False,
+    ):
+        self.config = config
+        self.dry_run = dry_run
+        self.preview_mode = preview_mode
+        self.preview_workunits = preview_workunits
+        self.report_to = report_to
+        self.reporters: List[PipelineRunListener] = []
+        self.no_progress = no_progress
+        self.num_intermediate_workunits = 0
+        self.last_time_printed = int(time.time())
+        self.cli_report = CliReport()
+
+        with (
+            contextlib.ExitStack() as exit_stack,
+            contextlib.ExitStack() as inner_exit_stack,
+        ):
+            self.graph: Optional[DataHubGraph] = None
+            with _add_init_error_context("connect to DataHub"):
+                if self.config.datahub_api:
+                    self.config.datahub_api.client_mode = ClientMode.INGESTION
+                    self.graph = exit_stack.enter_context(
+                        DataHubGraph(self.config.datahub_api)
+                    )
+                    self.graph.test_connection()
+
+            with _add_init_error_context("set up framework context"):
+                self.ctx = PipelineContext(
+                    run_id=self.config.run_id,
+                    graph=self.graph,
+                    pipeline_name=self.config.pipeline_name,
+                    dry_run=dry_run,
+                    preview_mode=preview_mode,
+                    pipeline_config=self.config,
+                )
+
+            if self.config.sink is None:
+                # The default sink is normally datahub-rest. Deployments that
+                # run ingestion close to Kafka (e.g. managed UI ingestion) opt
+                # into a datahub-kafka default to take load off GMS by setting
+                # DATAHUB_INGESTION_DEFAULT_SINK=datahub-kafka on those runs only.
+                # Unset/any-other-value preserves the historical datahub-rest
+                # behavior exactly. A recipe with an explicit sink is unaffected.
+                default_sink = get_ingestion_default_sink()
+                if default_sink == DEFAULT_SINK_KAFKA:
+                    with _add_init_error_context("configure the default kafka sink"):
+                        self.sink = exit_stack.enter_context(
+                            _make_default_kafka_sink(self.ctx)
+                        )
+                else:
+                    with _add_init_error_context("configure the default rest sink"):
+                        self.sink = exit_stack.enter_context(
+                            _make_default_rest_sink(self.ctx)
+                        )
+                # Derive the reported type from the sink actually created: the
+                # Kafka factory degrades to a REST sink when the broker/registry
+                # is unreachable, so a requested datahub-kafka default can still
+                # yield a DatahubRestSink. DatahubKafkaSink is imported lazily
+                # (optional confluent_kafka extra), so key off the REST class,
+                # which is always available.
+                self.sink_type = (
+                    DEFAULT_SINK_REST
+                    if isinstance(self.sink, DatahubRestSink)
+                    else DEFAULT_SINK_KAFKA
+                )
+                logger.info(
+                    f"No sink configured, using the default {self.sink_type} sink."
+                )
+            else:
+                self.sink_type = self.config.sink.type
+                with _add_init_error_context(
+                    f"find a registered sink for type {self.sink_type}"
+                ):
+                    sink_class = sink_registry.get(self.sink_type)
+
+                with _add_init_error_context(f"configure the sink ({self.sink_type})"):
+                    sink_config = self.config.sink.model_dump().get("config") or {}
+                    self.sink = exit_stack.enter_context(
+                        sink_class.create(sink_config, self.ctx)
+                    )
+                    logger.debug(
+                        f"Sink type {self.sink_type} ({sink_class}) configured"
+                    )
+            logger.info(f"Sink configured successfully. {self.sink.configured()}")
+
+            # Apply recipe-level sample sizes to the sink report.
+            flags = self.config.flags
+            sink_report = self.sink.get_report()
+            sink_report.failures.max_elements = max(
+                flags.report_failure_sample_size,
+                flags.progress_report_max_failures,
+            )
+            sink_report.warnings.max_elements = max(
+                flags.report_warning_sample_size,
+                flags.progress_report_max_warnings,
+            )
+
+            if self.graph is None:
+                with _add_init_error_context("setup default datahub client"):
+                    self.graph = self.sink.to_graph()
+                    if self.graph is not None:
+                        self.graph.test_connection()
+            self.ctx.graph = self.graph
+            telemetry_instance.set_context(server=self.graph)
+
+            with set_graph_context(self.graph):
+                with _add_init_error_context("configure reporters"):
+                    self._configure_reporting(report_to)
+
+                with _add_init_error_context(
+                    f"find a registered source for type {self.source_type}"
+                ):
+                    source_class = source_registry.get(self.source_type)
+
+                with _add_init_error_context(
+                    f"configure the source ({self.source_type})"
+                ):
+                    self.source = inner_exit_stack.enter_context(
+                        source_class.create(
+                            self.config.source.model_dump().get("config", {}), self.ctx
+                        )
+                    )
+                    logger.debug(
+                        f"Source type {self.source_type} ({source_class}) configured"
+                    )
+                    logger.info("Source configured successfully.")
+
+                    # Retain enough entries for whichever is larger: the
+                    # final report size or the interim display cap.
+                    flags = self.config.flags
+                    self.source.get_report().set_sample_sizes(
+                        failure_size=max(
+                            flags.report_failure_sample_size,
+                            flags.progress_report_max_failures,
+                        ),
+                        warning_size=max(
+                            flags.report_warning_sample_size,
+                            flags.progress_report_max_warnings,
+                        ),
+                        info_size=max(
+                            flags.report_info_sample_size,
+                            flags.progress_report_max_infos,
+                        ),
+                    )
+
+                extractor_type = self.config.source.extractor
+                with _add_init_error_context(
+                    f"configure the extractor ({extractor_type})"
+                ):
+                    extractor_class = extractor_registry.get(extractor_type)
+                    self.extractor = inner_exit_stack.enter_context(
+                        extractor_class(self.config.source.extractor_config, self.ctx)
+                    )
+
+                with _add_init_error_context("configure transformers"):
+                    self._configure_transforms()
+
+                # Register completion callback with sink to handle final reporting
+                self.sink.register_pre_shutdown_callback(
+                    self._notify_reporters_on_ingestion_completion
+                )
+
+            # If all of the initialization succeeds, we can preserve the exit stack until the pipeline run.
+            # We need to use an exit stack so that if we have an exception during initialization,
+            # things that were already initialized are still cleaned up.
+            # We need to separate the source/extractor from the rest because stateful
+            # ingestion requires the source to be closed before the state can be updated.
+            self.inner_exit_stack = inner_exit_stack.pop_all()
+            self.exit_stack = exit_stack.pop_all()
+
+    @property
+    def source_type(self) -> str:
+        return self.config.source.type
+
+    def _configure_transforms(self) -> None:
+        self.transformers = []
+        if self.config.transformers is not None:
+            for transformer in self.config.transformers:
+                transformer_type = transformer.type
+                transformer_class = transform_registry.get(transformer_type)
+                transformer_config = transformer.model_dump().get("config", {})
+                self.transformers.append(
+                    transformer_class.create(transformer_config, self.ctx)
+                )
+                logger.debug(
+                    f"Transformer type:{transformer_type},{transformer_class} configured"
+                )
+
+    def _configure_reporting(self, report_to: Optional[str]) -> None:
+        if self.dry_run:
+            # In dry run mode, we don't want to report anything.
+            return
+
+        if not report_to:
+            # Reporting is disabled.
+            pass
+        elif report_to == "datahub":
+            # we add the default datahub reporter unless a datahub reporter is already configured
+            if not self.config.reporting or "datahub" not in [
+                reporter.type for reporter in self.config.reporting
+            ]:
+                self.config.reporting.append(
+                    ReporterConfig.model_validate({"type": "datahub"})
+                )
+        elif report_to:
+            # we assume this is a file name, and add the file reporter
+            self.config.reporting.append(
+                ReporterConfig.model_validate(
+                    {"type": "file", "config": {"filename": report_to}}
+                )
+            )
+
+        for reporter in self.config.reporting:
+            reporter_type = reporter.type
+            reporter_class = reporting_provider_registry.get(reporter_type)
+            reporter_config_dict = reporter.model_dump().get("config", {})
+            try:
+                self.reporters.append(
+                    reporter_class.create(
+                        config_dict=reporter_config_dict,
+                        ctx=self.ctx,
+                        sink=self.sink,
+                    )
+                )
+                logger.debug(
+                    f"Reporter type:{reporter_type},{reporter_class} configured."
+                )
+            except Exception as e:
+                if reporter.required:
+                    raise
+                elif isinstance(e, IgnorableError):
+                    logger.debug(f"Reporter type {reporter_type} is disabled: {e}")
+                else:
+                    logger.warning(
+                        f"Failed to configure reporter: {reporter_type}", exc_info=e
+                    )
+
+    def _notify_reporters_on_ingestion_start(self) -> None:
+        for reporter in self.reporters:
+            try:
+                reporter.on_start(ctx=self.ctx)
+            except Exception:
+                logger.warning("Reporting failed on start", exc_info=True)
+
+    def _warn_old_cli_version(self) -> None:
+        """
+        Check if the server default CLI version is ahead of the CLI version being used.
+        If so, add a warning to the report.
+        """
+
+        try:
+            version_stats = retrieve_version_stats(timeout=2.0, graph=self.graph)
+        except RuntimeError as e:
+            # Handle case where there's no event loop available (e.g., in ThreadPoolExecutor)
+            if "no current event loop" in str(e):
+                logger.debug("Skipping version check - no event loop available")
+                return
+            raise
+
+        if not version_stats or not self.graph:
+            return
+
+        if is_server_default_cli_ahead(version_stats):
+            server_default_version = (
+                version_stats.server.current_server_default_cli_version.version
+                if version_stats.server.current_server_default_cli_version
+                else None
+            )
+            current_version = version_stats.client.current.version
+
+            logger.debug(
+                f"""
+                client_version: {current_version}
+                server_default_version: {server_default_version}
+                server_default_cli_ahead: True
+            """
+            )
+
+            self.source.get_report().warning(
+                title="Server default CLI version is ahead of CLI version",
+                message="Please upgrade the CLI version being used",
+                context=f"Server Default CLI version: {server_default_version}, Used CLI version: {current_version}",
+            )
+
+    def _notify_reporters_on_ingestion_completion(self) -> None:
+        for reporter in self.reporters:
+            try:
+                reporter.on_completion(
+                    status=(
+                        "CANCELLED"
+                        if self.final_status == PipelineStatus.CANCELLED
+                        else (
+                            "FAILURE"
+                            if self.has_failures()
+                            else (
+                                "SUCCESS"
+                                if self.final_status == PipelineStatus.COMPLETED
+                                else "UNKNOWN"
+                            )
+                        )
+                    ),
+                    report=self._get_structured_report(),
+                    ctx=self.ctx,
+                )
+            except Exception:
+                logger.warning("Reporting failed on completion", exc_info=True)
+
+    @classmethod
+    def create(
+        cls,
+        config_dict: dict,
+        dry_run: bool = False,
+        preview_mode: bool = False,
+        preview_workunits: int = 10,
+        report_to: Optional[str] = "datahub",
+        no_progress: bool = False,
+        raw_config: Optional[dict] = None,
+    ) -> "Pipeline":
+        config = PipelineConfig.from_dict(config_dict, raw_config)
+        return cls(
+            config,
+            dry_run=dry_run,
+            preview_mode=preview_mode,
+            preview_workunits=preview_workunits,
+            report_to=report_to,
+            no_progress=no_progress,
+        )
+
+    def _time_to_print(self) -> bool:
+        self.num_intermediate_workunits += 1
+        current_time = int(time.time())
+        # TODO: Replace with ProgressTimer.
+        if current_time - self.last_time_printed > _REPORT_PRINT_INTERVAL_SECONDS:
+            # we print
+            self.num_intermediate_workunits = 0
+            self.last_time_printed = current_time
+            return True
+        return False
+
+    def _set_platform(self) -> None:
+        platform = self.source.infer_platform()
+        if platform:
+            self.source.get_report().set_platform(platform)
+        else:
+            self.source.get_report().warning(
+                message="Platform not found",
+                title="Platform not found",
+                context="Platform not found",
+            )
+
+    def run(self) -> None:
+        self._set_platform()
+        self._warn_old_cli_version()
+        with self.exit_stack, self.inner_exit_stack:
+            if self.config.flags.generate_memory_profiles:
+                import memray
+
+                self.exit_stack.enter_context(
+                    memray.Tracker(
+                        f"{self.config.flags.generate_memory_profiles}/{self.config.run_id}.bin"
+                    )
+                )
+
+            self.exit_stack.enter_context(
+                change_default_attribution(KnownAttribution.INGESTION)
+            )
+
+            self.final_status = PipelineStatus.UNKNOWN
+            self._notify_reporters_on_ingestion_start()
+            callback = None
+            try:
+                callback = (
+                    LoggingCallback()
+                    if not self.config.failure_log.enabled
+                    else self.exit_stack.enter_context(
+                        DeadLetterQueueCallback(
+                            self.ctx, self.config.failure_log.log_config
+                        )
+                    )
+                )
+                for wu in itertools.islice(
+                    self.source.get_workunits(),
+                    self.preview_workunits if self.preview_mode else None,
+                ):
+                    try:
+                        if self._time_to_print() and not self.no_progress:
+                            self.pretty_print_summary(currently_running=True)
+                    except Exception as e:
+                        logger.warning(f"Failed to print summary {e}")
+
+                    if not self.dry_run:
+                        self.sink.handle_work_unit_start(wu)
+                    try:
+                        # Most of this code is meant to be fully stream-based instead of generating all records into memory.
+                        # However, the extractor in particular will never generate a particularly large list. We want the
+                        # exception reporting to be associated with the source, and not the transformer. As such, we
+                        # need to materialize the generator returned by get_records().
+                        record_envelopes = list(self.extractor.get_records(wu))
+                    except Exception as e:
+                        self.source.get_report().failure(
+                            "Source produced bad metadata", context=wu.id, exc=e
+                        )
+                        continue
+                    try:
+                        for record_envelope in self.transform(record_envelopes):
+                            if not self.dry_run:
+                                try:
+                                    self.sink.write_record_async(
+                                        record_envelope, callback
+                                    )
+                                except Exception as e:
+                                    # In case the sink's error handling is bad, we still want to report the error.
+                                    self.sink.report.report_failure(
+                                        f"Failed to write record: {e}"
+                                    )
+
+                    except (RuntimeError, SystemExit):
+                        raise
+                    except Exception:
+                        logger.error(
+                            "Failed to process some records. Continuing.",
+                            exc_info=True,
+                        )
+                        # TODO: Transformer errors should be reported more loudly / as part of the pipeline report.
+
+                    if not self.dry_run:
+                        self.sink.handle_work_unit_end(wu)
+
+                # no more data is coming, we need to let the transformers produce any additional records if they are holding on to state
+                for record_envelope in self.transform(
+                    [
+                        RecordEnvelope(
+                            record=EndOfStream(),
+                            metadata={"workunit_id": "end-of-stream"},
+                        )
+                    ]
+                ):
+                    if not self.dry_run and not isinstance(
+                        record_envelope.record, EndOfStream
+                    ):
+                        # TODO: propagate EndOfStream and other control events to sinks, to allow them to flush etc.
+                        self.sink.write_record_async(record_envelope, callback)
+
+                # Stateful ingestion generates the updated state objects as part of the
+                # source's close method. Because of that, we need to close the source
+                # before we call process_commits.
+                self.inner_exit_stack.close()
+
+                # Flush the sink before committing state so async sinks (e.g.
+                # datahub-kafka) confirm delivery and record any failures on
+                # their report first -- process_commits() gates on
+                # sink.get_report().failures, and the sink's own close() runs
+                # later (outer exit_stack). Without this, a commit could persist
+                # checkpoints for writes that never landed.
+                if not self.dry_run:
+                    self.sink.flush()
+
+                self.process_commits()
+                self.final_status = PipelineStatus.COMPLETED
+
+            except (SystemExit, KeyboardInterrupt):
+                self.final_status = PipelineStatus.CANCELLED
+                logger.error("Caught error", exc_info=True)
+                raise
+            except Exception as exc:
+                self.final_status = PipelineStatus.ERROR
+                self._handle_uncaught_pipeline_exception(exc)
+            finally:
+                clear_global_warnings()
+
+    def transform(self, records: Iterable[RecordEnvelope]) -> Iterable[RecordEnvelope]:
+        """
+        Transforms the given sequence of records by passing the records through the transformers
+        :param records: the records to transform
+        :return: the transformed records
+        """
+        for transformer in self.transformers:
+            records = transformer.transform(records)
+
+        return records
+
+    def process_commits(self) -> None:
+        """
+        Evaluates the commit_policy for each committable in the context and triggers the commit operation
+        on the committable if its required commit policies are satisfied.
+        """
+        has_errors: bool = bool(
+            self.source.get_report().failures or self.sink.get_report().failures
+        )
+        has_warnings: bool = bool(
+            self.source.get_report().warnings or self.sink.get_report().warnings
+        )
+
+        for name, committable in self.ctx.get_committables():
+            commit_policy: CommitPolicy = committable.commit_policy
+
+            logger.info(
+                f"Processing commit request for {name}. Commit policy = {commit_policy},"
+                f" has_errors={has_errors}, has_warnings={has_warnings}"
+            )
+
+            if (
+                commit_policy == CommitPolicy.ON_NO_ERRORS_AND_NO_WARNINGS
+                and (has_errors or has_warnings)
+            ) or (commit_policy == CommitPolicy.ON_NO_ERRORS and has_errors):
+                logger.warning(
+                    f"Skipping commit request for {name} since policy requirements are not met."
+                )
+                continue
+
+            try:
+                committable.commit()
+            except Exception as e:
+                logger.error(f"Failed to commit changes for {name}.", e)
+                raise e
+            else:
+                logger.info(f"Successfully committed changes for {name}.")
+
+    def raise_from_status(self, raise_warnings: bool = False) -> None:
+        if self.source.get_report().failures:
+            raise PipelineExecutionError(
+                "Source reported errors", self.source.get_report().failures
+            )
+        if self.sink.get_report().failures:
+            raise PipelineExecutionError(
+                "Sink reported errors", self.sink.get_report().failures
+            )
+        if raise_warnings:
+            if self.source.get_report().warnings:
+                raise PipelineExecutionError(
+                    "Source reported warnings", self.source.get_report().warnings
+                )
+            if self.sink.get_report().warnings:
+                raise PipelineExecutionError(
+                    "Sink reported warnings", self.sink.get_report().warnings
+                )
+
+    def log_ingestion_stats(self) -> None:
+        source_failures = self._approx_all_vals(self.source.get_report().failures)
+        source_warnings = self._approx_all_vals(self.source.get_report().warnings)
+        sink_failures = len(self.sink.get_report().failures)
+        sink_warnings = len(self.sink.get_report().warnings)
+        global_warnings = len(get_global_warnings())
+        source_aspects = self.source.get_report().get_aspects_dict()
+        source_aspects_by_subtype = (
+            self.source.get_report().get_aspects_by_subtypes_dict()
+        )
+
+        telemetry_instance.ping(
+            "ingest_stats",
+            {
+                "source_type": self.source_type,
+                "source_aspects": source_aspects,
+                "source_aspects_by_subtype": source_aspects_by_subtype,
+                "sink_type": self.sink_type,
+                "transformer_types": [
+                    transformer.type for transformer in self.config.transformers or []
+                ],
+                "extractor_type": self.config.source.extractor,
+                "records_written": stats.discretize(
+                    self.sink.get_report().total_records_written
+                ),
+                "source_failures": stats.discretize(source_failures),
+                "source_warnings": stats.discretize(source_warnings),
+                "sink_failures": stats.discretize(sink_failures),
+                "sink_warnings": stats.discretize(sink_warnings),
+                "global_warnings": global_warnings,
+                "failures": stats.discretize(source_failures + sink_failures),
+                "warnings": stats.discretize(
+                    source_warnings + sink_warnings + global_warnings
+                ),
+                "has_pipeline_name": bool(self.config.pipeline_name),
+            },
+        )
+
+    def _approx_all_vals(self, d: LossyList[Any]) -> int:
+        return d.total_elements
+
+    def _get_text_color(self, running: bool, failures: bool, warnings: bool) -> str:
+        if running:
+            return "cyan"
+        else:
+            if failures:
+                return "bright_red"
+            elif warnings:
+                return "bright_yellow"
+            else:
+                return "bright_green"
+
+    def has_failures(self) -> bool:
+        return bool(
+            self.source.get_report().failures or self.sink.get_report().failures
+        )
+
+    def pretty_print_summary(
+        self, warnings_as_failure: bool = False, currently_running: bool = False
+    ) -> int:
+        workunits_produced = self.sink.get_report().total_records_written
+
+        if (
+            not workunits_produced
+            and not currently_running
+            and self.final_status == PipelineStatus.ERROR
+        ):
+            # If the pipeline threw an uncaught exception before doing anything, printing
+            # out the report would just be annoying.
+            pass
+        else:
+            if currently_running:
+                sample_caps = {
+                    "failures": self.config.flags.progress_report_max_failures,
+                    "warnings": self.config.flags.progress_report_max_warnings,
+                    "infos": self.config.flags.progress_report_max_infos,
+                }
+            else:
+                sample_caps = {
+                    "failures": self.config.flags.report_failure_sample_size,
+                    "warnings": self.config.flags.report_warning_sample_size,
+                    "infos": self.config.flags.report_info_sample_size,
+                }
+            click.echo()
+            click.secho("Cli report:", bold=True)
+            click.echo(self.cli_report.as_string(sample_caps))
+            click.secho(f"Source ({self.source_type}) report:", bold=True)
+            click.echo(self.source.get_report().as_string(sample_caps))
+            click.secho(f"Sink ({self.sink_type}) report:", bold=True)
+            click.echo(self.sink.get_report().as_string(sample_caps))
+            global_warnings = get_global_warnings()
+            if len(global_warnings) > 0:
+                click.secho("Global Warnings:", bold=True)
+                click.echo(global_warnings)
+            click.echo()
+
+        duration_message = f"in {humanfriendly.format_timespan(self.source.get_report().running_time)}."
+        if currently_running:
+            message_template = f"⏳ Pipeline running {{status}} so far; produced {workunits_produced} events {duration_message}"
+        else:
+            message_template = f"Pipeline finished {{status}}; produced {workunits_produced} events {duration_message}"
+
+        if self.source.get_report().failures or self.sink.get_report().failures:
+            num_failures_source = self._approx_all_vals(
+                self.source.get_report().failures
+            )
+            num_failures_sink = len(self.sink.get_report().failures)
+            click.secho(
+                message_template.format(
+                    status=f"with at least {num_failures_source + num_failures_sink} failures"
+                ),
+                fg=self._get_text_color(
+                    running=currently_running, failures=True, warnings=False
+                ),
+                bold=True,
+            )
+            return 1
+        elif (
+            self.source.get_report().warnings
+            or self.sink.get_report().warnings
+            or len(global_warnings) > 0
+        ):
+            num_warn_source = self._approx_all_vals(self.source.get_report().warnings)
+            num_warn_sink = len(self.sink.get_report().warnings)
+            num_warn_global = len(global_warnings)
+            click.secho(
+                message_template.format(
+                    status=f"with at least {num_warn_source + num_warn_sink + num_warn_global} warnings"
+                ),
+                fg=self._get_text_color(
+                    running=currently_running, failures=False, warnings=True
+                ),
+                bold=True,
+            )
+            return 1 if warnings_as_failure else 0
+        else:
+            click.secho(
+                message_template.format(status="successfully"),
+                fg=self._get_text_color(
+                    running=currently_running, failures=False, warnings=False
+                ),
+                bold=True,
+            )
+            return 0
+
+    def _handle_uncaught_pipeline_exception(self, exc: Exception) -> None:
+        logger.exception(
+            f"Ingestion pipeline threw an uncaught exception: {exc}", stacklevel=2
+        )
+        self.source.get_report().failure(
+            title="Pipeline Error",
+            message="Ingestion pipeline raised an unexpected exception!",
+            exc=exc,
+            log=False,
+        )
+
+    def _get_structured_report(self) -> Dict[str, Any]:
+        return {
+            "cli": self.cli_report.as_obj(),
+            "source": {
+                "type": self.source_type,
+                "report": self.source.get_report().as_obj(),
+            },
+            "sink": {
+                "type": self.sink_type,
+                "report": self.sink.get_report().as_obj(),
+            },
+        }

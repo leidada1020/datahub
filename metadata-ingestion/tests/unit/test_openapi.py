@@ -1,0 +1,2105 @@
+import unittest
+from typing import Any, Dict
+from unittest.mock import MagicMock, patch
+
+import requests
+import yaml
+from pydantic import SecretStr, ValidationError
+
+from datahub.ingestion.api.common import PipelineContext
+from datahub.ingestion.extractor.json_schema_util import JsonSchemaTranslator
+from datahub.ingestion.source.openapi import (
+    APISource,
+    OpenApiConfig,
+    OpenApiGetTokenConfig,
+)
+from datahub.ingestion.source.openapi_parser import (
+    flatten2list,
+    get_endpoints,
+    get_swag_json,
+    get_tok,
+    get_url_basepath,
+    guessing_url_name,
+    maybe_theres_simple_id,
+    resolve_schema_references,
+    try_guessing,
+)
+
+
+class TestGetUrlBasepath:
+    def test_base_path_v2(self):
+        assert get_url_basepath({"swagger": "2.0", "basePath": "/api/v2"}) == "/api/v2"
+
+    def test_servers_v3(self):
+        sw_dict = {"openapi": "3.0.0", "servers": [{"url": "/api/v3"}]}
+        assert get_url_basepath(sw_dict) == "/api/v3"
+
+    def test_empty_servers_list(self):
+        assert get_url_basepath({"openapi": "3.0.0", "servers": []}) == ""
+
+    def test_server_entry_without_url(self):
+        sw_dict = {"openapi": "3.0.0", "servers": [{"description": "prod"}]}
+        assert get_url_basepath(sw_dict) == ""
+
+    def test_no_base_path_or_servers(self):
+        assert get_url_basepath({"openapi": "3.0.0"}) == ""
+
+
+class TestGetEndpoints(unittest.TestCase):
+    # https://github.com/OAI/OpenAPI-Specification/blob/main/examples/v2.0/yaml/api-with-examples.yaml
+    openapi20 = """
+swagger: "2.0"
+info:
+  title: Simple API overview
+  version: v2
+paths:
+  /:
+    get:
+      operationId: listVersionsv2
+      summary: List API versions
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: |-
+            200 300 response
+          examples:
+            application/json: |-
+              {
+                  "versions": [
+                      {
+                          "status": "CURRENT",
+                          "updated": "2011-01-21T11:33:21Z",
+                          "id": "v2.0",
+                          "links": [
+                              {
+                                  "href": "http://127.0.0.1:8774/v2/",
+                                  "rel": "self"
+                              }
+                          ]
+                      },
+                      {
+                          "status": "EXPERIMENTAL",
+                          "updated": "2013-07-23T11:33:21Z",
+                          "id": "v3.0",
+                          "links": [
+                              {
+                                  "href": "http://127.0.0.1:8774/v3/",
+                                  "rel": "self"
+                              }
+                          ]
+                      }
+                  ]
+              }
+        "300":
+          description: |-
+            200 300 response
+          examples:
+            application/json: |-
+              {
+                  "versions": [
+                      {
+                          "status": "CURRENT",
+                          "updated": "2011-01-21T11:33:21Z",
+                          "id": "v2.0",
+                          "links": [
+                              {
+                                  "href": "http://127.0.0.1:8774/v2/",
+                                  "rel": "self"
+                              }
+                          ]
+                      },
+                      {
+                          "status": "EXPERIMENTAL",
+                          "updated": "2013-07-23T11:33:21Z",
+                          "id": "v3.0",
+                          "links": [
+                              {
+                                  "href": "http://127.0.0.1:8774/v3/",
+                                  "rel": "self"
+                              }
+                          ]
+                      }
+                  ]
+              }
+  /v2:
+    get:
+      operationId: getVersionDetailsv2
+      summary: Show API version details
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: |-
+            200 203 response
+          examples:
+            application/json: |-
+              {
+                  "version": {
+                      "status": "CURRENT",
+                      "updated": "2011-01-21T11:33:21Z",
+                      "media-types": [
+                          {
+                              "base": "application/xml",
+                              "type": "application/vnd.openstack.compute+xml;version=2"
+                          },
+                          {
+                              "base": "application/json",
+                              "type": "application/vnd.openstack.compute+json;version=2"
+                          }
+                      ],
+                      "id": "v2.0",
+                      "links": [
+                          {
+                              "href": "http://127.0.0.1:8774/v2/",
+                              "rel": "self"
+                          },
+                          {
+                              "href": "http://docs.openstack.org/api/openstack-compute/2/os-compute-devguide-2.pdf",
+                              "type": "application/pdf",
+                              "rel": "describedby"
+                          },
+                          {
+                              "href": "http://docs.openstack.org/api/openstack-compute/2/wadl/os-compute-2.wadl",
+                              "type": "application/vnd.sun.wadl+xml",
+                              "rel": "describedby"
+                          },
+                          {
+                            "href": "http://docs.openstack.org/api/openstack-compute/2/wadl/os-compute-2.wadl",
+                            "type": "application/vnd.sun.wadl+xml",
+                            "rel": "describedby"
+                          }
+                      ]
+                  }
+              }
+        "203":
+          description: |-
+            200 203 response
+          examples:
+            application/json: |-
+              {
+                  "version": {
+                      "status": "CURRENT",
+                      "updated": "2011-01-21T11:33:21Z",
+                      "media-types": [
+                          {
+                              "base": "application/xml",
+                              "type": "application/vnd.openstack.compute+xml;version=2"
+                          },
+                          {
+                              "base": "application/json",
+                              "type": "application/vnd.openstack.compute+json;version=2"
+                          }
+                      ],
+                      "id": "v2.0",
+                      "links": [
+                          {
+                              "href": "http://23.253.228.211:8774/v2/",
+                              "rel": "self"
+                          },
+                          {
+                              "href": "http://docs.openstack.org/api/openstack-compute/2/os-compute-devguide-2.pdf",
+                              "type": "application/pdf",
+                              "rel": "describedby"
+                          },
+                          {
+                              "href": "http://docs.openstack.org/api/openstack-compute/2/wadl/os-compute-2.wadl",
+                              "type": "application/vnd.sun.wadl+xml",
+                              "rel": "describedby"
+                          }
+                      ]
+                  }
+              }
+    post:
+      operationId: updateVersionDetailsv2
+      summary: Update API version details
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: |-
+            200 203 response
+          examples:
+            application/json: |-
+              {
+                  "version": {
+                      "status": "CURRENT",
+                      "updated": "2011-01-21T11:33:21Z",
+                      "media-types": [
+                          {
+                              "base": "application/xml",
+                              "type": "application/vnd.openstack.compute+xml;version=2"
+                          },
+                          {
+                              "base": "application/json",
+                              "type": "application/vnd.openstack.compute+json;version=2"
+                          }
+                      ],
+                      "id": "v2.0",
+                      "links": [
+                          {
+                              "href": "http://127.0.0.1:8774/v2/",
+                              "rel": "self"
+                          },
+                          {
+                              "href": "http://docs.openstack.org/api/openstack-compute/2/os-compute-devguide-2.pdf",
+                              "type": "application/pdf",
+                              "rel": "describedby"
+                          },
+                          {
+                              "href": "http://docs.openstack.org/api/openstack-compute/2/wadl/os-compute-2.wadl",
+                              "type": "application/vnd.sun.wadl+xml",
+                              "rel": "describedby"
+                          },
+                          {
+                            "href": "http://docs.openstack.org/api/openstack-compute/2/wadl/os-compute-2.wadl",
+                            "type": "application/vnd.sun.wadl+xml",
+                            "rel": "describedby"
+                          }
+                      ]
+                  }
+              }
+  /v2/updateNoExample:
+    post:
+      operationId: updateVersionDetailsNoExample
+      summary: Show API version details no example output
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: |-
+            200 203 response
+  /v2/update:
+    post:
+      operationId: updateVersionDetailsv2
+      summary: Show API version details
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: |-
+            200 203 response
+          examples:
+            application/json: |-
+              {
+                  "version": {
+                      "status": "CURRENT",
+                      "updated": "2011-01-21T11:33:21Z",
+                      "media-types": [
+                          {
+                              "base": "application/xml",
+                              "type": "application/vnd.openstack.compute+xml;version=2"
+                          },
+                          {
+                              "base": "application/json",
+                              "type": "application/vnd.openstack.compute+json;version=2"
+                          }
+                      ],
+                      "id": "v2.0",
+                      "links": [
+                          {
+                              "href": "http://127.0.0.1:8774/v2/",
+                              "rel": "self"
+                          },
+                          {
+                              "href": "http://docs.openstack.org/api/openstack-compute/2/os-compute-devguide-2.pdf",
+                              "type": "application/pdf",
+                              "rel": "describedby"
+                          },
+                          {
+                              "href": "http://docs.openstack.org/api/openstack-compute/2/wadl/os-compute-2.wadl",
+                              "type": "application/vnd.sun.wadl+xml",
+                              "rel": "describedby"
+                          },
+                          {
+                            "href": "http://docs.openstack.org/api/openstack-compute/2/wadl/os-compute-2.wadl",
+                            "type": "application/vnd.sun.wadl+xml",
+                            "rel": "describedby"
+                          }
+                      ]
+                  }
+              }
+consumes:
+- application/json
+    """
+
+    # https://github.com/OAI/OpenAPI-Specification/blob/main/examples/v3.0/api-with-examples.yaml
+    openapi30 = """
+openapi: "3.0.0"
+info:
+  title: Simple API overview
+  version: 2.0.0
+paths:
+  /:
+    get:
+      operationId: listVersionsv2
+      summary: List API versions
+      responses:
+        '200':
+          description: |-
+            200 response
+          content:
+            application/json:
+              examples:
+                foo:
+                  value:
+                    {
+                      "versions": [
+                        {
+                            "status": "CURRENT",
+                            "updated": "2011-01-21T11:33:21Z",
+                            "id": "v2.0",
+                            "links": [
+                                {
+                                    "href": "http://127.0.0.1:8774/v2/",
+                                    "rel": "self"
+                                }
+                            ]
+                        },
+                        {
+                            "status": "EXPERIMENTAL",
+                            "updated": "2013-07-23T11:33:21Z",
+                            "id": "v3.0",
+                            "links": [
+                                {
+                                    "href": "http://127.0.0.1:8774/v3/",
+                                    "rel": "self"
+                                }
+                            ]
+                        }
+                      ]
+                    }
+        '300':
+          description: |-
+            300 response
+          content:
+            application/json:
+              examples:
+                foo:
+                  value: |
+                   {
+                    "versions": [
+                          {
+                            "status": "CURRENT",
+                            "updated": "2011-01-21T11:33:21Z",
+                            "id": "v2.0",
+                            "links": [
+                                {
+                                    "href": "http://127.0.0.1:8774/v2/",
+                                    "rel": "self"
+                                }
+                            ]
+                        },
+                        {
+                            "status": "EXPERIMENTAL",
+                            "updated": "2013-07-23T11:33:21Z",
+                            "id": "v3.0",
+                            "links": [
+                                {
+                                    "href": "http://127.0.0.1:8774/v3/",
+                                    "rel": "self"
+                                }
+                            ]
+                        }
+                    ]
+                   }
+  /redirect:
+    get:
+      operationId: redirectSomewhere
+      summary: Redirect to a different endpoint
+      responses:
+        '302':
+          description: 302 response
+  /v2:
+    get:
+      operationId: getVersionDetailsv2
+      summary: Show API version details
+      responses:
+        '200':
+          description: |-
+            200 response
+          content:
+            application/json:
+              examples:
+                foo:
+                  value:
+                    {
+                      "version": {
+                        "status": "CURRENT",
+                        "updated": "2011-01-21T11:33:21Z",
+                        "media-types": [
+                          {
+                              "base": "application/xml",
+                              "type": "application/vnd.openstack.compute+xml;version=2"
+                          },
+                          {
+                              "base": "application/json",
+                              "type": "application/vnd.openstack.compute+json;version=2"
+                          }
+                        ],
+                        "id": "v2.0",
+                        "links": [
+                          {
+                              "href": "http://127.0.0.1:8774/v2/",
+                              "rel": "self"
+                          },
+                          {
+                              "href": "http://docs.openstack.org/api/openstack-compute/2/os-compute-devguide-2.pdf",
+                              "type": "application/pdf",
+                              "rel": "describedby"
+                          },
+                          {
+                              "href": "http://docs.openstack.org/api/openstack-compute/2/wadl/os-compute-2.wadl",
+                              "type": "application/vnd.sun.wadl+xml",
+                              "rel": "describedby"
+                          },
+                          {
+                            "href": "http://docs.openstack.org/api/openstack-compute/2/wadl/os-compute-2.wadl",
+                            "type": "application/vnd.sun.wadl+xml",
+                            "rel": "describedby"
+                          }
+                        ]
+                      }
+                    }
+        '203':
+          description: |-
+            203 response
+          content:
+            application/json:
+              examples:
+                foo:
+                  value:
+                    {
+                      "version": {
+                        "status": "CURRENT",
+                        "updated": "2011-01-21T11:33:21Z",
+                        "media-types": [
+                          {
+                              "base": "application/xml",
+                              "type": "application/vnd.openstack.compute+xml;version=2"
+                          },
+                          {
+                              "base": "application/json",
+                              "type": "application/vnd.openstack.compute+json;version=2"
+                          }
+                        ],
+                        "id": "v2.0",
+                        "links": [
+                          {
+                              "href": "http://23.253.228.211:8774/v2/",
+                              "rel": "self"
+                          },
+                          {
+                              "href": "http://docs.openstack.org/api/openstack-compute/2/os-compute-devguide-2.pdf",
+                              "type": "application/pdf",
+                              "rel": "describedby"
+                          },
+                          {
+                              "href": "http://docs.openstack.org/api/openstack-compute/2/wadl/os-compute-2.wadl",
+                              "type": "application/vnd.sun.wadl+xml",
+                              "rel": "describedby"
+                          }
+                        ]
+                      }
+                    }
+  /v2/updateNoExample:
+    post:
+      operationId: updateVersionDetailsNoExample
+      summary: Update API version details
+      responses:
+        '200':
+          description: |-
+            200 response
+  /v2/update:
+    post:
+      operationId: updateVersionDetailsv2
+      summary: Update API version details
+      responses:
+        '200':
+          description: |-
+            200 response
+          content:
+            application/json:
+              examples:
+                foo:
+                  value:
+                    {
+                      "version": {
+                        "status": "CURRENT",
+                        "updated": "2011-01-21T11:33:21Z",
+                        "media-types": [
+                          {
+                              "base": "application/xml",
+                              "type": "application/vnd.openstack.compute+xml;version=2"
+                          },
+                          {
+                              "base": "application/json",
+                              "type": "application/vnd.openstack.compute+json;version=2"
+                          }
+                        ],
+                        "id": "v2.0",
+                        "links": [
+                          {
+                              "href": "http://127.0.0.1:8774/v2/",
+                              "rel": "self"
+                          },
+                          {
+                              "href": "http://docs.openstack.org/api/openstack-compute/2/os-compute-devguide-2.pdf",
+                              "type": "application/pdf",
+                              "rel": "describedby"
+                          },
+                          {
+                              "href": "http://docs.openstack.org/api/openstack-compute/2/wadl/os-compute-2.wadl",
+                              "type": "application/vnd.sun.wadl+xml",
+                              "rel": "describedby"
+                          },
+                          {
+                            "href": "http://docs.openstack.org/api/openstack-compute/2/wadl/os-compute-2.wadl",
+                            "type": "application/vnd.sun.wadl+xml",
+                            "rel": "describedby"
+                          }
+                        ]
+                      }
+                    }
+"""
+
+    def test_get_endpoints_openapi30(self) -> None:
+        """extracting 'get' type endpoints from swagger 3.0 file"""
+        sw_file_raw = yaml.safe_load(self.openapi30)
+        url_endpoints = get_endpoints(sw_file_raw)
+
+        self.assertEqual(len(url_endpoints), 4)
+        d4k = {"data": "", "tags": "", "description": "", "method": ""}
+        self.assertEqual(url_endpoints["/"].keys(), d4k.keys())
+
+        self.assertIn("data", url_endpoints["/v2/update"])
+        self.assertNotIn("data", url_endpoints["/v2/updateNoExample"])
+
+    def test_get_endpoints_openapi20(self) -> None:
+        """extracting 'get' type endpoints from swagger 2.0 file"""
+        sw_file_raw = yaml.safe_load(self.openapi20)
+        url_endpoints = get_endpoints(sw_file_raw)
+
+        self.assertEqual(len(url_endpoints), 4)
+        d4k = {"data": "", "tags": "", "description": "", "method": ""}
+        self.assertEqual(url_endpoints["/"].keys(), d4k.keys())
+
+        self.assertIn("data", url_endpoints["/v2/update"])
+        self.assertNotIn("data", url_endpoints["/v2/updateNoExample"])
+
+
+class TestExplodeDict(unittest.TestCase):
+    def test_d1(self):
+        #  exploding keys of a dict...
+        d = {"a": {"b": 3}, "c": 2, "asdasd": {"ytkhj": 2, "uylkj": 3}}
+
+        exp_l = [
+            "a",  # parent field
+            "a.b",
+            "c",
+            "asdasd",  # parent field
+            "asdasd.ytkhj",
+            "asdasd.uylkj",
+        ]
+
+        cal_l = flatten2list(d)
+        self.assertEqual(
+            sorted(exp_l), sorted(cal_l)
+        )  # Sort both lists since order doesn't matter
+
+
+class TestGuessing(unittest.TestCase):
+    extr_data = {"advancedcomputersearches": {"id": 202, "name": "_unmanaged"}}
+
+    def test_name_id(self):
+        #  guessing in presence of name fields
+        url2complete = "/advancedcomputersearches/name/{name}/id/"
+        guessed_url = guessing_url_name(url2complete, self.extr_data)
+        should_be = "/advancedcomputersearches/name/_unmanaged/id/"
+        self.assertEqual(guessed_url, should_be)
+
+    def test_name_id2(self):
+        #  guessing in presence of name fields, other
+        url2complete = "/advancedcomputersearches/{name}/id/"
+        guessed_url = guessing_url_name(url2complete, self.extr_data)
+        should_be = "/advancedcomputersearches/_unmanaged/id/"
+        self.assertEqual(guessed_url, should_be)
+
+    def test_only_id(self):
+        #  guessing in presence of name and id fields
+        url2complete = "/advancedcomputersearches/name/{name}/id/{id}"
+        guessed_url = guessing_url_name(url2complete, self.extr_data)
+        should_be = "/advancedcomputersearches/name/_unmanaged/id/202"
+        self.assertEqual(guessed_url, should_be)
+
+    def test_no_k_f(self):
+        #  guessing with no known fields
+        url2complete = "/advancedcomputersearches/name//id/"
+        guessed_url = guessing_url_name(url2complete, self.extr_data)
+        self.assertEqual(guessed_url, url2complete)
+
+    def test_one_id(self):
+        # guessing url with simple id
+        url2complete = "/advancedcomputersearches/name/{id}/"
+        guessed_url = maybe_theres_simple_id(url2complete)
+        should_be = "/advancedcomputersearches/name/1/"
+        self.assertEqual(guessed_url, should_be)
+
+    def test_mul_ids(self):
+        # guessing url with multiple simple ids
+        url2complete = "/advancedcomputersearches/name/{id}/asd/{id}/jhg"
+        guessed_url = maybe_theres_simple_id(url2complete)
+        should_be = "/advancedcomputersearches/name/1/asd/1/jhg"
+        self.assertEqual(guessed_url, should_be)
+
+    def test_one_cid(self):
+        # guessing url with complex id
+        url2complete = "/advancedcomputersearches/name/{asdid}/"
+        guessed_url = maybe_theres_simple_id(url2complete)
+        should_be = "/advancedcomputersearches/name/1/"
+        self.assertEqual(guessed_url, should_be)
+
+    def test_mul_cids(self):
+        # guessing url with multiple complex ids
+        url2complete = "/advancedcomputersearches/name/{asdid}/asd/{asdid}/jhg"
+        guessed_url = maybe_theres_simple_id(url2complete)
+        should_be = "/advancedcomputersearches/name/1/asd/1/jhg"
+        self.assertEqual(guessed_url, should_be)
+
+    extr_data2 = {"advancedcomputersearches": {"id": 202, "name": "_unmanaged"}}
+
+    def test_no_good_guesses(self):
+        url2complete = "/advancedcomputersearches/name/{nasde}/asd/{asd}/jhg"
+        guessed_url = try_guessing(url2complete, self.extr_data2)
+        self.assertEqual(guessed_url, url2complete)
+
+
+class TestAPISourceSchemaExtraction(unittest.TestCase):
+    """Test schema extraction methods in APISource class."""
+
+    def setUp(self):
+        """Set up test fixtures."""
+        self.ctx = PipelineContext(run_id="test")
+        self.config = OpenApiConfig(
+            name="test_api",
+            url="https://api.example.com",
+            swagger_file="/openapi.json",
+        )
+        self.source = APISource(self.config, self.ctx, "OpenApi")
+
+    def test_extract_response_schema_from_endpoint_v2(self):
+        """Test extracting schema from Swagger v2 response."""
+        sw_dict = {
+            "swagger": "2.0",
+            "definitions": {
+                "Pet": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer", "format": "int64"},
+                        "name": {"type": "string"},
+                    },
+                }
+            },
+        }
+
+        endpoint_spec = {
+            "responses": {
+                "200": {
+                    "description": "Success",
+                    "schema": {"$ref": "#/definitions/Pet"},
+                }
+            }
+        }
+
+        with patch(
+            "datahub.ingestion.source.openapi.get_schema_from_response"
+        ) as mock_get_schema:
+            expected_schema = {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "format": "int64"},
+                    "name": {"type": "string"},
+                },
+            }
+            mock_get_schema.return_value = expected_schema
+
+            result = self.source.extract_response_schema_from_endpoint(
+                endpoint_spec, sw_dict
+            )
+
+            self.assertIsNotNone(result)
+            mock_get_schema.assert_called_once()
+            self.assertEqual(result, expected_schema)
+
+    def test_extract_response_schema_from_endpoint_v3(self):
+        """Test extracting schema from OpenAPI v3 response."""
+        sw_dict = {
+            "openapi": "3.0.0",
+            "components": {
+                "schemas": {
+                    "Pet": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "integer", "format": "int64"},
+                            "name": {"type": "string"},
+                        },
+                    }
+                }
+            },
+        }
+
+        endpoint_spec = {
+            "responses": {
+                "200": {
+                    "description": "Success",
+                    "content": {
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/Pet"}
+                        }
+                    },
+                }
+            }
+        }
+
+        with patch(
+            "datahub.ingestion.source.openapi.get_schema_from_response"
+        ) as mock_get_schema:
+            expected_schema = {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "format": "int64"},
+                    "name": {"type": "string"},
+                },
+            }
+            mock_get_schema.return_value = expected_schema
+
+            result = self.source.extract_response_schema_from_endpoint(
+                endpoint_spec, sw_dict
+            )
+
+            self.assertIsNotNone(result)
+            mock_get_schema.assert_called_once()
+            self.assertEqual(result, expected_schema)
+
+    def test_extract_response_schema_no_200_response(self):
+        """Test that None is returned when no 200 response exists."""
+        endpoint_spec = {
+            "responses": {
+                "404": {"description": "Not Found"},
+                "500": {"description": "Server Error"},
+            }
+        }
+
+        result = self.source.extract_response_schema_from_endpoint(endpoint_spec, {})
+
+        self.assertIsNone(result)
+
+    def test_extract_response_schema_multiple_content_types(self):
+        """Test that application/json is preferred over other content types."""
+        sw_dict = {"openapi": "3.0.0"}
+
+        endpoint_spec = {
+            "responses": {
+                "200": {
+                    "description": "Success",
+                    "content": {
+                        "application/xml": {
+                            "schema": {"type": "string", "example": "xml"}
+                        },
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {"id": {"type": "integer"}},
+                            }
+                        },
+                        "text/json": {"schema": {"type": "string", "example": "text"}},
+                    },
+                }
+            }
+        }
+
+        with patch(
+            "datahub.ingestion.source.openapi.get_schema_from_response"
+        ) as mock_get_schema:
+            expected_schema = {
+                "type": "object",
+                "properties": {"id": {"type": "integer"}},
+            }
+            mock_get_schema.return_value = expected_schema
+
+            result = self.source.extract_response_schema_from_endpoint(
+                endpoint_spec, sw_dict
+            )
+
+            self.assertIsNotNone(result)
+            # Verify application/json was used (first in priority list)
+            self.assertTrue(mock_get_schema.called)
+            call_args = mock_get_schema.call_args[0]
+            self.assertEqual(
+                call_args[0],
+                {"type": "object", "properties": {"id": {"type": "integer"}}},
+            )
+
+    def test_extract_request_schema_from_endpoint_v3(self):
+        """Test extracting from requestBody.content[application/json].schema."""
+        sw_dict = {
+            "openapi": "3.0.0",
+            "components": {
+                "schemas": {
+                    "NewPet": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "tag": {"type": "string"},
+                        },
+                    }
+                }
+            },
+        }
+
+        endpoint_spec = {
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/NewPet"}
+                    }
+                },
+            }
+        }
+
+        with patch(
+            "datahub.ingestion.source.openapi.get_schema_from_response"
+        ) as mock_get_schema:
+            expected_schema = {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "tag": {"type": "string"},
+                },
+            }
+            mock_get_schema.return_value = expected_schema
+
+            result = self.source.extract_request_schema_from_endpoint(
+                endpoint_spec, sw_dict
+            )
+
+            self.assertIsNotNone(result)
+            mock_get_schema.assert_called_once()
+            self.assertEqual(result, expected_schema)
+
+    def test_extract_request_schema_from_parameters(self):
+        """Test extracting schema from parameters (both v2 and v3)."""
+        endpoint_spec = {
+            "parameters": [
+                {
+                    "name": "id",
+                    "in": "path",
+                    "required": True,
+                    "schema": {"type": "integer", "format": "int64"},
+                },
+                {
+                    "name": "name",
+                    "in": "query",
+                    "required": False,
+                    "schema": {"type": "string"},
+                },
+            ]
+        }
+
+        result = self.source.extract_request_schema_from_endpoint(endpoint_spec, {})
+
+        self.assertIsNotNone(result)
+        assert result is not None  # Type assertion for mypy
+        self.assertEqual(result["type"], "object")
+        self.assertIn("properties", result)
+        self.assertIn("id", result["properties"])
+        self.assertIn("name", result["properties"])
+        self.assertEqual(result["properties"]["id"]["type"], "integer")
+        self.assertEqual(result["properties"]["name"]["type"], "string")
+
+    def test_extract_request_schema_no_request_body(self):
+        """Test that None is returned when no request body exists."""
+        endpoint_spec = {"responses": {"200": {"description": "Success"}}}
+
+        result = self.source.extract_request_schema_from_endpoint(endpoint_spec, {})
+
+        self.assertIsNone(result)
+
+    def test_extract_schema_method_priority(self):
+        """Test that GET is preferred over POST when both have 200 responses."""
+        sw_dict = {
+            "swagger": "2.0",
+            "paths": {
+                "/pets": {
+                    "get": {
+                        "responses": {
+                            "200": {
+                                "description": "GET response",
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"id": {"type": "integer"}},
+                                },
+                            }
+                        }
+                    },
+                    "post": {
+                        "responses": {
+                            "200": {
+                                "description": "POST response",
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"name": {"type": "string"}},
+                                },
+                            }
+                        }
+                    },
+                }
+            },
+        }
+
+        with patch(
+            "datahub.ingestion.source.openapi.get_schema_from_response"
+        ) as mock_get_schema:
+            # Mock to return different schemas for GET vs POST
+            def side_effect(schema, sw_dict, **kwargs):
+                if "id" in str(schema):
+                    return {"type": "object", "properties": {"id": {"type": "integer"}}}
+                return {"type": "object", "properties": {"name": {"type": "string"}}}
+
+            mock_get_schema.side_effect = side_effect
+
+            result = self.source.extract_schema_from_all_methods("/pets", sw_dict)
+
+            # Should return GET schema (higher priority)
+            self.assertIsNotNone(result)
+            assert result is not None  # Type assertion for mypy
+            self.assertIn("id", result.get("properties", {}))
+
+    def test_extract_schema_all_methods_order(self):
+        """Test that methods are processed in correct priority order (GET, POST, PUT, PATCH)."""
+        sw_dict = {
+            "swagger": "2.0",
+            "paths": {
+                "/test": {
+                    "patch": {
+                        "responses": {
+                            "200": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"patch": {"type": "string"}},
+                                }
+                            }
+                        }
+                    },
+                    "put": {
+                        "responses": {
+                            "200": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"put": {"type": "string"}},
+                                }
+                            }
+                        }
+                    },
+                    "post": {
+                        "responses": {
+                            "200": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"post": {"type": "string"}},
+                                }
+                            }
+                        }
+                    },
+                    "get": {
+                        "responses": {
+                            "200": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"get": {"type": "string"}},
+                                }
+                            }
+                        }
+                    },
+                }
+            },
+        }
+
+        with patch(
+            "datahub.ingestion.source.openapi.get_schema_from_response"
+        ) as mock_get_schema:
+
+            def side_effect(schema, sw_dict, **kwargs):
+                return schema  # Return schema as-is
+
+            mock_get_schema.side_effect = side_effect
+
+            result = self.source.extract_schema_from_all_methods("/test", sw_dict)
+
+            # Should return GET schema (first in priority)
+            self.assertIsNotNone(result)
+            assert result is not None  # Type assertion for mypy
+            self.assertIn("get", result.get("properties", {}))
+
+    def test_extract_schema_fallback_to_lower_priority(self):
+        """Test that lower priority methods are used when higher priority methods don't have schemas."""
+        sw_dict = {
+            "swagger": "2.0",
+            "paths": {
+                "/test": {
+                    "get": {"responses": {"404": {"description": "Not found"}}},
+                    "post": {
+                        "responses": {
+                            "200": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"post_field": {"type": "string"}},
+                                }
+                            }
+                        }
+                    },
+                }
+            },
+        }
+
+        with patch(
+            "datahub.ingestion.source.openapi.get_schema_from_response"
+        ) as mock_get_schema:
+
+            def side_effect(schema, sw_dict, **kwargs):
+                return schema
+
+            mock_get_schema.side_effect = side_effect
+
+            result = self.source.extract_schema_from_all_methods("/test", sw_dict)
+
+            # Should return POST schema (GET has no 200 response)
+            self.assertIsNotNone(result)
+            assert result is not None  # Type assertion for mypy
+            self.assertIn("post_field", result.get("properties", {}))
+
+    def test_extract_schema_from_openapi_spec_success(self):
+        """Test successful schema extraction from spec."""
+        sw_dict = {
+            "swagger": "2.0",
+            "paths": {
+                "/pets": {
+                    "get": {
+                        "responses": {
+                            "200": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"id": {"type": "integer"}},
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+        }
+
+        with (
+            patch(
+                "datahub.ingestion.source.openapi.get_schema_from_response"
+            ) as mock_get_schema,
+            patch.object(
+                self.source, "create_schema_metadata_from_schema"
+            ) as mock_create_metadata,
+        ):
+            mock_get_schema.return_value = {
+                "type": "object",
+                "properties": {"id": {"type": "integer"}},
+            }
+            mock_create_metadata.return_value = MagicMock()
+
+            result = self.source._extract_schema_from_openapi_spec(
+                "/pets", "pets", sw_dict
+            )
+
+            self.assertIsNotNone(result)
+            mock_create_metadata.assert_called_once()
+            self.assertEqual(self.source.schema_extraction_stats.from_openapi_spec, 1)
+
+    def test_extract_schema_from_openapi_spec_no_schema(self):
+        """Test that None is returned when no schema found."""
+        sw_dict = {
+            "swagger": "2.0",
+            "paths": {
+                "/pets": {"get": {"responses": {"404": {"description": "Not found"}}}}
+            },
+        }
+
+        result = self.source._extract_schema_from_openapi_spec("/pets", "pets", sw_dict)
+
+        self.assertIsNone(result)
+
+    def test_extract_schema_from_openapi_spec_tracks_stats(self):
+        """Test that statistics are properly tracked."""
+        sw_dict = {
+            "swagger": "2.0",
+            "paths": {
+                "/pets": {
+                    "get": {
+                        "responses": {
+                            "200": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"id": {"type": "integer"}},
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+        }
+
+        initial_count = self.source.schema_extraction_stats.from_openapi_spec
+
+        with (
+            patch(
+                "datahub.ingestion.source.openapi.get_schema_from_response"
+            ) as mock_get_schema,
+            patch.object(
+                self.source, "create_schema_metadata_from_schema"
+            ) as mock_create_metadata,
+        ):
+            mock_get_schema.return_value = {
+                "type": "object",
+                "properties": {"id": {"type": "integer"}},
+            }
+            mock_create_metadata.return_value = MagicMock()
+
+            self.source._extract_schema_from_openapi_spec("/pets", "pets", sw_dict)
+
+            self.assertEqual(
+                self.source.schema_extraction_stats.from_openapi_spec, initial_count + 1
+            )
+
+    def test_extract_response_schema_handles_exceptions(self):
+        """Test that exceptions in response extraction are caught and logged."""
+        endpoint_spec = {
+            "responses": {
+                "200": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/definitions/Pet"
+                            }  # Valid schema that will cause error in processing
+                        }
+                    }
+                }
+            }
+        }
+
+        with (
+            patch(
+                "datahub.ingestion.source.openapi.get_schema_from_response"
+            ) as mock_get_schema,
+            patch("datahub.ingestion.source.openapi.logger") as mock_logger,
+        ):
+            # Make get_schema_from_response raise an exception
+            mock_get_schema.side_effect = TypeError("Cannot process schema")
+
+            result = self.source.extract_response_schema_from_endpoint(
+                endpoint_spec, {}
+            )
+
+            # Should return None and log warning
+            self.assertIsNone(result)
+            mock_logger.warning.assert_called()
+
+    def test_extract_request_schema_handles_exceptions(self):
+        """Test that exceptions in request extraction are caught and logged."""
+        endpoint_spec = {
+            "requestBody": {
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "$ref": "#/components/schemas/NewPet"
+                        }  # Valid schema that will cause error in processing
+                    }
+                }
+            }
+        }
+
+        with (
+            patch(
+                "datahub.ingestion.source.openapi.get_schema_from_response"
+            ) as mock_get_schema,
+            patch("datahub.ingestion.source.openapi.logger") as mock_logger,
+        ):
+            # Make get_schema_from_response raise an exception
+            mock_get_schema.side_effect = TypeError("Cannot process schema")
+
+            result = self.source.extract_request_schema_from_endpoint(endpoint_spec, {})
+
+            # Should return None and log warning
+            self.assertIsNone(result)
+            mock_logger.warning.assert_called()
+
+    def test_resolve_schema_references_recursive(self):
+        """Test that nested $ref references are fully resolved in properties, items, etc."""
+        sw_dict = {
+            "swagger": "2.0",
+            "definitions": {
+                "Address": {
+                    "type": "object",
+                    "properties": {
+                        "street": {"type": "string"},
+                        "city": {"type": "string"},
+                    },
+                },
+                "Person": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "address": {"$ref": "#/definitions/Address"},
+                        "tags": {
+                            "type": "array",
+                            "items": {"$ref": "#/definitions/Tag"},
+                        },
+                    },
+                },
+                "Tag": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                },
+            },
+        }
+
+        schema = {
+            "$ref": "#/definitions/Person",
+        }
+
+        resolved = resolve_schema_references(schema, sw_dict)
+
+        # Should resolve all references
+        self.assertIsNotNone(resolved)
+        self.assertIn("properties", resolved)
+        self.assertIn("name", resolved["properties"])
+        self.assertIn("address", resolved["properties"])
+        # Address should be resolved
+        self.assertIn("properties", resolved["properties"]["address"])
+        self.assertIn("street", resolved["properties"]["address"]["properties"])
+        # Tags array items should be resolved
+        self.assertIn("items", resolved["properties"]["tags"])
+        self.assertIn("properties", resolved["properties"]["tags"]["items"])
+
+    def test_resolve_schema_references_v2_definitions(self):
+        """Test v2 definition references (#/definitions/Pet)."""
+        sw_dict = {
+            "swagger": "2.0",
+            "definitions": {
+                "Pet": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer", "format": "int64"},
+                        "name": {"type": "string"},
+                    },
+                }
+            },
+        }
+
+        schema = {"$ref": "#/definitions/Pet"}
+
+        resolved = resolve_schema_references(schema, sw_dict)
+
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved["type"], "object")
+        self.assertIn("properties", resolved)
+        self.assertIn("id", resolved["properties"])
+        self.assertIn("name", resolved["properties"])
+
+    def test_resolve_schema_references_v3_components(self):
+        """Test v3 component references (#/components/schemas/Pet)."""
+        sw_dict = {
+            "openapi": "3.0.0",
+            "components": {
+                "schemas": {
+                    "Pet": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "integer", "format": "int64"},
+                            "name": {"type": "string"},
+                        },
+                    }
+                }
+            },
+        }
+
+        schema = {"$ref": "#/components/schemas/Pet"}
+
+        resolved = resolve_schema_references(schema, sw_dict)
+
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved["type"], "object")
+        self.assertIn("properties", resolved)
+        self.assertIn("id", resolved["properties"])
+        self.assertIn("name", resolved["properties"])
+
+    def test_resolve_schema_references_allof_merging(self):
+        """Test that allOf schemas are properly merged."""
+        sw_dict = {
+            "swagger": "2.0",
+            "definitions": {
+                "NewPet": {
+                    "type": "object",
+                    "required": ["name"],
+                    "properties": {
+                        "name": {"type": "string"},
+                        "tag": {"type": "string"},
+                    },
+                },
+                "Pet": {
+                    "type": "object",
+                    "allOf": [
+                        {"$ref": "#/definitions/NewPet"},
+                        {
+                            "required": ["id"],
+                            "properties": {
+                                "id": {"type": "integer", "format": "int64"},
+                            },
+                        },
+                    ],
+                },
+            },
+        }
+
+        schema = {"$ref": "#/definitions/Pet"}
+
+        resolved = resolve_schema_references(schema, sw_dict)
+
+        self.assertIsNotNone(resolved)
+        self.assertIn("properties", resolved)
+        # Should have merged properties from both allOf entries
+        self.assertIn("name", resolved["properties"])
+        self.assertIn("tag", resolved["properties"])
+        self.assertIn("id", resolved["properties"])
+        # Should have merged required fields
+        self.assertIn("required", resolved)
+        self.assertIn("name", resolved["required"])
+        self.assertIn("id", resolved["required"])
+
+    def test_resolve_schema_references_pattern_properties_ref_resolved_and_promoted(
+        self,
+    ):
+        # A map-only patternProperties schema with a $ref value: the ref is
+        # resolved and the pattern schema is promoted to additionalProperties so
+        # json_schema_util can extract the map value type.
+        sw_dict = {
+            "swagger": "2.0",
+            "definitions": {"Value": {"type": "integer"}},
+        }
+        schema = {
+            "type": "object",
+            "patternProperties": {"^x-": {"$ref": "#/definitions/Value"}},
+        }
+        resolved = resolve_schema_references(schema, sw_dict)
+        self.assertEqual(resolved["patternProperties"]["^x-"], {"type": "integer"})
+        self.assertEqual(resolved["additionalProperties"], {"type": "integer"})
+
+    def test_resolve_schema_references_multiple_pattern_properties_promoted_to_anyof(
+        self,
+    ):
+        schema = {
+            "type": "object",
+            "patternProperties": {
+                "^s_": {"type": "string"},
+                "^n_": {"type": "integer"},
+            },
+        }
+        resolved = resolve_schema_references(schema, {})
+        self.assertIn("anyOf", resolved["additionalProperties"])
+        self.assertEqual(
+            resolved["additionalProperties"]["anyOf"],
+            [{"type": "string"}, {"type": "integer"}],
+        )
+
+    def test_resolve_schema_references_named_properties_block_pattern_promotion(self):
+        # Named properties must win; promotion would route extraction through the
+        # additionalProperties map path and drop the named fields.
+        schema = {
+            "type": "object",
+            "properties": {"id": {"type": "integer"}},
+            "patternProperties": {"^x-": {"type": "string"}},
+        }
+        resolved = resolve_schema_references(schema, {})
+        self.assertNotIn("additionalProperties", resolved)
+        self.assertIn("id", resolved["properties"])
+
+    def test_resolve_schema_references_property_names_ref_resolved(self):
+        sw_dict = {
+            "swagger": "2.0",
+            "definitions": {"Key": {"type": "string", "pattern": "^[a-z]+$"}},
+        }
+        schema = {
+            "type": "object",
+            "additionalProperties": {"type": "integer"},
+            "propertyNames": {"$ref": "#/definitions/Key"},
+        }
+        resolved = resolve_schema_references(schema, sw_dict)
+        self.assertEqual(
+            resolved["propertyNames"], {"type": "string", "pattern": "^[a-z]+$"}
+        )
+
+    def test_merge_allof_enum_intersects_across_members(self):
+        schema = {
+            "allOf": [
+                {"type": "integer", "enum": [1, 2, 3]},
+                {"enum": [2, 3, 4]},
+            ]
+        }
+        resolved = resolve_schema_references(schema, {})
+        self.assertEqual(resolved["enum"], [2, 3])
+
+    def test_merge_allof_disjoint_enum_dropped_keeps_schema_valid(self):
+        # Disjoint enums across allOf members intersect to the empty set. An
+        # empty `enum: []` is invalid per the JSON Schema meta-schema
+        # (minItems 1), so json_schema_util's check_schema rejects the whole
+        # schema and drops every field -- not just the one enum constraint. The
+        # composition is unsatisfiable, so the enum keyword must be dropped and
+        # the rest of the schema must stay extractable.
+        schema = {
+            "type": "object",
+            "properties": {
+                "status": {"allOf": [{"enum": ["a", "b"]}, {"enum": ["c", "d"]}]},
+                "name": {"type": "string"},
+            },
+        }
+        resolved = resolve_schema_references(schema, {})
+        self.assertNotIn("enum", resolved["properties"]["status"])
+        # The whole schema must remain valid for extraction; an empty enum would
+        # raise in check_schema here (swallow_exceptions=False) and drop `name`.
+        fields = list(
+            JsonSchemaTranslator.get_fields_from_schema(
+                resolved, swallow_exceptions=False
+            )
+        )
+        self.assertTrue(any(f.fieldPath.endswith("name") for f in fields))
+
+    def test_resolve_schema_references_circular(self):
+        """Test that circular references are handled by max_depth limit."""
+        sw_dict = {
+            "swagger": "2.0",
+            "definitions": {
+                "Pet": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer"},
+                        "owner": {"$ref": "#/definitions/Owner"},
+                    },
+                },
+                "Owner": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer"},
+                        "pets": {
+                            "type": "array",
+                            "items": {"$ref": "#/definitions/Pet"},
+                        },
+                    },
+                },
+            },
+        }
+
+        schema = {"$ref": "#/definitions/Pet"}
+
+        # With max_depth=10, circular references will hit the depth limit
+        # and return partially resolved schema instead of RecursionError
+        resolved = resolve_schema_references(schema, sw_dict, max_depth=10)
+
+        # Should return partially resolved schema when depth limit is reached
+        self.assertIsNotNone(resolved)
+        # Should have resolved at least some levels before hitting max_depth
+        self.assertIn("properties", resolved)
+
+    def test_resolve_schema_references_max_depth(self):
+        """Test that max depth limit prevents infinite recursion."""
+        # Create a deeply nested schema
+        sw_dict = {
+            "swagger": "2.0",
+            "definitions": {},
+        }
+
+        # Create nested references up to level 20 (exceeds default max_depth of 10)
+        definitions: Dict[str, Dict[str, Any]] = {}
+        for i in range(0, 20):
+            if i < 19:
+                definitions[f"Level{i}"] = {
+                    "type": "object",
+                    "properties": {
+                        f"level{i + 1}": {"$ref": f"#/definitions/Level{i + 1}"},
+                    },
+                }
+            else:
+                # Last level has no reference
+                definitions[f"Level{i}"] = {
+                    "type": "object",
+                    "properties": {
+                        "value": {"type": "string"},
+                    },
+                }
+        sw_dict["definitions"] = definitions
+
+        schema = {"$ref": "#/definitions/Level0"}
+
+        # Should handle max depth gracefully without RecursionError
+        # With max_depth=10, it should stop before reaching Level10
+        resolved = resolve_schema_references(schema, sw_dict, max_depth=10)
+
+        # Should return partially resolved schema when depth limit is reached
+        self.assertIsNotNone(resolved)
+
+    def test_extract_response_schema_malformed_no_content_type(self):
+        """Test handling of response with content but no application/json."""
+        endpoint_spec = {
+            "responses": {
+                "200": {
+                    "description": "Success",
+                    "content": {
+                        "application/xml": {"schema": {"type": "string"}}
+                        # No application/json
+                    },
+                }
+            }
+        }
+
+        # Should return None since application/json is not available
+        result = self.source.extract_response_schema_from_endpoint(endpoint_spec, {})
+
+        # Should try application/xml as fallback
+        with patch(
+            "datahub.ingestion.source.openapi.get_schema_from_response"
+        ) as mock_get_schema:
+            mock_get_schema.return_value = {"type": "string"}
+            result = self.source.extract_response_schema_from_endpoint(
+                endpoint_spec, {}
+            )
+            # Should still work with fallback content types
+            self.assertIsNotNone(result)
+            mock_get_schema.assert_called_once()
+
+    def test_extract_response_schema_malformed_missing_reference(self):
+        """Test handling of $ref to non-existent schema."""
+        sw_dict = {
+            "swagger": "2.0",
+            "definitions": {
+                # Missing "Pet" definition
+            },
+        }
+
+        endpoint_spec = {
+            "responses": {
+                "200": {
+                    "description": "Success",
+                    "schema": {"$ref": "#/definitions/NonExistent"},
+                }
+            }
+        }
+
+        with patch(
+            "datahub.ingestion.source.openapi.get_schema_from_response"
+        ) as mock_get_schema:
+            # get_schema_from_response should handle missing references
+            mock_get_schema.return_value = None
+
+            result = self.source.extract_response_schema_from_endpoint(
+                endpoint_spec, sw_dict
+            )
+
+            # Should return None when reference doesn't exist
+            self.assertIsNone(result)
+
+    def test_extract_schema_mixed_methods_get_no_schema_post_has_schema(self):
+        """Test that POST schema is used when GET has no schema but POST has schema."""
+        sw_dict = {
+            "swagger": "2.0",
+            "paths": {
+                "/pets": {
+                    "get": {
+                        "responses": {
+                            "200": {
+                                "description": "Success but no schema"
+                                # No schema field
+                            }
+                        }
+                    },
+                    "post": {
+                        "responses": {
+                            "200": {
+                                "description": "POST response",
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"name": {"type": "string"}},
+                                },
+                            }
+                        }
+                    },
+                }
+            },
+        }
+
+        with patch(
+            "datahub.ingestion.source.openapi.get_schema_from_response"
+        ) as mock_get_schema:
+
+            def side_effect(schema, sw_dict, **kwargs):
+                return schema
+
+            mock_get_schema.side_effect = side_effect
+
+            result = self.source.extract_schema_from_all_methods("/pets", sw_dict)
+
+            # Should return POST schema (GET has no schema)
+            self.assertIsNotNone(result)
+            assert result is not None  # Type assertion for mypy
+            self.assertIn("name", result.get("properties", {}))
+
+    def test_extract_schema_mixed_methods_get_has_schema_post_has_schema(self):
+        """Test that GET schema is preferred when both GET and POST have schemas."""
+        sw_dict = {
+            "swagger": "2.0",
+            "paths": {
+                "/pets": {
+                    "get": {
+                        "responses": {
+                            "200": {
+                                "description": "GET response",
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"id": {"type": "integer"}},
+                                },
+                            }
+                        }
+                    },
+                    "post": {
+                        "responses": {
+                            "200": {
+                                "description": "POST response",
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"name": {"type": "string"}},
+                                },
+                            }
+                        }
+                    },
+                }
+            },
+        }
+
+        with patch(
+            "datahub.ingestion.source.openapi.get_schema_from_response"
+        ) as mock_get_schema:
+
+            def side_effect(schema, sw_dict, **kwargs):
+                return schema
+
+            mock_get_schema.side_effect = side_effect
+
+            result = self.source.extract_schema_from_all_methods("/pets", sw_dict)
+
+            # Should return GET schema (higher priority)
+            self.assertIsNotNone(result)
+            assert result is not None  # Type assertion for mypy
+            self.assertIn("id", result.get("properties", {}))
+            self.assertNotIn("name", result.get("properties", {}))
+
+    def test_extract_response_schema_empty_content(self):
+        """Test handling of response with empty content object."""
+        endpoint_spec = {
+            "responses": {
+                "200": {
+                    "description": "Success",
+                    "content": {},  # Empty content
+                }
+            }
+        }
+
+        result = self.source.extract_response_schema_from_endpoint(endpoint_spec, {})
+
+        # Should return None when content is empty
+        self.assertIsNone(result)
+
+    def test_extract_request_schema_malformed_missing_reference(self):
+        """Test handling of request body with $ref to non-existent schema."""
+        sw_dict = {
+            "openapi": "3.0.0",
+            "components": {
+                "schemas": {
+                    # Missing "NewPet" definition
+                }
+            },
+        }
+
+        endpoint_spec = {
+            "requestBody": {
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/NonExistent"}
+                    }
+                }
+            }
+        }
+
+        with patch(
+            "datahub.ingestion.source.openapi.get_schema_from_response"
+        ) as mock_get_schema:
+            # get_schema_from_response should handle missing references
+            mock_get_schema.return_value = None
+
+            result = self.source.extract_request_schema_from_endpoint(
+                endpoint_spec, sw_dict
+            )
+
+            # Should return None when reference doesn't exist
+            self.assertIsNone(result)
+
+    def test_schema_extraction_with_missing_credentials(self):
+        """Test that API calls are skipped when credentials missing (should log warning but not fail)."""
+        # Create config without credentials
+        config_no_creds = OpenApiConfig(
+            name="test_api",
+            url="https://api.example.com",
+            swagger_file="/openapi.json",
+            enable_api_calls_for_schema_extraction=True,
+        )
+        source_no_creds = APISource(config_no_creds, self.ctx, "OpenApi")
+
+        sw_dict = {
+            "swagger": "2.0",
+            "paths": {
+                "/pets": {"get": {"responses": {"404": {"description": "Not found"}}}}
+            },
+        }
+
+        # Try to extract schema - should not fail even without credentials
+        # Since there's no 200 response, it should return None without making API calls
+        result = source_no_creds._extract_schema_from_openapi_spec(
+            "/pets", "pets", sw_dict
+        )
+
+        # Should return None (no schema in spec, and no API call made without credentials)
+        self.assertIsNone(result)
+
+
+class TestOpenApiGetTokenConfig(unittest.TestCase):
+    def test_get_token_empty_dict_coerces_to_none(self):
+        config = OpenApiConfig(
+            name="test_api",
+            url="https://api.example.com",
+            swagger_file="/openapi.json",
+            get_token={},
+        )
+        self.assertIsNone(config.get_token)
+
+    def test_get_token_get_requires_placeholders(self):
+        with self.assertRaises(ValueError):
+            OpenApiGetTokenConfig(request_type="get", url_complement="/token")
+        cfg = OpenApiGetTokenConfig(
+            request_type="get",
+            url_complement="/token?u={username}&p={password}",
+        )
+        self.assertEqual(cfg.request_type, "get")
+
+    def test_ensure_only_one_token_rejects_token_and_get_token(self):
+        with self.assertRaises(ValidationError):
+            OpenApiConfig(
+                name="test_api",
+                url="https://api.example.com",
+                swagger_file="/openapi.json",
+                token="abc",
+                get_token={"request_type": "post", "url_complement": "/auth"},
+            )
+
+    def test_ensure_only_one_token_rejects_bearer_and_get_token(self):
+        with self.assertRaises(ValidationError):
+            OpenApiConfig(
+                name="test_api",
+                url="https://api.example.com",
+                swagger_file="/openapi.json",
+                bearer_token="abc",
+                get_token={"request_type": "post", "url_complement": "/auth"},
+            )
+
+    def test_ensure_only_one_token_allows_empty_token_with_get_token(self):
+        # Regression: an empty SecretStr("") (e.g. an unresolved env var
+        # substituted into `token`) is falsy and get_swagger() treats it as
+        # unconfigured, so the validator must use the same truthiness check
+        # instead of rejecting this as "token and get_token together".
+        config = OpenApiConfig(
+            name="test_api",
+            url="https://api.example.com",
+            swagger_file="/openapi.json",
+            token=SecretStr(""),
+            get_token={"request_type": "post", "url_complement": "/auth"},
+        )
+        self.assertIsNotNone(config.get_token)
+
+    def test_get_swagger_get_token_substitutes_credentials(self):
+        config = OpenApiConfig(
+            name="test_api",
+            url="https://api.example.com",
+            swagger_file="/openapi.json",
+            username="alice",
+            password="s3cret",
+            get_token={
+                "request_type": "get",
+                "url_complement": "/token?u={username}&p={password}",
+            },
+        )
+        with (
+            patch(
+                "datahub.ingestion.source.openapi.get_tok", return_value="fetched-tok"
+            ) as mock_tok,
+            patch(
+                "datahub.ingestion.source.openapi.get_swag_json",
+                return_value={"openapi": "3.0.0", "paths": {}},
+            ) as mock_swag,
+        ):
+            result = config.get_swagger()
+
+        self.assertEqual(result["openapi"], "3.0.0")
+        mock_tok.assert_called_once()
+        self.assertEqual(mock_tok.call_args.kwargs["method"], "get")
+        self.assertEqual(
+            mock_tok.call_args.kwargs["tok_url"], "/token?u=alice&p=s3cret"
+        )
+        mock_swag.assert_called_once()
+        self.assertEqual(mock_swag.call_args.kwargs["token"], "fetched-tok")
+
+    def test_get_swagger_post_token_dispatches_to_get_tok(self):
+        config = OpenApiConfig(
+            name="test_api",
+            url="https://api.example.com",
+            swagger_file="/openapi.json",
+            username="alice",
+            password="s3cret",
+            get_token={"request_type": "post", "url_complement": "/auth/token"},
+        )
+        with (
+            patch(
+                "datahub.ingestion.source.openapi.get_tok", return_value="post-tok"
+            ) as mock_tok,
+            patch(
+                "datahub.ingestion.source.openapi.get_swag_json",
+                return_value={"openapi": "3.0.0", "paths": {}},
+            ),
+        ):
+            config.get_swagger()
+
+        mock_tok.assert_called_once()
+        self.assertEqual(mock_tok.call_args.kwargs["method"], "post")
+        self.assertEqual(mock_tok.call_args.kwargs["tok_url"], "/auth/token")
+        self.assertEqual(mock_tok.call_args.kwargs["username"], "alice")
+        self.assertEqual(mock_tok.call_args.kwargs["password"], "s3cret")
+
+    def test_get_swagger_empty_bearer_token_falls_back_to_basic_auth(self):
+        # Regression: the auth-branch condition mixed truthiness (self.token,
+        # self.bearer_token in the inner checks) with `is not None` (in the outer
+        # guard), so bearer_token=SecretStr("") took the outer branch but matched
+        # none of the inner arms, hitting `assert self.get_token is not None` and
+        # crashing with a bare AssertionError instead of falling back to basic auth.
+        config = OpenApiConfig(
+            name="test_api",
+            url="https://api.example.com",
+            swagger_file="/openapi.json",
+            username="alice",
+            password="s3cret",
+            bearer_token=SecretStr(""),
+        )
+        with patch(
+            "datahub.ingestion.source.openapi.get_swag_json",
+            return_value={"openapi": "3.0.0", "paths": {}},
+        ) as mock_swag:
+            config.get_swagger()
+
+        self.assertEqual(mock_swag.call_args.kwargs["username"], "alice")
+        self.assertNotIn("token", mock_swag.call_args.kwargs)
+
+
+class TestGetTok(unittest.TestCase):
+    def test_get_tok_post_unexpected_shape_raises(self):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = b'{"not_a_token": true}'
+        with patch(
+            "datahub.ingestion.source.openapi_parser.requests.post",
+            return_value=mock_response,
+        ):
+            with self.assertRaises(ValueError):
+                get_tok(
+                    url="https://api.example.com",
+                    username="u",
+                    password="p",
+                    tok_url="/auth",
+                    method="post",
+                )
+
+    def test_get_tok_unrecognised_method_raises(self):
+        # Deliberately passes an invalid method to exercise the runtime guard,
+        # despite get_tok's method param now being typed Literal["get", "post"].
+        with self.assertRaises(ValueError):
+            get_tok(
+                url="https://api.example.com",
+                tok_url="/auth",
+                method="put",  # type: ignore[arg-type]
+            )
+
+    def test_get_tok_error_does_not_leak_credentials_in_message(self):
+        # get_swagger substitutes {username}/{password} into the GET token URL before
+        # calling get_tok; its error messages must never echo that URL or the raw
+        # response body back into report.failure.
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = MagicMock(
+                status_code=200, content=b"not json", text="secret=hunter2"
+            )
+            with self.assertRaises(ValueError) as ctx:
+                get_tok(
+                    url="https://api.example.com",
+                    tok_url="/token?u=alice&p=hunter2",
+                    method="get",
+                )
+        self.assertNotIn("hunter2", str(ctx.exception))
+        self.assertNotIn("u=alice", str(ctx.exception))
+
+    def test_get_tok_connection_error_does_not_leak_credentials_in_message(self):
+        # Regression: a raw `requests` exception raised while making the GET/POST
+        # token request (not just a malformed 200 response) must not propagate its
+        # message verbatim -- for method="get" that message can otherwise embed the
+        # password-substituted URL, and it ends up in report.failure verbatim.
+        with patch("requests.get") as mock_get:
+            mock_get.side_effect = requests.exceptions.ConnectionError(
+                "Failed to resolve host for https://api.example.com/token?u=alice&p=hunter2"
+            )
+            with self.assertRaises(ValueError) as ctx:
+                get_tok(
+                    url="https://api.example.com",
+                    tok_url="/token?u=alice&p=hunter2",
+                    method="get",
+                )
+        self.assertNotIn("hunter2", str(ctx.exception))
+        self.assertNotIn("u=alice", str(ctx.exception))
+
+        with patch("requests.post") as mock_post:
+            mock_post.side_effect = requests.exceptions.ConnectionError(
+                "Failed to resolve host for https://api.example.com/token"
+            )
+            with self.assertRaises(ValueError) as ctx:
+                get_tok(
+                    url="https://api.example.com",
+                    username="alice",
+                    password="hunter2",
+                    tok_url="/token",
+                    method="post",
+                )
+        self.assertNotIn("hunter2", str(ctx.exception))
+
+
+class TestOpenApiInputHardening(unittest.TestCase):
+    def test_forced_examples_coerce_numeric_path_params(self):
+        # Docs use integers (e.g. /pet/{petId}: [1]); config stores strings for URLs.
+        config = OpenApiConfig(
+            name="test_api",
+            url="https://api.example.com",
+            swagger_file="/openapi.json",
+            forced_examples={"/pet/{petId}": [1]},
+        )
+        self.assertEqual(config.forced_examples["/pet/{petId}"], ["1"])
+
+    def test_forced_examples_coerce_bool_via_int(self):
+        # The docs promise "bool via int": True/False must become "1"/"0", not
+        # str(True) == "True", which most APIs reject for a boolean path param.
+        config = OpenApiConfig(
+            name="test_api",
+            url="https://api.example.com",
+            swagger_file="/openapi.json",
+            forced_examples={"/pet/{available}": [True, False]},
+        )
+        self.assertEqual(config.forced_examples["/pet/{available}"], ["1", "0"])
+
+    def test_forced_examples_reject_null_path_params(self):
+        with self.assertRaises(ValidationError):
+            OpenApiConfig(
+                name="test_api",
+                url="https://api.example.com",
+                swagger_file="/openapi.json",
+                forced_examples={"/pet/{petId}": [None]},
+            )
+
+    def test_schema_resolution_max_depth_capped(self):
+        with self.assertRaises(ValidationError):
+            OpenApiConfig(
+                name="test_api",
+                url="https://api.example.com",
+                swagger_file="/openapi.json",
+                schema_resolution_max_depth=101,
+            )
+        with self.assertRaises(ValidationError):
+            OpenApiConfig(
+                name="test_api",
+                url="https://api.example.com",
+                swagger_file="/openapi.json",
+                schema_resolution_max_depth=0,
+            )
+
+    def test_get_swag_json_parses_json_response(self):
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = MagicMock(
+                status_code=200, content=b'{"openapi": "3.0.0"}'
+            )
+            result = get_swag_json("https://api.example.com")
+        self.assertEqual(result, {"openapi": "3.0.0"})
+
+    def test_get_swag_json_falls_back_to_yaml(self):
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = MagicMock(
+                status_code=200, content=b"openapi: 3.0.0\npaths: {}\n"
+            )
+            result = get_swag_json("https://api.example.com")
+        self.assertEqual(result, {"openapi": "3.0.0", "paths": {}})
+
+    def test_get_swag_json_raises_when_neither_json_nor_yaml(self):
+        with patch("requests.get") as mock_get:
+            # A tab character is invalid in both JSON and YAML.
+            mock_get.return_value = MagicMock(status_code=200, content=b"{\t*bad*")
+            with self.assertRaises(ValueError) as ctx:
+                get_swag_json("https://api.example.com")
+        self.assertIn("as JSON or YAML", str(ctx.exception))
+
+    def test_get_swag_json_raises_clear_error_on_non_utf8_content(self):
+        # Regression: json.loads on non-UTF-8 bytes raises UnicodeDecodeError,
+        # not json.JSONDecodeError -- that used to skip both the YAML fallback
+        # and this function's own clear error message, letting a raw decode
+        # error propagate instead.
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = MagicMock(status_code=200, content=b"\xff\xfe\x00")
+            with self.assertRaises(ValueError) as ctx:
+                get_swag_json("https://api.example.com")
+        self.assertIn("as JSON or YAML", str(ctx.exception))
+
+    def test_get_swag_json_raises_on_non_dict_document(self):
+        # Regression: a valid JSON/YAML document that isn't an object (e.g. a
+        # bare list) is not a valid OpenAPI/Swagger spec, but used to be
+        # returned as-is despite the declared `-> Dict` contract, letting a
+        # confusing TypeError/KeyError surface later in get_endpoints instead
+        # of a clear error at the point the malformed data was fetched.
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = MagicMock(status_code=200, content=b"[1, 2, 3]")
+            with self.assertRaises(ValueError) as ctx:
+                get_swag_json("https://api.example.com")
+        self.assertIn("did not parse to a JSON/YAML object", str(ctx.exception))
+
+    def test_resolve_schema_references_non_dict_properties_does_not_crash(self):
+        # A malformed spec may set `properties` to a non-dict; resolution must
+        # leave it untouched rather than raising while iterating its keys.
+        schema = {"type": "object", "properties": ["not", "a", "dict"]}
+        resolved = resolve_schema_references(schema, {"components": {"schemas": {}}})
+        self.assertEqual(resolved["properties"], ["not", "a", "dict"])
+
+    def test_resolve_schema_references_non_list_oneof_does_not_crash(self):
+        # oneOf/anyOf as a single inline object (not a list) must be left
+        # untouched rather than iterated as if it were a list of members.
+        schema = {"oneOf": {"type": "string"}}
+        resolved = resolve_schema_references(schema, {"components": {"schemas": {}}})
+        self.assertEqual(resolved["oneOf"], {"type": "string"})

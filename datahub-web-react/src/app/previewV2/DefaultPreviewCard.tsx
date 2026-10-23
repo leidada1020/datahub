@@ -1,0 +1,472 @@
+import { Button } from '@components';
+import React, { ReactNode } from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { useEntityContext, useEntityData } from '@app/entity/shared/EntityContext';
+import { removeMarkdown } from '@app/entity/shared/components/styled/StripMarkdownText';
+import { GenericEntityProperties } from '@app/entity/shared/types';
+import { EntityMenuActions, PreviewType } from '@app/entityV2/Entity';
+import { EntityMenuItems } from '@app/entityV2/shared/EntityDropdown/EntityMenuActions';
+import MoreOptionsMenuAction from '@app/entityV2/shared/EntityDropdown/MoreOptionsMenuAction';
+import { DeprecationFormData } from '@app/entityV2/shared/EntityDropdown/useHandleDeprecateDomain';
+import { usePreviewData } from '@app/entityV2/shared/PreviewContext';
+import { useSearchCardContext } from '@app/entityV2/shared/SearchCardContext';
+import { PopularityTier } from '@app/entityV2/shared/containers/profile/sidebar/shared/utils';
+import ViewInPlatform from '@app/entityV2/shared/externalUrl/ViewInPlatform';
+import CompactMarkdownViewer from '@app/entityV2/shared/tabs/Documentation/components/CompactMarkdownViewer';
+import ShortMarkdownViewer from '@app/entityV2/shared/tabs/Documentation/components/ShortMarkdownViewer';
+import { DashboardLastUpdatedMs, DatasetLastUpdatedMs } from '@app/entityV2/shared/utils';
+import ColoredBackgroundPlatformIconGroup from '@app/previewV2/ColoredBackgroundPlatformIconGroup';
+import { CompactView } from '@app/previewV2/CompactView';
+import ContextPath from '@app/previewV2/ContextPath';
+import DefaultPreviewCardFooter from '@app/previewV2/DefaultPreviewCardFooter';
+import EntityHeader from '@app/previewV2/EntityHeader';
+import { ActionsAndStatusSection } from '@app/previewV2/shared';
+import {
+    RemoveConfirmState,
+    useRemoveApplicationAssets,
+    useRemoveDataProductAssets,
+    useRemoveDomainAssets,
+    useRemoveGlossaryTermAssets,
+} from '@app/previewV2/utils';
+import { useSearchContext } from '@app/search/context/SearchContext';
+import { ConfirmationModal } from '@app/sharedV2/modals/ConfirmationModal';
+import { useAppConfig } from '@app/useAppConfig';
+import { useEntityRegistry } from '@app/useEntityRegistry';
+import DataProcessInstanceInfo from '@src/app/preview/DataProcessInstanceInfo';
+
+import {
+    BrowsePathV2,
+    Container,
+    CorpUser,
+    DataProduct,
+    Deprecation,
+    Domain,
+    Entity,
+    EntityPath,
+    EntityType,
+    GlobalTags,
+    GlossaryTerms,
+    Health,
+    Maybe,
+    Owner,
+    SearchInsight,
+} from '@types';
+
+const TransparentButton = styled(Button)`
+    display: none;
+
+    &:hover {
+        display: inline-flex;
+    }
+`;
+
+const PreviewContainer = styled.div`
+    display: flex;
+    flex-direction: column;
+    height: auto;
+    width: 100%;
+    justify-content: space-between;
+    align-items: start;
+
+    .entityCount {
+        margin-bottom: 2px;
+    }
+
+    &:hover ${TransparentButton} {
+        display: inline-block;
+    }
+`;
+
+interface RowContainerProps {
+    hidden?: boolean;
+    alignment?: 'flex-start' | 'center' | 'flex-end' | 'self-start';
+}
+
+const RowContainer = styled.div<RowContainerProps>`
+    align-items: ${(props) => props.alignment || 'center'};
+    display: ${(props) => (props.hidden ? 'none' : 'flex')};
+    flex-direction: row;
+    justify-content: space-between;
+    width: 100%;
+`;
+
+const InsightsText = styled.span`
+    font-size: 12px;
+    line-height: 20px;
+    font-weight: 600;
+    color: ${(props) => props.theme.colors.textTertiary};
+`;
+
+const InsightIconContainer = styled.span`
+    margin-right: 4px;
+`;
+
+const DocumentationTopMarginWrapper = styled.div`
+    margin-top: 8px;
+`;
+
+const ShortDocumentation = styled(DocumentationTopMarginWrapper)`
+    width: 100%;
+`;
+
+const Documentation = styled(DocumentationTopMarginWrapper)`
+    max-height: 300px;
+    overflow-y: auto;
+`;
+
+const ENTITY_TYPES_WITH_DESCRIPTION_PREVIEW = new Set([
+    EntityType.GlossaryTerm,
+    EntityType.GlossaryNode,
+    EntityType.DataProduct,
+    EntityType.Domain,
+    EntityType.Tag,
+]);
+
+interface Props {
+    name: string;
+    urn: string;
+    data: GenericEntityProperties | null;
+    logoUrl?: string;
+    logoComponent?: JSX.Element;
+    url: string;
+    entityType: EntityType;
+    type?: string | null;
+    typeIcon?: JSX.Element;
+    platform?: string;
+    platformInstanceId?: string;
+    platforms?: Maybe<string | undefined>[];
+    logoUrls?: Maybe<string | undefined>[];
+    tags?: GlobalTags;
+    owners?: Array<Owner> | null;
+    deprecation?: Deprecation | null;
+    topUsers?: Array<CorpUser> | null;
+    subHeader?: React.ReactNode;
+    snippet?: React.ReactNode;
+    insights?: Array<SearchInsight> | null;
+    glossaryTerms?: GlossaryTerms;
+    container?: Container;
+    domain?: Domain | undefined | null;
+    dataProduct?: DataProduct | undefined | null;
+    entityCount?: number;
+    dataTestID?: string;
+    titleSizePx?: number;
+    onClick?: () => void;
+    // this is provided by the impact analysis view. it is used to display
+    // how the listed node is connected to the source node
+    degree?: number;
+    parentEntities?: Entity[] | null;
+    previewType: PreviewType;
+    paths?: EntityPath[];
+    health?: Health[];
+    lastUpdatedMs?: DatasetLastUpdatedMs | DashboardLastUpdatedMs;
+    description?: string;
+    // eslint-disable-next-line react/no-unused-prop-types
+    externalUrl?: string | null;
+    tier?: PopularityTier;
+    isOutputPort?: boolean;
+    entityIcon?: JSX.Element;
+    headerDropdownItems?: Set<EntityMenuItems>;
+    statsSummary?: any;
+    actions?: EntityMenuActions;
+    browsePaths?: BrowsePathV2 | undefined;
+    refetchDeprecation?: (formData?: DeprecationFormData) => void;
+}
+
+export default function DefaultPreviewCard({
+    name,
+    urn,
+    data,
+    logoUrl, // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    logoComponent,
+    url,
+    entityType,
+    type, // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    typeIcon,
+    platform, // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    platformInstanceId,
+    tags,
+    owners, // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    topUsers,
+    glossaryTerms,
+    paths, // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    subHeader,
+    snippet,
+    insights, // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    domain, // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    dataProduct, // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    container,
+    deprecation, // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    entityCount,
+    titleSizePx,
+    dataTestID,
+    onClick,
+    degree,
+    parentEntities,
+    platforms,
+    logoUrls,
+    previewType,
+    health,
+    lastUpdatedMs,
+    tier,
+    isOutputPort,
+    entityIcon,
+    headerDropdownItems,
+    statsSummary,
+    actions,
+    browsePaths,
+    description,
+    refetchDeprecation,
+}: Props) {
+    const entityRegistry = useEntityRegistry();
+    const supportedCapabilities = entityRegistry.getSupportedEntityCapabilities(entityType);
+    const { config } = useAppConfig();
+
+    const shouldShowRedesignedDescription = config.searchCardConfig.showDescription;
+    const shouldShowDescriptionsForSearch =
+        previewType === PreviewType.SEARCH && config.searchCardConfig.showDescription;
+    const shouldShowDescription =
+        ENTITY_TYPES_WITH_DESCRIPTION_PREVIEW.has(entityType) || shouldShowDescriptionsForSearch;
+
+    // sometimes these lists will be rendered inside an entity container (for example, in the case of impact analysis)
+    // in those cases, we may want to enrich the preview w/ context about the container entity
+    // Passing previewType via context because not all entities pass it via props
+    // But not using previewContextType everywhere to avoid regressions... sorry
+    const { previewData } = usePreviewData();
+    const insightViews: Array<ReactNode> =
+        insights?.map((insight) => (
+            <>
+                <InsightIconContainer>{insight.icon}</InsightIconContainer>
+                <InsightsText>{insight.text}</InsightsText>
+            </>
+        )) || [];
+
+    if (snippet) {
+        insightViews.push(snippet);
+    }
+
+    // TODO: Replace with something less hacky
+    const finalType = type || entityRegistry.getEntityName(entityType);
+    const hasPlatformIcons = logoUrl || (logoUrls && logoUrls.length) || isOutputPort;
+    const isIconPresent = !!hasPlatformIcons || !!entityIcon;
+
+    const { isFullViewCard } = useSearchContext();
+
+    const { removeRelationship, removeButtonText, confirmationModals } = useRemoveRelationship(entityType);
+
+    // When a caller passes a live `deprecation` (e.g. Preview using local optimistic state),
+    // merge it into the entityData handed to the row's actions menu so the menu reflects the
+    // current state (e.g. "Mark as Deprecated" vs "Mark as un-deprecated") instead of stale data.
+    const entityDataForMenu = React.useMemo(() => {
+        if (deprecation === undefined) return previewData;
+        return { ...(previewData ?? {}), deprecation };
+    }, [previewData, deprecation]);
+
+    const lastRunEvent = data?.lastRunEvent;
+    const shouldShowDPIinfo =
+        lastRunEvent?.timestampMillis || lastRunEvent?.durationMillis || lastRunEvent?.result?.resultType;
+    const entityHeader = (
+        <EntityHeader
+            name={name}
+            onClick={onClick}
+            titleSizePx={titleSizePx}
+            url={url}
+            urn={urn}
+            deprecation={deprecation}
+            health={health}
+            degree={degree}
+            refetchDeprecation={refetchDeprecation}
+            connectionName={previewData?.name}
+            previewData={previewData}
+        />
+    );
+
+    return (
+        <PreviewContainer data-testid={dataTestID ?? `preview-${urn}`}>
+            {isFullViewCard ? (
+                <>
+                    <RowContainer alignment="self-start">
+                        {isIconPresent ? (
+                            <ColoredBackgroundPlatformIconGroup
+                                platformName={platform}
+                                platformLogoUrl={logoUrl}
+                                platformNames={platforms}
+                                platformLogoUrls={logoUrls}
+                                isOutputPort={isOutputPort}
+                                icon={entityIcon}
+                            />
+                        ) : (
+                            entityHeader
+                        )}
+                        <ActionsAndStatusSection>
+                            {removeButtonText && (
+                                <TransparentButton variant="text" size="sm" onClick={removeRelationship}>
+                                    {removeButtonText}
+                                </TransparentButton>
+                            )}
+                            <ViewInPlatform urn={urn} data={data} shouldFillAllAvailableSpace={false} />
+                            {headerDropdownItems && (
+                                <MoreOptionsMenuAction
+                                    menuItems={headerDropdownItems}
+                                    urn={urn}
+                                    entityType={entityType}
+                                    entityData={entityDataForMenu}
+                                    triggerType={['click']}
+                                    actions={actions}
+                                    refetchDeprecation={refetchDeprecation}
+                                />
+                            )}
+                        </ActionsAndStatusSection>
+                    </RowContainer>
+                    {isIconPresent && <RowContainer>{entityHeader}</RowContainer>}
+                    <RowContainer style={{ marginTop: 8 }}>
+                        <ContextPath
+                            displayedEntityType={finalType}
+                            entityType={entityType}
+                            browsePaths={browsePaths}
+                            parentEntities={parentEntities}
+                            entityTitleWidth={200}
+                        />
+                    </RowContainer>
+                    {shouldShowDescription &&
+                        !!description &&
+                        (shouldShowRedesignedDescription ? (
+                            <ShortDocumentation>
+                                <ShortMarkdownViewer content={description} clearMarkdown />
+                            </ShortDocumentation>
+                        ) : (
+                            <Documentation>
+                                <CompactMarkdownViewer content={removeMarkdown(description)} />
+                            </Documentation>
+                        ))}
+                    {shouldShowDPIinfo && (
+                        <RowContainer style={{ marginTop: 8, justifyContent: 'flex-end' }}>
+                            <DataProcessInstanceInfo {...lastRunEvent} />
+                        </RowContainer>
+                    )}
+                </>
+            ) : (
+                <CompactView
+                    data={data}
+                    name={name}
+                    onClick={onClick}
+                    titleSizePx={titleSizePx}
+                    url={url}
+                    degree={degree}
+                    deprecation={deprecation}
+                    actions={actions}
+                    health={health}
+                    previewData={previewData}
+                    isIconPresent={isIconPresent}
+                    platform={platform}
+                    logoUrl={logoUrl}
+                    platforms={platforms}
+                    logoUrls={logoUrls}
+                    isOutputPort={isOutputPort}
+                    entityIcon={entityIcon}
+                    headerDropdownItems={headerDropdownItems}
+                    urn={urn}
+                    entityType={entityType}
+                    finalType={finalType}
+                    parentEntities={parentEntities}
+                    browsePaths={browsePaths}
+                />
+            )}
+            <DefaultPreviewCardFooter
+                glossaryTerms={glossaryTerms}
+                tags={tags}
+                owners={owners}
+                entityCapabilities={supportedCapabilities}
+                tier={tier}
+                entityType={entityType}
+                urn={urn}
+                entityRegistry={entityRegistry}
+                lastUpdatedMs={lastUpdatedMs}
+                statsSummary={statsSummary}
+                paths={paths}
+                isFullViewCard={isFullViewCard}
+            />
+            {confirmationModals}
+        </PreviewContainer>
+    );
+}
+
+function useRemoveRelationship(entityType: EntityType) {
+    const { t } = useTranslation('entity.preview');
+    const { setShouldRefetchEmbeddedListSearch } = useEntityContext();
+    const { showRemovalFromList, onRemove, removeText } = useSearchCardContext();
+    const { removeDomain, confirmState: domainConfirmState } = useRemoveDomainAssets(
+        setShouldRefetchEmbeddedListSearch,
+    );
+    const { removeTerm, confirmState: termConfirmState } = useRemoveGlossaryTermAssets(
+        setShouldRefetchEmbeddedListSearch,
+    );
+    const { removeDataProduct, confirmState: dataProductConfirmState } = useRemoveDataProductAssets(
+        setShouldRefetchEmbeddedListSearch,
+    );
+    const { removeApplication, confirmState: applicationConfirmState } = useRemoveApplicationAssets(
+        setShouldRefetchEmbeddedListSearch,
+    );
+
+    const renderConfirmModal = (state: RemoveConfirmState) => (
+        <ConfirmationModal
+            isOpen={state.isOpen}
+            handleClose={state.handleClose}
+            handleConfirm={state.handleConfirm}
+            modalTitle={state.modalTitle}
+            modalText={state.modalText}
+        />
+    );
+
+    const confirmationModals = (
+        <>
+            {renderConfirmModal(domainConfirmState)}
+            {renderConfirmModal(termConfirmState)}
+            {renderConfirmModal(dataProductConfirmState)}
+            {renderConfirmModal(applicationConfirmState)}
+        </>
+    );
+
+    const { previewData } = usePreviewData();
+    const entityData = useEntityData();
+    const pageEntityType = entityData.entityType;
+
+    if (pageEntityType === EntityType.Domain) {
+        return {
+            removeRelationship: () => (onRemove ? onRemove() : removeDomain(previewData?.urn)),
+            removeButtonText:
+                showRemovalFromList && entityType !== EntityType.DataProduct
+                    ? removeText || t('removeFromDomain')
+                    : null,
+            confirmationModals,
+        };
+    }
+    if (pageEntityType === EntityType.GlossaryTerm) {
+        return {
+            removeRelationship: () => (onRemove ? onRemove() : removeTerm(previewData, entityData.urn)),
+            removeButtonText: showRemovalFromList ? removeText || t('removeGlossaryTerm') : null,
+            confirmationModals,
+        };
+    }
+    if (pageEntityType === EntityType.DataProduct) {
+        return {
+            removeRelationship: () => (onRemove ? onRemove() : removeDataProduct(previewData?.urn)),
+            removeButtonText: showRemovalFromList ? removeText || t('removeFromDataProduct') : null,
+            confirmationModals,
+        };
+    }
+    if (pageEntityType === EntityType.Application) {
+        return {
+            removeRelationship: () => (onRemove ? onRemove() : removeApplication(previewData?.urn)),
+            removeButtonText: showRemovalFromList ? removeText || t('removeFromApplication') : null,
+            confirmationModals,
+        };
+    }
+
+    return {
+        removeRelationship: () => {},
+        removeButtonText: null,
+        confirmationModals,
+    };
+}

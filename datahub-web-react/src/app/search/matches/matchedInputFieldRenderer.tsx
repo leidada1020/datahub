@@ -1,0 +1,51 @@
+import React from 'react';
+
+import { useEntityRegistry } from '@app/useEntityRegistry';
+
+import { Chart, Dashboard, EntityType, GlossaryTerm, MatchedField } from '@types';
+
+const LABEL_INDEX_NAME = 'fieldLabels';
+const TYPE_PROPERTY_KEY_NAME = 'type';
+
+const TermName = ({ term }: { term: GlossaryTerm }) => {
+    const entityRegistry = useEntityRegistry();
+    return <>{entityRegistry.getDisplayName(EntityType.GlossaryTerm, term)}</>;
+};
+
+export const matchedInputFieldParams = (matchedField: MatchedField, entity: Chart | Dashboard) => {
+    if (matchedField?.name === LABEL_INDEX_NAME) {
+        const matchedSchemaField = entity.inputFields?.fields?.find(
+            (field) => field?.schemaField?.label === matchedField.value,
+        );
+        const matchedGlossaryTerm = matchedSchemaField?.schemaField?.glossaryTerms?.terms?.find(
+            (term) => term?.term?.name === matchedField.value,
+        );
+
+        if (matchedGlossaryTerm) {
+            let termType =
+                'term'; /* untranslated-text -- dynamic value from backend custom properties; full sentence needs Trans rewrite */
+            const typeProperty = matchedGlossaryTerm.term.properties?.customProperties?.find(
+                (property) => property.key === TYPE_PROPERTY_KEY_NAME,
+            );
+            if (typeProperty) {
+                termType = typeProperty.value || termType;
+            }
+
+            return { termType, term: matchedGlossaryTerm.term };
+        }
+    }
+    return {};
+};
+
+export const matchedInputFieldRenderer = (matchedField: MatchedField, entity: Chart | Dashboard) => {
+    const { termType, term } = matchedInputFieldParams(matchedField, entity);
+
+    if (termType && term) {
+        return (
+            <>
+                {termType} <TermName term={term} />
+            </>
+        );
+    }
+    return null;
+};

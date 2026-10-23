@@ -1,0 +1,369 @@
+import logging
+import re
+import time
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Tuple
+
+from datahub.emitter.mcp import MetadataChangeProposalWrapper
+from datahub.ingestion.api.workunit import MetadataWorkUnit
+from datahub.ingestion.source.dremio.dremio_api import (
+    DremioAPIException,
+    DremioAPIOperations,
+)
+from datahub.ingestion.source.dremio.dremio_config import DremioSourceConfig
+from datahub.ingestion.source.dremio.dremio_entities import DremioDataset
+from datahub.ingestion.source.dremio.dremio_models import (
+    DremioProfilingResult,
+)
+from datahub.ingestion.source.dremio.dremio_reporting import DremioSourceReport
+from datahub.ingestion.source.state.profiling_state_handler import ProfilingHandler
+from datahub.metadata.schema_classes import (
+    DatasetFieldProfileClass,
+    DatasetProfileClass,
+    QuantileClass,
+)
+from datahub.utilities.perf_timer import PerfTimer
+
+logger = logging.getLogger(__name__)
+
+
+# Slim projection of a DremioDataset for buffering across the emission →
+# profiling boundary. Holding full DremioDataset objects for 10k+ catalogs
+# adds real memory pressure for state the profiler never reads.
+class ProfileTarget(NamedTuple):
+    dataset_urn: str
+    full_table_name: str  # already-quoted '"a"."b"."c"' identifier
+    resource_name: str
+    columns: List[Tuple[str, str]]
+
+
+def build_profile_target(dataset: DremioDataset, dataset_urn: str) -> ProfileTarget:
+    full_table_name = (
+        '"' + '"."'.join(dataset.path) + '"."' + dataset.resource_name + '"'
+    )
+    columns = [(col.name, col.data_type) for col in dataset.columns]
+    return ProfileTarget(
+        dataset_urn=dataset_urn,
+        full_table_name=full_table_name,
+        resource_name=dataset.resource_name,
+        columns=columns,
+    )
+
+
+class DremioProfiler:
+    config: DremioSourceConfig
+    report: DremioSourceReport
+    MAX_COLUMNS_PER_QUERY = 800
+
+    def __init__(
+        self,
+        config: DremioSourceConfig,
+        report: DremioSourceReport,
+        api_operations: DremioAPIOperations,
+        state_handler: Optional[ProfilingHandler] = None,
+    ) -> None:
+        self.api_operations = api_operations
+        self.config = config
+        self.report = report
+        self.state_handler = state_handler
+        self.QUERY_TIMEOUT = config.profiling.query_timeout
+
+    def get_workunits(self, target: ProfileTarget) -> Iterable[MetadataWorkUnit]:
+        if not target.columns:
+            self.report.warning(
+                message="Skipping profiling as no columns found for table",
+                context=f"{target.resource_name}",
+            )
+            self.report.profiling_skipped_other[target.resource_name] += 1
+            return
+
+        full_table_name = target.full_table_name
+        columns = target.columns
+        dataset_urn = target.dataset_urn
+
+        if not self.config.profile_pattern.allowed(full_table_name):
+            self.report.profiling_skipped_table_profile_pattern[full_table_name] += 1
+            self.report.warning(
+                message="Profiling is restricted due to the specified profile pattern.",
+                context=f"{full_table_name}",
+            )
+            return
+
+        # Stateful profiling skip: Dremio has no table-level modification timestamps,
+        # so profile_if_updated_since_days is compared against when DataHub last
+        # profiled the table rather than when the table was last modified.
+        if (
+            self.state_handler is not None
+            and self.config.profiling.profile_if_updated_since_days is not None
+        ):
+            last_profiled_ms = self.state_handler.get_last_profiled(dataset_urn)
+            if last_profiled_ms is not None:
+                days_elapsed = (time.time() * 1000 - last_profiled_ms) / (
+                    1000 * 3600 * 24
+                )
+                if days_elapsed < self.config.profiling.profile_if_updated_since_days:
+                    logger.info(
+                        f"Skipping profiling of {full_table_name}: profiled "
+                        f"{days_elapsed:.2f}d ago, threshold is "
+                        f"{self.config.profiling.profile_if_updated_since_days}d"
+                    )
+                    self.report.profiling_skipped_not_updated[full_table_name] += 1
+                    # Carry the existing timestamp forward so the next run also
+                    # has an accurate "last profiled" reference.
+                    self.state_handler.add_to_state(dataset_urn, last_profiled_ms)
+                    return
+
+        with PerfTimer() as timer:
+            profile_data = self.profile_table(full_table_name, columns)
+            profile_aspect = self.populate_profile_aspect(profile_data)
+
+        logger.info(
+            f"Profiled table {full_table_name} with {len(columns)} columns in {timer.elapsed_seconds():.2f} seconds"
+        )
+
+        if profile_aspect:
+            self.report.report_entity_profiled(target.resource_name)
+            mcp = MetadataChangeProposalWrapper(
+                entityUrn=dataset_urn, aspect=profile_aspect
+            )
+            yield mcp.as_workunit()
+
+            if self.state_handler:
+                self.state_handler.add_to_state(dataset_urn, round(time.time() * 1000))
+
+    def populate_profile_aspect(self, profile_data: Dict) -> DatasetProfileClass:
+        field_profiles = [
+            self._create_field_profile(field_name, field_stats)
+            for field_name, field_stats in profile_data.get("column_stats", {}).items()
+        ]
+        return DatasetProfileClass(
+            timestampMillis=round(time.time() * 1000),
+            rowCount=profile_data.get("row_count"),
+            columnCount=profile_data.get("column_count"),
+            fieldProfiles=field_profiles,
+        )
+
+    def _create_field_profile(
+        self, field_name: str, field_stats: Dict
+    ) -> DatasetFieldProfileClass:
+        quantiles = field_stats.get("quantiles")
+        return DatasetFieldProfileClass(
+            fieldPath=field_name,
+            uniqueCount=field_stats.get("distinct_count"),
+            nullCount=field_stats.get("null_count"),
+            min=str(field_stats.get("min")) if field_stats.get("min") else None,
+            max=str(field_stats.get("max")) if field_stats.get("max") else None,
+            mean=str(field_stats.get("mean")) if field_stats.get("mean") else None,
+            median=str(field_stats.get("median"))
+            if field_stats.get("median")
+            else None,
+            stdev=str(field_stats.get("stdev")) if field_stats.get("stdev") else None,
+            quantiles=[
+                QuantileClass(quantile=str(0.25), value=str(quantiles[0])),
+                QuantileClass(quantile=str(0.75), value=str(quantiles[1])),
+            ]
+            if quantiles
+            else None,
+            sampleValues=field_stats.get("sample_values"),
+        )
+
+    def profile_table(self, table_name: str, columns: List[Tuple[str, str]]) -> Dict:
+        chunked_columns = self._chunk_columns(columns)
+        profile_results = []
+
+        for chunk in chunked_columns:
+            try:
+                chunk_result = self._profile_chunk(table_name, chunk)
+                profile_results.append(chunk_result)
+            except DremioAPIException as e:
+                self.report.profiling_skipped_other[table_name] += 1
+                profile_results.append(self._create_empty_profile_result(chunk))
+                self.report.warning(
+                    message="Error in profiling for table",
+                    context=f"{table_name}",
+                    exc=e,
+                )
+        return self._combine_profile_results(profile_results)
+
+    def _profile_chunk(self, table_name: str, columns: List[Tuple[str, str]]) -> Dict:
+        profile_sql = self._build_profile_sql(table_name, columns)
+        try:
+            with PerfTimer() as timer:
+                results = self.api_operations.execute_query(
+                    profile_sql, timeout=self.QUERY_TIMEOUT
+                )
+
+            logger.debug(
+                f"Profiling query for {table_name} ({len(columns)} columns) completed in {timer.elapsed_seconds():.2f} seconds"
+            )
+            return self._parse_profile_results(results, columns)
+        except DremioAPIException as e:
+            raise e
+
+    def _chunk_columns(
+        self, columns: List[Tuple[str, str]]
+    ) -> List[List[Tuple[str, str]]]:
+        return [
+            columns[i : i + self.MAX_COLUMNS_PER_QUERY]
+            for i in range(0, len(columns), self.MAX_COLUMNS_PER_QUERY)
+        ]
+
+    def _build_profile_sql(
+        self, table_name: str, columns: List[Tuple[str, str]]
+    ) -> str:
+        metrics = []
+
+        metrics.append("COUNT(*) AS row_count")
+        metrics.append(f"{len(columns)} AS column_count")
+
+        if not self.config.profiling.profile_table_level_only:
+            for column_name, data_type in columns:
+                try:
+                    metrics.extend(self._get_column_metrics(column_name, data_type))
+                except Exception as e:
+                    logger.warning(
+                        f"Error building metrics for column {column_name}: {str(e)}"
+                    )
+
+        if not metrics:
+            raise ValueError("No valid metrics could be generated")
+
+        main_query = f"SELECT {', '.join(metrics)} FROM {table_name}"
+
+        if self.config.profiling.limit:
+            main_query += f" LIMIT {self.config.profiling.limit}"
+        if self.config.profiling.offset:
+            main_query += f" OFFSET {self.config.profiling.offset}"
+
+        return main_query
+
+    def _get_column_metrics(self, column_name: str, data_type: str) -> List[str]:
+        metrics = []
+
+        # Wrap column name in quotes to handle special characters
+        quoted_column_name = f'"{column_name}"'
+        safe_column_name = re.sub(r"\W|^(?=\d)", "_", column_name)
+
+        if self.config.profiling.include_field_distinct_count:
+            metrics.append(
+                f"COUNT(DISTINCT {quoted_column_name}) AS {safe_column_name}_distinct_count"
+            )
+
+        if self.config.profiling.include_field_null_count:
+            metrics.append(
+                f"SUM(CASE WHEN {quoted_column_name} IS NULL THEN 1 ELSE 0 END) AS {safe_column_name}_null_count"
+            )
+
+        if self.config.profiling.include_field_min_value:
+            metrics.append(f"MIN({quoted_column_name}) AS {safe_column_name}_min")
+
+        if self.config.profiling.include_field_max_value:
+            metrics.append(f"MAX({quoted_column_name}) AS {safe_column_name}_max")
+
+        if data_type.lower() in [
+            "int",
+            "integer",
+            "bigint",
+            "float",
+            "double",
+            "decimal",
+        ]:
+            if self.config.profiling.include_field_mean_value:
+                metrics.append(
+                    f"AVG(CAST({quoted_column_name} AS DOUBLE)) AS {safe_column_name}_mean"
+                )
+
+            if self.config.profiling.include_field_stddev_value:
+                metrics.append(
+                    f"STDDEV(CAST({quoted_column_name} AS DOUBLE)) AS {safe_column_name}_stdev"
+                )
+
+            if self.config.profiling.include_field_median_value:
+                metrics.append(
+                    f"MEDIAN({quoted_column_name}) AS {safe_column_name}_median"
+                )
+
+            if self.config.profiling.include_field_quantiles:
+                metrics.append(
+                    f"PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY {quoted_column_name}) AS {safe_column_name}_25th_percentile"
+                )
+                metrics.append(
+                    f"PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY {quoted_column_name}) AS {safe_column_name}_75th_percentile"
+                )
+
+        return metrics
+
+    def _parse_profile_results(
+        self, results: List[Dict], columns: List[Tuple[str, str]]
+    ) -> Dict:
+        profile: Dict[str, Any] = {"column_stats": {}}
+        result_dict = results[0] if results else {}
+        profiling_result = DremioProfilingResult.model_validate(result_dict)
+        profile["row_count"] = profiling_result.row_count
+        profile["column_count"] = profiling_result.column_count
+
+        for column_name, data_type in columns:
+            safe_column_name = re.sub(r"\W|^(?=\d)", "_", column_name)
+            col_stats = profiling_result.get_column_stats(safe_column_name)
+            column_stats: Dict[str, Any] = {}
+
+            if self.config.profiling.include_field_distinct_count:
+                column_stats["distinct_count"] = (
+                    int(col_stats.distinct_count)
+                    if col_stats.distinct_count is not None
+                    else 0
+                )
+
+            if self.config.profiling.include_field_null_count:
+                column_stats["null_count"] = (
+                    int(col_stats.null_count) if col_stats.null_count is not None else 0
+                )
+
+            if self.config.profiling.include_field_min_value:
+                column_stats["min"] = col_stats.min
+            if self.config.profiling.include_field_max_value:
+                column_stats["max"] = col_stats.max
+
+            if data_type.lower() in [
+                "int",
+                "integer",
+                "bigint",
+                "float",
+                "double",
+                "decimal",
+            ]:
+                if self.config.profiling.include_field_mean_value:
+                    column_stats["mean"] = col_stats.mean
+                if self.config.profiling.include_field_stddev_value:
+                    column_stats["stdev"] = col_stats.stdev
+                if self.config.profiling.include_field_median_value:
+                    column_stats["median"] = col_stats.median
+                if self.config.profiling.include_field_quantiles:
+                    column_stats["quantiles"] = col_stats.quantiles
+
+            profile["column_stats"][column_name] = column_stats
+
+        return profile
+
+    def _create_empty_profile_result(self, columns: List[Tuple[str, str]]) -> Dict:
+        profile: Dict[str, Any] = {"column_stats": {}}
+        for column_name, _ in columns:
+            profile["column_stats"][column_name] = {}
+        return profile
+
+    def _combine_profile_results(self, profile_results: List[Dict]) -> Dict:
+        combined_profile: Dict[str, Any] = {}
+        # Every chunk re-queries COUNT(*) on the same table, so summing
+        # multiplied the row count by the chunk count for >800-column tables.
+        combined_profile["row_count"] = max(
+            (profile.get("row_count", 0) or 0 for profile in profile_results),
+            default=0,
+        )
+        combined_profile["column_count"] = sum(
+            profile.get("column_count", 0) for profile in profile_results
+        )
+        combined_profile["column_stats"] = {}
+
+        for profile in profile_results:
+            combined_profile["column_stats"].update(profile.get("column_stats", {}))
+
+        return combined_profile

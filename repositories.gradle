@@ -1,0 +1,11 @@
+// Used for buildscript dependency resolution (applied in buildSrc and root build.gradle buildscript blocks).
+// Project dependency resolution is centralized via dependencyResolutionManagement in settings.gradle.
+// URLs are resolved (with legacy-property fallback) in settings.gradle / buildSrc/settings.gradle and
+// stored in gradle.ext before this script is ever evaluated.
+repositories {
+    gradlePluginPortal()
+    mavenLocal()
+    maven { url = gradle.ext['datahub.dependencies.maven.central'] }
+    maven { url = gradle.ext['datahub.dependencies.maven.confluent'] }
+    maven { url = gradle.ext['datahub.dependencies.maven.linkedinOpenSource'] } // GMA, pegasus
+}

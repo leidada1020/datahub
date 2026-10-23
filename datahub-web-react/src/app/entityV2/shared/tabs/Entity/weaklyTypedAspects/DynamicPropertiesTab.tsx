@@ -1,0 +1,50 @@
+import { Typography } from 'antd';
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { StyledTable } from '@app/entityV2/shared/components/styled/StyledTable';
+import TableValueElement from '@app/entityV2/shared/tabs/Entity/weaklyTypedAspects/TableValueElement';
+
+type Props = {
+    payload: string | undefined | null;
+};
+
+const NameText = styled(Typography.Text)`
+    font-weight: 600;
+    font-size: 12px;
+    color: ${(props) => props.theme.colors.text};
+`;
+
+export default function DynamicTabularTab({ payload: rawPayload }: Props) {
+    const { t: tc } = useTranslation('common.labels');
+    const aspectData = JSON.parse(rawPayload || '{}');
+    const transformedRowData = Object.keys(aspectData).map((key) => ({ key, value: aspectData[key] }));
+
+    const propertyTableColumns = [
+        {
+            width: 210,
+            title: tc('name'),
+            dataIndex: 'key',
+            sorter: (a, b) => a?.key?.localeCompare(b?.key || '') || 0,
+            defaultSortOrder: 'ascend',
+            render: (name: string) => <NameText>{name}</NameText>,
+        },
+        {
+            title: tc('value'),
+            dataIndex: 'value',
+            render: (value: string) => <TableValueElement value={value} />,
+        },
+    ];
+
+    return (
+        <StyledTable
+            pagination={false}
+            // typescript is complaining that default sort order is not a valid column field- overriding this here
+            // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+            // @ts-ignore
+            columns={propertyTableColumns}
+            dataSource={transformedRowData}
+        />
+    );
+}

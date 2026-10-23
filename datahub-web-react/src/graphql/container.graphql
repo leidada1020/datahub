@@ -1,0 +1,102 @@
+query getContainer($urn: String!) {
+    container(urn: $urn) {
+        urn
+        type
+        exists
+        lastIngested
+        platform {
+            ...platformFields
+        }
+        properties {
+            name
+            qualifiedName
+            description
+            externalUrl
+            customProperties {
+                key
+                value
+            }
+            created {
+                time
+            }
+        }
+        privileges {
+            ...entityPrivileges
+        }
+        editableProperties {
+            description
+        }
+        ownership {
+            ...ownershipFields
+        }
+        tags {
+            ...globalTagsFields
+        }
+        institutionalMemory {
+            ...institutionalMemoryFields
+        }
+        glossaryTerms {
+            ...glossaryTerms
+        }
+        subTypes {
+            typeNames
+        }
+        entities(input: { start: 0, count: 1 }) {
+            total
+        }
+        container {
+            ...entityContainer
+        }
+        parentContainers {
+            ...parentContainersFields
+        }
+        domain {
+            ...entityDomain
+        }
+        ...entityDataProduct
+        deprecation {
+            ...deprecationFields
+        }
+        dataPlatformInstance {
+            ...dataPlatformInstanceFields
+        }
+        status {
+            removed
+        }
+        access {
+            roles {
+                role {
+                    urn
+                }
+            }
+        }
+        autoRenderAspects: aspects(input: { autoRenderOnly: true }) {
+            ...autoRenderAspectFields
+        }
+        structuredProperties {
+            properties {
+                ...structuredPropertiesFields
+            }
+        }
+        browsePathV2 {
+            ...browsePathV2Fields
+        }
+        ...notes
+    }
+}
+
+# We should replace this with a cached summary object on the container
+query getContainerEntitySummary($urn: String!) {
+    aggregateAcrossEntities(
+        input: {
+            types: []
+            query: "*"
+            facets: ["_entityType␞typeNames", "_entityType"]
+            orFilters: [{ and: [{ field: "container", values: [$urn] }] }]
+        }
+    ) {
+        facets {
+            ...facetFields
+        }
+    }
+}

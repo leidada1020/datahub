@@ -1,0 +1,117 @@
+import React, { useState } from 'react';
+import { useDebounce } from 'react-use';
+
+import OptionsDropdownMenu from '@app/searchV2/filters/OptionsDropdownMenu';
+import { mapFilterOption } from '@app/searchV2/filters/mapFilterOption';
+import { FilterField, FilterValue, FilterValueOption } from '@app/searchV2/filters/types';
+import { getFilterDisplayName, useFilterDisplayName } from '@app/searchV2/filters/utils';
+import { OptionMenu } from '@app/searchV2/filters/value/styledComponents';
+import {
+    deduplicateOptions,
+    useFilterOptionsBySearchQuery,
+    useLoadAggregationOptions,
+} from '@app/searchV2/filters/value/utils';
+import { useEntityRegistry } from '@app/useEntityRegistry';
+import { EntityType } from '@src/types.generated';
+
+const DEBOUNCE_MS = 300;
+
+interface Props {
+    field: FilterField;
+    values: FilterValue[];
+    defaultOptions: FilterValueOption[];
+    onChangeValues: (newValues: FilterValue[]) => void;
+    onApply: () => void;
+    type?: 'card' | 'default';
+    includeCount?: boolean;
+    className?: string;
+    aggregationsEntityTypes?: Array<EntityType>;
+    showDefaultOptions?: boolean;
+}
+
+export default function EnumValueMenu({
+    field,
+    values,
+    includeCount = false,
+    defaultOptions,
+    type = 'card',
+    onChangeValues,
+    onApply,
+    className,
+    aggregationsEntityTypes,
+    showDefaultOptions = true,
+}: Props) {
+    const entityRegistry = useEntityRegistry();
+    const displayName = useFilterDisplayName(field);
+
+    // Ideally we would not have staged values, and filters would update automatically.
+    const [searchQuery, setSearchQuery] = useState<string | undefined>(undefined);
+
+    // Debounce the value that drives the server-side aggregation query so we don't fire
+    // an aggregateAcrossEntities request on every keystroke. The raw searchQuery still
+    // drives the input and local (client-side) option filtering for instant feedback.
+    const [debouncedSearchQuery, setDebouncedSearchQuery] = useState<string | undefined>(undefined);
+    useDebounce(() => setDebouncedSearchQuery(searchQuery), DEBOUNCE_MS, [searchQuery]);
+
+    // Here we optionally load the aggregation options, which are the options that are displayed by default.
+    const { options: aggOptions, loading: aggLoading } = useLoadAggregationOptions({
+        field,
+        visible: showDefaultOptions,
+        includeCounts: includeCount,
+        aggregationsEntityTypes,
+    });
+
+    const optionsWithAggs = [...defaultOptions, ...deduplicateOptions(defaultOptions, aggOptions)];
+
+    // Do an aggregations query with the given search query as a filter to find any values not in the first set of results
+    const { options: searchAggOptions, loading: searchAggsLoading } = useLoadAggregationOptions({
+        field,
+        visible: !!debouncedSearchQuery, // only run this query if there's a (debounced) search query
+        includeCounts: includeCount,
+        aggregationsEntityTypes,
+        extraOrFilters: [{ and: [{ field: field.field, values: [debouncedSearchQuery || ''] }] }],
+        removeOptionsWithNoCount: true,
+    });
+
+    const allOptions = [...optionsWithAggs, ...deduplicateOptions(optionsWithAggs, searchAggOptions)];
+
+    const localSearchOptions = useFilterOptionsBySearchQuery(allOptions, searchQuery);
+
+    // Compute the final options to show to the user.
+    const finalOptions = searchQuery ? localSearchOptions : allOptions;
+
+    const filterMenuOptions = finalOptions.map((option) =>
+        mapFilterOption({
+            filterOption: {
+                field: field.field,
+                value: option.value,
+                count: option.count,
+                entity: option.entity,
+                displayName: getFilterDisplayName(option, field),
+            },
+            entityRegistry,
+            selectedFilterOptions: values.map((value) => {
+                return { field: field.field, value: value.value };
+            }),
+            setSelectedFilterOptions: (newOptions) =>
+                onChangeValues(
+                    newOptions.map((op) => {
+                        return { field: field.field, value: op.value, entity: null };
+                    }),
+                ),
+        }),
+    );
+
+    return (
+        <OptionsDropdownMenu
+            menu={<OptionMenu items={filterMenuOptions} />}
+            updateFilters={onApply}
+            searchQuery={searchQuery || ''}
+            updateSearchQuery={setSearchQuery}
+            isLoading={aggLoading || searchAggsLoading}
+            searchPlaceholder={displayName}
+            type={type}
+            className={className}
+        />
+    );
+}

@@ -1,0 +1,58 @@
+namespace com.linkedin.form
+
+import com.linkedin.common.Urn
+
+record FormActorAssignment {
+  /**
+   * Whether the form should be assigned to the owners of assets that it is applied to.
+   * This is the default.
+   */
+  @Searchable = {
+    "fieldName": "isOwnershipForm",
+    "fieldType": "BOOLEAN",
+  }
+  owners: boolean = true
+
+  /**
+   * Optional: Specific ownership types to filter which owners are assigned.
+   * When specified, only owners with these ownership types will be assigned the form.
+   * If not specified and owners=true, all owners will be assigned regardless of type.
+   * Supports both built-in types (e.g., urn:li:ownershipType:__system__technical_owner)
+   * and custom ownership types.
+   */
+  @Relationship = {
+    "/*": {
+      "name": "FormAssignedToOwnershipType",
+      "entityTypes": [ "ownershipType" ]
+    }
+  }
+  @Searchable = {
+    "/*": {
+      "fieldName": "assignedOwnershipTypes",
+      "fieldType": "URN"
+    }
+  }
+  ownershipTypes: optional array[Urn]
+
+  /**
+   * Optional: Specific set of groups that are targeted by this form assignment.
+   */
+  @Searchable = {
+    "/*": {
+      "fieldName": "assignedGroups",
+      "fieldType": "URN"
+    }
+  }
+  groups: optional array[Urn]
+
+  /**
+   * Optional: Specific set of users that are targeted by this form assignment.
+   */
+  @Searchable = {
+    "/*": {
+      "fieldName": "assignedUsers",
+      "fieldType": "URN"
+    }
+  }
+  users: optional array[Urn]
+}

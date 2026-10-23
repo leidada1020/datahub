@@ -1,0 +1,247 @@
+import { Button, Table } from 'antd';
+import { ColumnsType } from 'antd/es/table';
+import { FixedType } from 'rc-table/lib/interface';
+import React, { useMemo, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useDebounce } from 'react-use';
+import styled from 'styled-components';
+
+import { useEntityData } from '@app/entity/shared/EntityContext';
+import useSchemaTitleRenderer from '@app/entityV2/dataset/profile/schema/utils/schemaTitleRenderer';
+import { ExtendedSchemaFields } from '@app/entityV2/dataset/profile/schema/utils/types';
+import ExpandIcon from '@app/entityV2/shared/tabs/Dataset/Schema/components/ExpandIcon';
+import SchemaFieldDrawer from '@app/entityV2/shared/tabs/Dataset/Schema/components/SchemaFieldDrawer/SchemaFieldDrawer';
+import useKeyboardControls from '@app/entityV2/shared/tabs/Dataset/Schema/useKeyboardControls';
+import useDescriptionRenderer from '@app/entityV2/shared/tabs/Dataset/Schema/utils/useDescriptionRenderer';
+import useEditableSchemaFieldInfoMaps from '@app/entityV2/shared/tabs/Dataset/Schema/utils/useEditableSchemaFieldInfoMaps';
+import useExtractFieldDescriptionInfo from '@app/entityV2/shared/tabs/Dataset/Schema/utils/useExtractFieldDescriptionInfo';
+import useUsageStatsRenderer from '@app/entityV2/shared/tabs/Dataset/Schema/utils/useUsageStatsRenderer';
+import { useEntityRegistry } from '@app/useEntityRegistry';
+import translateFieldPath from '@src/app/entityV2/dataset/profile/schema/utils/translateFieldPath';
+import { resolveRuntimePath } from '@utils/runtimeBasePath';
+
+import { EditableSchemaMetadata, EntityType, SchemaField, SchemaMetadata, UsageQueryResult } from '@types';
+
+type Props = {
+    rows: Array<ExtendedSchemaFields>;
+    schemaMetadata: SchemaMetadata | undefined | null;
+    editableSchemaMetadata?: EditableSchemaMetadata | null;
+    usageStats?: UsageQueryResult | null;
+    fullHeight?: boolean;
+    expandedRowsFromFilter?: Set<string>;
+    expandedDrawerFieldPath: string | null;
+    setExpandedDrawerFieldPath: (path: string | null) => void;
+    openTimelineDrawer?: boolean;
+    setOpenTimelineDrawer?: any;
+    inputFields?: SchemaField[];
+    refetch?: () => void;
+};
+
+const TableContainer = styled.div<{ fullHeight?: boolean }>`
+    margin-top: ${(props) => (props.fullHeight ? '0px' : '5px')};
+    margin-left: ${(props) => (props.fullHeight ? '12px' : '0px')};
+    .ant-table-thead > tr > th {
+        background-color: transparent;
+        font-weight: 600;
+        color: ${(props) => props.theme.colors.text};
+        font-weight: 700;
+    }
+    &&& .ant-table-cell:first-of-type {
+        ${(props) => !props.fullHeight && 'padding: 8px 8px 8px 0px'};
+    }
+
+    &&& .selected-row * {
+        color: ${(props) => props.theme.colors.textOnFillBrand};
+        background-color: ${(props) => props.theme.colors.bgSurfaceBrand};
+    }
+
+    &&& .field-column {
+        max-width: 100px;
+    }
+
+    &&& .description-column {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        max-width: 100px;
+    }
+`;
+
+const StyledButton = styled(Button)`
+    color: ${(props) => props.theme.colors.textTertiary};
+    font-weight: 500;
+    :hover {
+        color: ${(props) => props.theme.colors.text};
+    }
+`;
+
+const KEYBOARD_CONTROL_DEBOUNCE_MS = 50;
+const SCROLL_X = 'auto';
+
+export default function CompactSchemaTable({
+    rows,
+    schemaMetadata,
+    editableSchemaMetadata,
+    usageStats,
+    fullHeight,
+    inputFields,
+    expandedDrawerFieldPath,
+    setExpandedDrawerFieldPath,
+    openTimelineDrawer = false,
+    setOpenTimelineDrawer,
+    refetch,
+}: Props): JSX.Element {
+    const { t } = useTranslation('entity.profile.schema');
+    const { t: tc } = useTranslation('common.labels');
+    const numberOfRowsToShow = fullHeight ? 20 : 5;
+    const { urn } = useEntityData();
+    const entityRegistry = useEntityRegistry();
+
+    const hasUsageStats = useMemo(() => (usageStats?.aggregations?.fields?.length || 0) > 0, [usageStats]);
+
+    const fieldInfoMaps = useEditableSchemaFieldInfoMaps(editableSchemaMetadata);
+    const descriptionRender = useDescriptionRenderer(editableSchemaMetadata, true, fieldInfoMaps);
+    const usageStatsRenderer = useUsageStatsRenderer(usageStats);
+
+    const schemaTitleRenderer = useSchemaTitleRenderer(urn, schemaMetadata, '', true);
+
+    const shortenedRows = useMemo(() => rows.slice(0, numberOfRowsToShow), [rows, numberOfRowsToShow]);
+    const hasSeeMore = rows.length > numberOfRowsToShow;
+
+    const schemaFields = schemaMetadata ? schemaMetadata.fields : inputFields;
+    const [schemaFieldDrawerFieldPath, setSchemaFieldDrawerFieldPath] = useState(expandedDrawerFieldPath);
+    useDebounce(() => setSchemaFieldDrawerFieldPath(expandedDrawerFieldPath), KEYBOARD_CONTROL_DEBOUNCE_MS, [
+        expandedDrawerFieldPath,
+    ]);
+
+    const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
+
+    const { selectPreviousField, selectNextField } = useKeyboardControls(
+        shortenedRows,
+        expandedDrawerFieldPath,
+        setExpandedDrawerFieldPath,
+        expandedRows,
+        setExpandedRows,
+    );
+
+    const extractFieldDescription = useExtractFieldDescriptionInfo(editableSchemaMetadata, fieldInfoMaps);
+
+    const fieldColumn = {
+        fixed: 'left' as FixedType,
+        width: 100,
+        title: tc('name'),
+        dataIndex: 'fieldPath',
+        key: 'fieldPath',
+        className: 'field-column',
+        render: schemaTitleRenderer,
+        filtered: true,
+        onCell: () => ({
+            style: {
+                whiteSpace: 'pre' as any,
+            },
+        }),
+        sorter: (sourceA, sourceB) =>
+            translateFieldPath(sourceA.fieldPath).localeCompare(translateFieldPath(sourceB.fieldPath)),
+    };
+
+    const descriptionColumn = {
+        ellipsis: true,
+        width: 600,
+        title: tc('description'),
+        dataIndex: 'description',
+        key: 'description',
+        className: 'description-column',
+        render: descriptionRender,
+        onCell: () => ({
+            style: {
+                whiteSpace: 'pre' as any,
+                textWrap: 'whitespace',
+            },
+        }),
+        sorter: (sourceA, sourceB) =>
+            (extractFieldDescription(sourceA).sanitizedDescription ? 1 : 0) -
+            (extractFieldDescription(sourceB).sanitizedDescription ? 1 : 0),
+    };
+
+    // Function to get the count of each usageStats fieldPath
+    function getCount(fieldPath: any) {
+        const data: any =
+            usageStats?.aggregations?.fields &&
+            usageStats?.aggregations?.fields?.find((field) => {
+                return field?.fieldName === fieldPath;
+            });
+        return (data && data.count) ?? 0;
+    }
+
+    const usageColumn = {
+        width: '100',
+        title: tc('usage'),
+        dataIndex: 'fieldPath',
+        key: 'usage',
+        render: usageStatsRenderer,
+        sorter: (sourceA, sourceB) => getCount(sourceA.fieldPath) - getCount(sourceB.fieldPath),
+    };
+
+    let allColumns: ColumnsType<ExtendedSchemaFields> = [fieldColumn, descriptionColumn];
+
+    if (hasUsageStats) {
+        allColumns = [...allColumns, usageColumn];
+    }
+
+    const rowClassName = (record) => {
+        let className = '';
+
+        if (expandedDrawerFieldPath === record.fieldPath) {
+            className += 'selected-row';
+        } else {
+            className = 'row';
+        }
+
+        return className;
+    };
+
+    return (
+        <TableContainer fullHeight={fullHeight}>
+            <Table
+                size="small"
+                columns={allColumns}
+                dataSource={shortenedRows}
+                rowKey="fieldPath"
+                pagination={false}
+                rowClassName={rowClassName}
+                onRow={(record) => ({
+                    id: `column-${record.fieldPath}`,
+                })}
+                scroll={{ x: SCROLL_X }}
+                expandable={{
+                    expandIcon: (props) => <ExpandIcon {...props} isCompact />,
+                }}
+            />
+            {hasSeeMore && (
+                <StyledButton
+                    type="text"
+                    size="small"
+                    href={resolveRuntimePath(entityRegistry.getEntityUrl(EntityType.Dataset, urn))}
+                >
+                    {t('compactSchemaTable.viewMore', { count: rows.length - numberOfRowsToShow })}
+                </StyledButton>
+            )}
+            {!!schemaFields && (
+                <SchemaFieldDrawer
+                    schemaFields={schemaFields}
+                    expandedDrawerFieldPath={schemaFieldDrawerFieldPath}
+                    editableSchemaMetadata={editableSchemaMetadata}
+                    setExpandedDrawerFieldPath={setExpandedDrawerFieldPath}
+                    openTimelineDrawer={openTimelineDrawer}
+                    setOpenTimelineDrawer={setOpenTimelineDrawer}
+                    selectPreviousField={selectPreviousField}
+                    selectNextField={selectNextField}
+                    usageStats={usageStats}
+                    displayedRows={shortenedRows}
+                    refetch={refetch}
+                    mask
+                />
+            )}
+        </TableContainer>
+    );
+}

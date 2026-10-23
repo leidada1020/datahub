@@ -1,0 +1,36 @@
+import { Empty } from 'antd';
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { useEntityData } from '@app/entity/shared/EntityContext';
+import { safeUrl } from '@app/sharedV2/urlUtils';
+
+const EmbedContainer = styled.div`
+    width: 100%;
+    height: 100%;
+`;
+
+const StyledIframe = styled.iframe`
+    width: 100%;
+    height: 100%;
+`;
+
+const StyledEmpty = styled(Empty)`
+    margin-top: 28px;
+    font-size: 16px;
+    color: ${(props) => props.theme.colors.textSecondary};
+`;
+
+export const EmbedTab = () => {
+    const { entityData } = useEntityData();
+    const { t } = useTranslation('entity.profile.tabs');
+    const embedRenderUrl = entityData?.embed?.renderUrl;
+    return (
+        <EmbedContainer>
+            {(embedRenderUrl && (
+                <StyledIframe src={safeUrl(embedRenderUrl)} title={entityData?.urn} frameBorder={0} />
+            )) || <StyledEmpty description={t('embed.noPreview')} />}
+        </EmbedContainer>
+    );
+};

@@ -1,0 +1,131 @@
+import React from 'react';
+
+import { AppConfig, PersonalSidebarSection, PoliciesConfig, SearchBarApi } from '@types';
+
+export type AppConfigWithoutPolicyPrivileges = Omit<AppConfig, 'policiesConfig'> & {
+    policiesConfig: Omit<PoliciesConfig, 'platformPrivileges' | 'resourcePrivileges'>;
+};
+
+export const DEFAULT_APP_CONFIG = {
+    analyticsConfig: {
+        enabled: false,
+    },
+    policiesConfig: {
+        enabled: false,
+        platformPrivileges: [],
+        resourcePrivileges: [],
+    },
+    identityManagementConfig: {
+        enabled: false,
+    },
+    managedIngestionConfig: {
+        enabled: false,
+    },
+    lineageConfig: {
+        supportsImpactAnalysis: false,
+    },
+    visualConfig: {
+        logoUrl: undefined,
+        queriesTab: {
+            queriesTabResultSize: 5,
+        },
+        entityProfiles: {
+            domain: {
+                defaultTab: null,
+            },
+        },
+        searchResult: {
+            enableNameHighlight: false,
+        },
+    },
+    authConfig: {
+        tokenAuthEnabled: false,
+        allowNoExpiry: false,
+        allowedAccessTokenDurations: ['PT1H', 'P1D', 'P7D', 'P30D', 'P90D', 'P180D', 'P365D'],
+    },
+    telemetryConfig: {
+        enableThirdPartyLogging: false,
+    },
+    testsConfig: {
+        enabled: false,
+    },
+    viewsConfig: {
+        enabled: false,
+    },
+    searchBarConfig: {
+        apiVariant: SearchBarApi.AutocompleteForMultiple,
+    },
+    searchCardConfig: {
+        showDescription: false,
+    },
+    searchFlagsConfig: {
+        defaultSkipHighlighting: false,
+    },
+    homePageConfig: {
+        firstInPersonalSidebar: PersonalSidebarSection.YourAssets,
+    },
+    featureFlags: {
+        readOnlyModeEnabled: false,
+        showSearchFiltersV2: true,
+        showBrowseV2: true,
+        showAcrylInfo: false,
+        erModelRelationshipFeatureEnabled: false,
+        showAccessManagement: false,
+        nestedDomainsEnabled: true,
+        platformBrowseV2: false,
+        browserTracingEnabled: false,
+        browserWebVitalsEnabled: false,
+        businessAttributeEntityEnabled: false,
+        dataContractsEnabled: false,
+        editableDatasetNameEnabled: false,
+        themeV2Enabled: false,
+        themeV2Default: false,
+        themeV2Toggleable: false,
+        themeDarkModeEnabled: false,
+        showSeparateSiblings: false,
+        schemaFieldCLLEnabled: false,
+        schemaFieldLineageIgnoreStatus: false,
+        showManageStructuredProperties: false,
+        hideDbtSourceInLineage: false,
+        showNavBarRedesign: false,
+        showAutoCompleteResults: false,
+        entityVersioningEnabled: false,
+        showHasSiblingsFilter: false,
+        showSearchBarAutocompleteRedesign: false,
+        showManageTags: false,
+        showIntroducePage: false,
+        showIngestionPageRedesign: false,
+        ingestionOnboardingRedesignV1: false,
+        showLineageExpandMore: false,
+        showLineageFilterNodes: false,
+        showDefaultExternalLinks: true,
+        showStatsTabRedesign: false,
+        showHomePageRedesign: false,
+        showProductUpdates: false,
+        logicalModelsEnabled: false,
+        showHomepageUserRole: false,
+        assetSummaryPageV1: false,
+        datasetSummaryPageV1: false,
+        metricsEnabled: false,
+        documentationFileUploadV1: false,
+        contextDocumentsEnabled: false,
+        documentExplicitSaveEnabled: false,
+        hideLineageInSearchCards: false,
+        dataProductLineageEnabled: false,
+        glossaryBasedPoliciesEnabled: false,
+        structuredPropertiesInPoliciesEnabled: false,
+        multipleDataProductsPerAsset: false,
+        showTestsInHealthIcon: false,
+        i18nEnabled: true,
+    },
+    chromeExtensionConfig: {
+        enabled: false,
+        lineageEnabled: false,
+    },
+};
+
+export const AppConfigContext = React.createContext<{
+    config: AppConfigWithoutPolicyPrivileges;
+    loaded: boolean;
+    refreshContext: () => void;
+}>({ config: DEFAULT_APP_CONFIG, loaded: false, refreshContext: () => null });

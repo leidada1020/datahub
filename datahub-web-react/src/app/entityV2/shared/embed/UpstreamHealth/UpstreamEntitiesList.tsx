@@ -1,0 +1,105 @@
+import { Divider } from 'antd';
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { GenericEntityProperties } from '@src/app/entity/shared/types';
+import { EntityLinkList } from '@src/app/homeV2/reference/sections/EntityLinkList';
+
+type Props = {
+    directEntities: GenericEntityProperties[];
+    indirectEntities: GenericEntityProperties[];
+    loadMoreDirectEntities: () => void;
+    loadMoreIndirectEntities: () => void;
+    remainingDirectEntities: number;
+    remainingIndirectEntities: number;
+    showHealthIcon?: boolean;
+    showDeprecatedIcon?: boolean;
+};
+
+const Container = styled.div`
+    padding: 10px;
+    background-color: ${(props) => props.theme.colors.bgSurface};
+`;
+
+const StyledDivider = styled(Divider)`
+    margin: 12px 0;
+`;
+
+const SubHeader = styled.div`
+    font-weight: 700;
+`;
+
+const Content = styled.div`
+    padding: 0 3px;
+`;
+
+const ShowMoreWrapper = styled.div`
+    margin-top: 5px;
+    display: flex;
+    justify-content: end;
+    font-weight: 600;
+    color: ${(props) => props.theme.colors.textTertiary};
+    font-size: 12px;
+`;
+
+const UpstreamEntitiesList = ({
+    directEntities,
+    indirectEntities,
+    loadMoreDirectEntities,
+    loadMoreIndirectEntities,
+    remainingDirectEntities,
+    remainingIndirectEntities,
+    showHealthIcon,
+    showDeprecatedIcon,
+}: Props) => {
+    const { t } = useTranslation('entity.shared.stats');
+    const { t: tc } = useTranslation('common.actions');
+    return (
+        <Container>
+            <Content>
+                {!!directEntities.length && (
+                    <>
+                        <SubHeader>{t('upstream.directUpstreams')}</SubHeader>
+                        <EntityLinkList
+                            entities={directEntities}
+                            loading={false}
+                            showMore={!!remainingDirectEntities}
+                            showMoreCount={remainingDirectEntities}
+                            onClickMore={loadMoreDirectEntities}
+                            showMoreComponent={
+                                <ShowMoreWrapper>
+                                    {tc('showCountMoreCapitalized', { count: remainingDirectEntities })}
+                                </ShowMoreWrapper>
+                            }
+                            showHealthIcon={showHealthIcon}
+                            showDeprecatedIcon={showDeprecatedIcon}
+                        />
+                    </>
+                )}
+
+                {!!indirectEntities.length && (
+                    <>
+                        {!!directEntities.length && <StyledDivider />}
+                        <SubHeader>{t('upstream.indirectUpstreams')}</SubHeader>
+                        <EntityLinkList
+                            entities={indirectEntities}
+                            loading={false}
+                            showMore={!!remainingIndirectEntities}
+                            showMoreCount={remainingIndirectEntities}
+                            onClickMore={loadMoreIndirectEntities}
+                            showMoreComponent={
+                                <ShowMoreWrapper>
+                                    {tc('showCountMoreCapitalized', { count: remainingIndirectEntities })}
+                                </ShowMoreWrapper>
+                            }
+                            showHealthIcon
+                        />
+                    </>
+                )}
+            </Content>
+        </Container>
+    );
+};
+
+export default UpstreamEntitiesList;

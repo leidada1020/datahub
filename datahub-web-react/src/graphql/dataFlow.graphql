@@ -1,0 +1,194 @@
+fragment dataFlowFields on DataFlow {
+    urn
+    type
+    exists
+    lastIngested
+    orchestrator
+    flowId
+    cluster
+    platform {
+        ...platformFields
+    }
+    properties {
+        name
+        description
+        project
+        externalUrl
+        customProperties {
+            key
+            value
+        }
+    }
+    privileges {
+        ...entityPrivileges
+    }
+    editableProperties {
+        description
+    }
+    ownership {
+        ...ownershipFields
+    }
+    globalTags {
+        ...globalTagsFields
+    }
+    institutionalMemory {
+        ...institutionalMemoryFields
+    }
+    glossaryTerms {
+        ...glossaryTerms
+    }
+    domain {
+        ...entityDomain
+    }
+    ...entityDataProduct
+    status {
+        removed
+        lifecycleStage {
+            urn
+            name
+            description
+        }
+    }
+    deprecation {
+        ...deprecationFields
+    }
+    dataPlatformInstance {
+        ...dataPlatformInstanceFields
+    }
+    parentContainers {
+        ...parentContainersFields
+    }
+    browsePathV2 {
+        ...browsePathV2Fields
+    }
+    health {
+        ...entityHealth
+    }
+    activeIncidents: incidents(start: 0, count: 1, state: ACTIVE) {
+        total
+    }
+    subTypes {
+        typeNames
+    }
+}
+
+query getDataFlow($urn: String!) {
+    dataFlow(urn: $urn) {
+        ...dataFlowFields
+        upstream: lineage(input: { direction: UPSTREAM, start: 0, count: 100 }) {
+            ...partialLineageResults
+        }
+        downstream: lineage(input: { direction: DOWNSTREAM, start: 0, count: 100 }) {
+            ...partialLineageResults
+        }
+        autoRenderAspects: aspects(input: { autoRenderOnly: true }) {
+            ...autoRenderAspectFields
+        }
+        structuredProperties {
+            properties {
+                ...structuredPropertiesFields
+            }
+        }
+        ...notes
+        runs(start: 0, count: 20) {
+            count
+            start
+            total
+        }
+    }
+}
+
+query getDataFlowChildJobs($urn: String!, $start: Int, $count: Int) {
+    dataFlow(urn: $urn) {
+        ...dataFlowFields
+        childJobs: relationships(input: { types: ["IsPartOf"], direction: INCOMING, start: $start, count: $count }) {
+            start
+            count
+            total
+            relationships {
+                entity {
+                    ... on DataJob {
+                        urn
+                        type
+                        jobId
+                        dataFlow {
+                            urn
+                            type
+                            orchestrator
+                            platform {
+                                ...platformFields
+                            }
+                        }
+                        ownership {
+                            ...ownershipFields
+                        }
+                        properties {
+                            name
+                            description
+                        }
+                        editableProperties {
+                            description
+                        }
+                        globalTags {
+                            ...globalTagsFields
+                        }
+                        glossaryTerms {
+                            ...glossaryTerms
+                        }
+                        deprecation {
+                            ...deprecationFields
+                        }
+                        subTypes {
+                            typeNames
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+query getDataFlowDag(
+    $urn: String!
+    $start: Int
+    $count: Int
+    $separateSiblings: Boolean
+    $startTimeMillis: Long
+    $endTimeMillis: Long
+    $includeGhostEntities: Boolean = false
+) {
+    dataFlow(urn: $urn) {
+        childJobs: relationships(input: { types: ["IsPartOf"], direction: INCOMING, start: $start, count: $count }) {
+            start
+            count
+            total
+            relationships {
+                entity {
+                    urn
+                    type
+                    ... on EntityWithRelationships {
+                        upstream: lineage(
+                            input: {
+                                direction: UPSTREAM
+                                start: 0
+                                count: 1000
+                                separateSiblings: $separateSiblings
+                                startTimeMillis: $startTimeMillis
+                                endTimeMillis: $endTimeMillis
+                                includeGhostEntities: $includeGhostEntities
+                            }
+                        ) {
+                            ...lineageV2Result
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+mutation updateDataFlow($urn: String!, $input: DataFlowUpdateInput!) {
+    updateDataFlow(urn: $urn, input: $input) {
+        urn
+    }
+}

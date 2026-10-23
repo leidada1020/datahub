@@ -1,0 +1,103 @@
+import { Plus } from '@phosphor-icons/react/dist/csr/Plus';
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import { useHistory } from 'react-router';
+import styled, { useTheme } from 'styled-components';
+
+import { useEntityData } from '@app/entity/shared/EntityContext';
+import { IconStyleType } from '@app/entityV2/Entity';
+import ContentSectionLoading from '@app/entityV2/domain/summary/ContentSectionLoading';
+import { navigateToDomainDataProducts } from '@app/entityV2/shared/containers/profile/sidebar/Domain/utils';
+import SectionActionButton from '@app/entityV2/shared/containers/profile/sidebar/SectionActionButton';
+import { DataProductMiniPreview } from '@app/entityV2/shared/links/DataProductMiniPreview';
+import {
+    SectionContainer,
+    SummaryHeaderButtonGroup,
+    SummaryTabHeaderTitle,
+    SummaryTabHeaderWrapper,
+} from '@app/entityV2/shared/summary/HeaderComponents';
+import { DOMAINS_FILTER_NAME } from '@app/searchV2/utils/constants';
+import { Carousel } from '@app/sharedV2/carousel/Carousel';
+import { useEntityRegistry } from '@app/useEntityRegistry';
+
+import { useGetSearchResultsForMultipleQuery } from '@graphql/search.generated';
+import { DataProduct, EntityType } from '@types';
+
+const ViewAllButton = styled.div`
+    color: ${(props) => props.theme.colors.textSecondary};
+    padding: 2px;
+
+    :hover {
+        cursor: pointer;
+        color: ${(props) => props.theme.colors.text};
+        text-decoration: underline;
+    }
+`;
+
+const StyledCarousel = styled(Carousel)`
+    align-items: stretch;
+`;
+
+export const DataProductsSection = () => {
+    const { t } = useTranslation('entity.types');
+    const { t: tc } = useTranslation('common.actions');
+    const { urn, entityType, entityData } = useEntityData();
+    const history = useHistory();
+    const domainUrn = entityData?.urn || '';
+    const entityRegistry = useEntityRegistry();
+    const theme = useTheme();
+
+    const { data, loading } = useGetSearchResultsForMultipleQuery({
+        skip: !domainUrn,
+        variables: {
+            input: {
+                types: [EntityType.DataProduct],
+                query: '',
+                start: 0,
+                count: 5,
+                orFilters: [{ and: [{ field: DOMAINS_FILTER_NAME, values: [domainUrn] }] }],
+                searchFlags: { skipCache: true },
+            },
+        },
+    });
+
+    const dataProducts = data?.searchAcrossEntities?.searchResults?.map((r) => r.entity) || [];
+    const numDataProducts = data?.searchAcrossEntities?.total || 0;
+
+    if (!numDataProducts) {
+        return null;
+    }
+
+    return (
+        <SectionContainer>
+            <SummaryTabHeaderWrapper>
+                <SummaryHeaderButtonGroup>
+                    <SummaryTabHeaderTitle
+                        icon={entityRegistry.getIcon(
+                            EntityType.DataProduct,
+                            16,
+                            IconStyleType.ACCENT,
+                            theme.colors.text,
+                        )}
+                        title={t('domain.dataProductsCountTitle', { count: numDataProducts })}
+                    />
+                    <SectionActionButton
+                        tip={t('dataProduct.createTitle')}
+                        icon={Plus}
+                        onClick={() => navigateToDomainDataProducts(urn, entityType, history, entityRegistry, true)}
+                    />
+                </SummaryHeaderButtonGroup>
+                <ViewAllButton onClick={() => navigateToDomainDataProducts(urn, entityType, history, entityRegistry)}>
+                    {tc('viewAll')}
+                </ViewAllButton>
+            </SummaryTabHeaderWrapper>
+            {loading && <ContentSectionLoading />}
+            <StyledCarousel>
+                {!loading &&
+                    dataProducts.map((product) => (
+                        <DataProductMiniPreview dataProduct={product as DataProduct} key={product.urn} />
+                    ))}
+            </StyledCarousel>
+        </SectionContainer>
+    );
+};

@@ -1,0 +1,288 @@
+import { ChartScatter } from '@phosphor-icons/react/dist/csr/ChartScatter';
+import { FileText } from '@phosphor-icons/react/dist/csr/FileText';
+import { Infinity } from '@phosphor-icons/react/dist/csr/Infinity';
+import { ListBullets } from '@phosphor-icons/react/dist/csr/ListBullets';
+import { TreeStructure } from '@phosphor-icons/react/dist/csr/TreeStructure';
+import { WarningCircle } from '@phosphor-icons/react/dist/csr/WarningCircle';
+import i18next from 'i18next';
+import * as React from 'react';
+
+import { GenericEntityProperties } from '@app/entity/shared/types';
+import { Entity, EntityCapabilityType, IconStyleType, PreviewType } from '@app/entityV2/Entity';
+import { Preview } from '@app/entityV2/mlFeature/preview/Preview';
+import { EntityMenuItems } from '@app/entityV2/shared/EntityDropdown/EntityMenuActions';
+import { TYPE_ICON_CLASS_NAME } from '@app/entityV2/shared/components/subtypes';
+import { EntityTabPath } from '@app/entityV2/shared/constants';
+import { getDataForEntityType } from '@app/entityV2/shared/containers/profile/entityData';
+import { lazyProfileComponent } from '@app/entityV2/shared/lazyEntityProfile';
+import {
+    DataProductSection,
+    DocumentationTab,
+    EntityProfile,
+    IncidentTab,
+    LineageTab,
+    PropertiesTab,
+    SidebarAboutSection,
+    SidebarApplicationSection,
+    SidebarDomainSection,
+    SidebarEntityHeader,
+    SidebarGlossaryTermsSection,
+    SidebarNotesSection,
+    SidebarOwnerSection,
+    SidebarStructuredProperties,
+    SidebarTagsSection,
+    StatusSection,
+} from '@app/entityV2/shared/profileChunks';
+import { SidebarTitleActionType, getDataProduct, isOutputPort } from '@app/entityV2/shared/utils';
+
+import { useGetMlFeatureQuery } from '@graphql/mlFeature.generated';
+import { EntityType, MlFeature, SearchResult } from '@types';
+
+const FeatureTableTab = lazyProfileComponent('FeatureTableTab', () =>
+    import('@app/entityV2/shared/tabs/ML/MlFeatureFeatureTableTab').then((module) => ({
+        default: module.FeatureTableTab,
+    })),
+);
+
+const headerDropdownItems = new Set([
+    EntityMenuItems.UPDATE_DEPRECATION,
+    EntityMenuItems.RAISE_INCIDENT,
+    EntityMenuItems.ANNOUNCE,
+]);
+
+/**
+ * Definition of the DataHub MLFeature entity.
+ */
+export class MLFeatureEntity implements Entity<MlFeature> {
+    type: EntityType = EntityType.Mlfeature;
+
+    icon = (fontSize?: number, styleType?: IconStyleType, color?: string) => {
+        return (
+            <ChartScatter
+                className={TYPE_ICON_CLASS_NAME}
+                size={fontSize || 14}
+                color={color || 'currentColor'}
+                weight={styleType === IconStyleType.HIGHLIGHT ? 'fill' : 'regular'}
+            />
+        );
+    };
+
+    isSearchEnabled = () => true;
+
+    isBrowseEnabled = () => false;
+
+    isLineageEnabled = () => true;
+
+    getAutoCompleteFieldName = () => 'name';
+
+    getGraphName = () => 'mlFeature';
+
+    getPathName = () => 'features';
+
+    getEntityName = () => i18next.t('entity.types:mlFeature.name');
+
+    getCollectionName = () => i18next.t('entity.types:mlFeature.namePlural');
+
+    getOverridePropertiesFromEntity = (feature?: MlFeature | null): GenericEntityProperties => {
+        return {
+            // eslint-disable-next-line
+            platform: feature?.['featureTables']?.relationships?.[0]?.entity?.platform,
+        };
+    };
+
+    useEntityQuery = useGetMlFeatureQuery;
+
+    renderProfile = (urn: string) => (
+        <EntityProfile
+            urn={urn}
+            key={urn}
+            entityType={EntityType.Mlfeature}
+            useEntityQuery={useGetMlFeatureQuery}
+            getOverrideProperties={this.getOverridePropertiesFromEntity}
+            headerDropdownItems={headerDropdownItems}
+            tabs={[
+                {
+                    name: i18next.t('entity.types:tab.featureTables'),
+                    path: EntityTabPath.FEATURE_TABLES,
+                    component: FeatureTableTab,
+                    icon: Infinity,
+                },
+                {
+                    name: i18next.t('entity.types:tab.documentation'),
+                    path: EntityTabPath.DOCUMENTATION,
+                    component: DocumentationTab,
+                    icon: FileText,
+                },
+                {
+                    name: i18next.t('entity.types:tab.lineage'),
+                    path: EntityTabPath.LINEAGE,
+                    component: LineageTab,
+                    icon: TreeStructure,
+                    supportsFullsize: true,
+                },
+                {
+                    name: i18next.t('entity.types:tab.properties'),
+                    path: EntityTabPath.PROPERTIES,
+                    component: PropertiesTab,
+                    icon: ListBullets,
+                },
+                {
+                    name: i18next.t('entity.types:tab.incidents'),
+                    path: EntityTabPath.INCIDENTS,
+                    icon: WarningCircle,
+                    component: IncidentTab,
+                    getCount: (_, mlFeature) => {
+                        return mlFeature?.mlFeature?.activeIncidents?.total;
+                    },
+                },
+            ]}
+            sidebarSections={this.getSidebarSections()}
+            sidebarTabs={this.getSidebarTabs()}
+        />
+    );
+
+    getSidebarSections = () => [
+        {
+            component: SidebarEntityHeader,
+        },
+        {
+            component: SidebarAboutSection,
+        },
+        {
+            component: SidebarNotesSection,
+        },
+        {
+            component: SidebarOwnerSection,
+        },
+        {
+            component: SidebarDomainSection,
+        },
+        {
+            component: SidebarApplicationSection,
+        },
+        {
+            component: DataProductSection,
+        },
+        {
+            component: SidebarTagsSection,
+        },
+        {
+            component: SidebarGlossaryTermsSection,
+        },
+        {
+            component: SidebarStructuredProperties,
+        },
+        {
+            component: StatusSection,
+        },
+    ];
+
+    getSidebarTabs = () => [
+        {
+            name: i18next.t('entity.types:tab.lineage'),
+            component: LineageTab,
+            description: i18next.t('entity.types:sidebar.lineageDescription'),
+            icon: TreeStructure,
+            properties: {
+                actionType: SidebarTitleActionType.LineageExplore,
+            },
+        },
+        {
+            name: i18next.t('entity.types:tab.properties'),
+            component: PropertiesTab,
+            description: i18next.t('entity.types:sidebar.propertiesDescription'),
+            icon: ListBullets,
+        },
+    ];
+
+    renderPreview = (previewType: PreviewType, data: MlFeature) => {
+        const genericProperties = this.getGenericEntityProperties(data);
+        // eslint-disable-next-line
+        const platform = data?.['featureTables']?.relationships?.[0]?.entity?.platform;
+        return (
+            <Preview
+                urn={data.urn}
+                data={genericProperties}
+                name={data.name || ''}
+                featureNamespace={data.featureNamespace || ''}
+                description={data.description}
+                owners={data.ownership?.owners}
+                platform={platform}
+                dataProduct={getDataProduct(genericProperties?.dataProduct)}
+                headerDropdownItems={headerDropdownItems}
+                previewType={previewType}
+                browsePaths={data.browsePathV2 || undefined}
+            />
+        );
+    };
+
+    renderSearch = (result: SearchResult) => {
+        const data = result.entity as MlFeature;
+        const genericProperties = this.getGenericEntityProperties(data);
+        // eslint-disable-next-line
+        const platform = data?.['featureTables']?.relationships?.[0]?.entity?.platform;
+        return (
+            <Preview
+                urn={data.urn}
+                data={genericProperties}
+                name={data.name || ''}
+                featureNamespace={data.featureNamespace || ''}
+                description={data.description || ''}
+                owners={data.ownership?.owners}
+                dataProduct={getDataProduct(genericProperties?.dataProduct)}
+                platform={platform}
+                platformInstanceId={data.dataPlatformInstance?.instanceId}
+                degree={(result as any).degree}
+                paths={(result as any).paths}
+                isOutputPort={isOutputPort(result)}
+                headerDropdownItems={headerDropdownItems}
+                browsePaths={data.browsePathV2 || undefined}
+                previewType={PreviewType.SEARCH}
+            />
+        );
+    };
+
+    displayName = (data: MlFeature) => {
+        return data.name || data.urn;
+    };
+
+    getGenericEntityProperties = (mlFeature: MlFeature) => {
+        return getDataForEntityType({
+            data: mlFeature,
+            entityType: this.type,
+            getOverrideProperties: this.getOverridePropertiesFromEntity,
+        });
+    };
+
+    getLineageVizConfig = (entity: MlFeature) => {
+        return {
+            urn: entity.urn,
+            name: entity.name,
+            type: EntityType.Mlfeature,
+            // eslint-disable-next-line
+            icon: entity?.['featureTables']?.relationships?.[0]?.entity?.platform?.properties?.logoUrl || undefined,
+            // eslint-disable-next-line
+            platform: entity?.['featureTables']?.relationships?.[0]?.entity?.platform,
+        };
+    };
+
+    supportedCapabilities = () => {
+        return new Set([
+            EntityCapabilityType.OWNERS,
+            EntityCapabilityType.GLOSSARY_TERMS,
+            EntityCapabilityType.TAGS,
+            EntityCapabilityType.DOMAINS,
+            EntityCapabilityType.DEPRECATION,
+            EntityCapabilityType.SOFT_DELETE,
+            EntityCapabilityType.DATA_PRODUCTS,
+            EntityCapabilityType.LINEAGE,
+            EntityCapabilityType.APPLICATIONS,
+            EntityCapabilityType.RELATED_DOCUMENTS,
+            EntityCapabilityType.FORMS,
+        ]);
+    };
+
+    getPlatformProperties = (data: MlFeature) => {
+        return data?.properties?.sources?.[0]?.platform;
+    };
+}

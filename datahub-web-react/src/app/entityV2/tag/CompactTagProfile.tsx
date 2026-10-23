@@ -1,0 +1,74 @@
+import { BookOpen } from '@phosphor-icons/react/dist/csr/BookOpen';
+import React, { useContext, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { matchPath, useLocation } from 'react-router';
+import styled from 'styled-components';
+
+import {
+    StyledEntitySidebarContainer,
+    StyledSidebar,
+} from '@app/entityV2/shared/containers/profile/sidebar/EntityProfileSidebar';
+import EntitySidebarSectionsTab from '@app/entityV2/shared/containers/profile/sidebar/EntitySidebarSectionsTab';
+import { EntitySidebarTabs } from '@app/entityV2/shared/containers/profile/sidebar/EntitySidebarTabs';
+import { defaultTabDisplayConfig } from '@app/entityV2/shared/containers/profile/utils';
+import { EntitySidebarTab } from '@app/entityV2/shared/types';
+import EntitySidebarContext from '@app/sharedV2/EntitySidebarContext';
+import TagStyleEntity from '@app/sharedV2/TagStyleEntity';
+import { PageRoutes } from '@conf/Global';
+
+const CompactEntityWrapper = styled.div<{ $isClosed: boolean }>`
+    ${(props) => !props.$isClosed && 'padding: 16px;'}
+    border-right: 1px solid ${(props) => props.theme.colors.border};
+    flex: 1;
+    overflow: inherit;
+`;
+
+const TabsContainer = styled.div``;
+
+interface Props {
+    urn: string;
+}
+
+/**
+ * Responsible for displaying metadata about a tag
+ */
+export default function CompactTagProfile({ urn }: Props) {
+    const { t } = useTranslation('entity.types');
+    const location = useLocation();
+    const isInSearch = matchPath(location.pathname, PageRoutes.SEARCH_RESULTS) !== null;
+    const { isClosed, width } = useContext(EntitySidebarContext);
+
+    const tabs: EntitySidebarTab[] = [
+        {
+            name: t('tab.about'),
+            icon: BookOpen,
+            component: EntitySidebarSectionsTab,
+            display: defaultTabDisplayConfig,
+        },
+    ];
+
+    const [selectedTabName, setSelectedTabName] = useState(tabs[0].name);
+    const selectedTab = tabs.find((tab) => tab.name === selectedTabName);
+
+    return (
+        <StyledEntitySidebarContainer
+            isCollapsed={isClosed}
+            $width={width}
+            id="entity-profile-sidebar"
+            isFocused={isInSearch}
+        >
+            <StyledSidebar isCard={isInSearch} isFocused={isInSearch}>
+                <CompactEntityWrapper $isClosed={isClosed}>
+                    <TagStyleEntity urn={urn} />
+                </CompactEntityWrapper>
+                <TabsContainer>
+                    <EntitySidebarTabs
+                        tabs={tabs}
+                        selectedTab={selectedTab}
+                        onSelectTab={(name) => setSelectedTabName(name)}
+                    />
+                </TabsContainer>
+            </StyledSidebar>
+        </StyledEntitySidebarContainer>
+    );
+}

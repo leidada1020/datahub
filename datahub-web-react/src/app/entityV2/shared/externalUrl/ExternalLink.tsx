@@ -1,0 +1,74 @@
+import { ArrowSquareOut } from '@phosphor-icons/react/dist/csr/ArrowSquareOut';
+import React from 'react';
+import styled from 'styled-components';
+
+import { Popover } from '@src/alchemy-components';
+import { safeUrl } from '@src/app/sharedV2/urlUtils';
+import useMeasureIfTrancated from '@src/app/sharedV2/useMeasureIfTruncated';
+
+const Link = styled.a<{ $isEntityPageHeader?: boolean }>`
+    display: flex;
+    align-items: center;
+    gap: 5px;
+
+    border-radius: 4px;
+    padding: ${(props) => (props.$isEntityPageHeader ? '6px' : '4px 6px')};
+
+    background: ${(props) => props.theme.colors.bgSelectedSubtle};
+    color: ${(props) => props.theme.colors.textBrand};
+
+    &:hover,
+    &:focus {
+        background: ${(props) => props.theme.colors.bgSelected};
+        color: ${(props) => props.theme.colors.textBrand};
+    }
+
+    max-width: 215px;
+    width: fit-content;
+`;
+
+const LabelWrapper = styled.span`
+    text-wrap: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+`;
+
+const IconWrapper = styled.span`
+    display: flex;
+    align-items: center;
+    font-size: ${4 / 3}em;
+`;
+
+const PopoverWrapper = styled.div`
+    max-width: 300px;
+    overflow-wrap: break-word;
+`;
+
+interface Props {
+    href: string;
+    label: string;
+    onClick?: React.MouseEventHandler<HTMLAnchorElement>;
+    className?: string;
+    isEntityPageHeader?: boolean;
+}
+
+export default function ExternalLink({ href, label, onClick, className, isEntityPageHeader }: Props) {
+    const { measuredRef, isHorizontallyTruncated } = useMeasureIfTrancated();
+
+    return (
+        <Popover content={isHorizontallyTruncated ? <PopoverWrapper>{label}</PopoverWrapper> : undefined}>
+            <Link
+                href={safeUrl(href)}
+                target="_blank"
+                onClick={onClick}
+                className={className}
+                $isEntityPageHeader={isEntityPageHeader}
+            >
+                <IconWrapper>
+                    <ArrowSquareOut size="1em" />
+                </IconWrapper>
+                <LabelWrapper ref={measuredRef}>{label}</LabelWrapper>
+            </Link>
+        </Popover>
+    );
+}

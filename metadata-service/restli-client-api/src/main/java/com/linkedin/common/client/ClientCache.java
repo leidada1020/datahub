@@ -1,0 +1,160 @@
+package com.linkedin.common.client;
+
+import com.github.benmanes.caffeine.cache.CacheLoader;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.Expiry;
+import com.github.benmanes.caffeine.cache.LoadingCache;
+import com.github.benmanes.caffeine.cache.Weigher;
+import com.google.common.annotations.VisibleForTesting;
+import com.linkedin.metadata.config.cache.client.ClientCacheConfig;
+import com.linkedin.metadata.utils.metrics.MetricUtils;
+import com.linkedin.metadata.utils.metrics.MicrometerMetricsRegistry;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.function.BiFunction;
+import java.util.function.Function;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+import lombok.Builder;
+import lombok.extern.slf4j.Slf4j;
+
+/**
+ * Generic cache with common configuration for limited weight, per item expiry, and batch loading
+ *
+ * @param <K> key
+ * @param <V> value
+ */
+@Slf4j
+@Builder
+public class ClientCache<K, V, C extends ClientCacheConfig> {
+  @Nonnull protected final C config;
+  @Nonnull protected final LoadingCache<K, V> cache;
+  @Nonnull private final Function<Iterable<? extends K>, Map<K, V>> loadFunction;
+  @Nonnull private final Weigher<K, V> weigher;
+  @Nonnull private final BiFunction<C, K, Integer> ttlSecondsFunction;
+
+  /** Optional per-value TTL adjustment. Used to expire negative entries faster than hits. */
+  @Nonnull private final BiFunction<V, Integer, Integer> ttlAdjustment;
+
+  public @Nullable V get(@Nonnull K key) {
+    return cache.get(key);
+  }
+
+  public @Nonnull Map<K, V> getAll(@Nonnull Iterable<? extends K> keys) {
+    return cache.getAll(keys);
+  }
+
+  public void refresh(@Nonnull K key) {
+    cache.refresh(key);
+  }
+
+  public void invalidateAll(@Nonnull Iterable<? extends K> keys) {
+    cache.invalidateAll(keys);
+  }
+
+  public Set<K> keySet() {
+    return cache.asMap().keySet();
+  }
+
+  @VisibleForTesting
+  LoadingCache<K, V> getCache() {
+    return cache;
+  }
+
+  public static class ClientCacheBuilder<K, V, C extends ClientCacheConfig> {
+
+    private BiFunction<V, Integer, Integer> ttlAdjustment = (value, configured) -> configured;
+
+    public ClientCacheBuilder<K, V, C> ttlAdjustment(
+        BiFunction<V, Integer, Integer> ttlAdjustment) {
+      this.ttlAdjustment = ttlAdjustment;
+      return this;
+    }
+
+    private ClientCacheBuilder<K, V, C> cache(LoadingCache<K, V> cache) {
+      return null;
+    }
+
+    private ClientCache<K, V, C> build() {
+      return null;
+    }
+
+    public ClientCache<K, V, C> build(MetricUtils metricUtils, Class<?> metricClazz) {
+      // loads data from entity client
+      CacheLoader<K, V> loader =
+          new CacheLoader<K, V>() {
+            @Override
+            public V load(@Nonnull K key) {
+              return loadAll(Set.of(key)).get(key);
+            }
+
+            @Override
+            @Nonnull
+            public Map<K, V> loadAll(@Nonnull Set<? extends K> keys) {
+              return loadFunction.apply(keys);
+            }
+          };
+
+      // build cache
+      Caffeine<K, V> caffeine =
+          Caffeine.newBuilder()
+              .maximumWeight(config.getMaxBytes())
+              // limit total size
+              .weigher(weigher)
+              .softValues()
+              // define per entity/aspect ttls
+              .expireAfter(
+                  new Expiry<K, V>() {
+                    public long expireAfterCreate(
+                        @Nonnull K key, @Nonnull V aspect, long currentTime) {
+                      BiFunction<V, Integer, Integer> adjust =
+                          ttlAdjustment == null ? (value, configured) -> configured : ttlAdjustment;
+                      int ttlSeconds = adjust.apply(aspect, ttlSecondsFunction.apply(config, key));
+                      if (ttlSeconds < 0) {
+                        ttlSeconds = Integer.MAX_VALUE;
+                      }
+                      return TimeUnit.SECONDS.toNanos(ttlSeconds);
+                    }
+
+                    public long expireAfterUpdate(
+                        @Nonnull K key, @Nonnull V aspect, long currentTime, long currentDuration) {
+                      return currentDuration;
+                    }
+
+                    public long expireAfterRead(
+                        @Nonnull K key, @Nonnull V aspect, long currentTime, long currentDuration) {
+                      return currentDuration;
+                    }
+                  });
+
+      if (config.isStatsEnabled()) {
+        caffeine.recordStats();
+      }
+
+      try {
+        /*
+         Caffeine 2 and 3 are mostly API-compatible but differ in the signature of
+         'CacheLoader.loadAll'.
+         Caffeine 2 creeping into the classpath of code meant for Caffeine 3 leads to silent but
+         non-critical issues so we want a warning.
+        */
+        CacheLoader.class.getMethod("loadAll", Set.class);
+      } catch (NoSuchMethodException | SecurityException e) {
+        log.warn(
+            "Could not find CacheLoader.loadAll(Set<>). Please ensure classpath does not contain Caffeine 2");
+      }
+
+      LoadingCache<K, V> cache = caffeine.build(loader);
+
+      if (config.isStatsEnabled() && metricUtils != null) {
+        MicrometerMetricsRegistry.registerCacheMetrics(
+            config.getName(), cache, metricUtils.getRegistry());
+      }
+
+      BiFunction<V, Integer, Integer> adjust =
+          ttlAdjustment == null ? (value, configured) -> configured : ttlAdjustment;
+      return new ClientCache<>(config, cache, loadFunction, weigher, ttlSecondsFunction, adjust);
+    }
+  }
+}

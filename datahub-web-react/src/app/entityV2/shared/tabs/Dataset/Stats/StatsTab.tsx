@@ -1,0 +1,113 @@
+import React, { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { useBaseEntity } from '@app/entity/shared/EntityContext';
+import StatsHeader from '@app/entityV2/shared/tabs/Dataset/Stats/StatsHeader';
+import HistoricalStats from '@app/entityV2/shared/tabs/Dataset/Stats/historical/HistoricalStats';
+import { LOOKBACK_WINDOWS, LookbackWindow } from '@app/entityV2/shared/tabs/Dataset/Stats/lookbackWindows';
+import ColumnStats from '@app/entityV2/shared/tabs/Dataset/Stats/snapshot/ColumnStats';
+import TableStats from '@app/entityV2/shared/tabs/Dataset/Stats/snapshot/TableStats';
+import { ViewType } from '@app/entityV2/shared/tabs/Dataset/Stats/viewType';
+import { toLocalDateString, toLocalDateTimeString, toLocalTimeString } from '@app/sharedV2/time/timeUtils';
+
+import { GetDatasetQuery, useGetLastMonthUsageAggregationsQuery } from '@graphql/dataset.generated';
+import { Operation, UsageQueryResult } from '@types';
+
+const SectionWrapper = styled.div`
+    overflow-y: auto;
+`;
+
+export default function StatsTab() {
+    const { t } = useTranslation('entity.profile.stats');
+    const baseEntity = useBaseEntity<GetDatasetQuery>();
+
+    const [viewType, setViewType] = useState(ViewType.LATEST);
+    const [lookbackWindow, setLookbackWindow] = useState<LookbackWindow>(LOOKBACK_WINDOWS.QUARTER);
+
+    const { data: usageStatsData } = useGetLastMonthUsageAggregationsQuery({
+        variables: { urn: baseEntity?.dataset?.urn as string },
+        skip: !baseEntity?.dataset?.urn,
+    });
+
+    const hasUsageStats = usageStatsData?.dataset?.usageStats !== undefined;
+
+    const hasOperations = baseEntity?.dataset?.operations !== undefined;
+
+    const usageStats = (hasUsageStats && (usageStatsData?.dataset?.usageStats as UsageQueryResult)) || undefined;
+
+    const latestFullTableProfile = baseEntity?.dataset?.latestFullTableProfile?.[0];
+    const latestPartitionProfile = baseEntity?.dataset?.latestPartitionProfile?.[0];
+
+    // Used for rendering latest stats.
+    const urn = baseEntity && baseEntity.dataset && baseEntity.dataset?.urn;
+
+    // Used for rendering operation info.
+    const operations = (hasOperations && (baseEntity?.dataset?.operations as Array<Operation>)) || undefined;
+    const latestOperation = operations && operations[0];
+    const lastUpdatedTime = latestOperation && toLocalDateTimeString(latestOperation?.lastUpdatedTimestamp);
+    const lastReportedTime = latestOperation && toLocalDateTimeString(latestOperation?.timestampMillis);
+
+    // Okay so if we are disabled, we don't have both or the other. Let's render
+    // Action buttons.
+    // Table Stats.
+    // Column Stats
+
+    const fullTableReportedAt =
+        latestFullTableProfile &&
+        t('statsTab.reportedAt', {
+            date: toLocalDateString(latestFullTableProfile?.timestampMillis),
+            time: toLocalTimeString(latestFullTableProfile?.timestampMillis),
+        });
+
+    const partitionReportedAt =
+        latestPartitionProfile &&
+        t('statsTab.reportedAt', {
+            date: toLocalDateString(latestPartitionProfile?.timestampMillis),
+            time: toLocalTimeString(latestPartitionProfile?.timestampMillis),
+        });
+
+    const totalSqlQueries = usageStats?.aggregations?.totalSqlQueries;
+    const queryCountLast30Days = baseEntity?.dataset?.statsSummary?.queryCountLast30Days;
+
+    const statsHeader = (
+        <StatsHeader
+            reportedAt={fullTableReportedAt || partitionReportedAt || ''}
+            viewType={viewType}
+            setViewType={setViewType}
+            lookbackWindow={lookbackWindow}
+            setLookbackWindow={setLookbackWindow}
+        />
+    );
+
+    const latestProfile = latestFullTableProfile || latestPartitionProfile;
+
+    const latestStats = (
+        <SectionWrapper>
+            <TableStats
+                partitionSpec={latestProfile?.partitionSpec}
+                rowCount={latestProfile?.rowCount || undefined}
+                columnCount={latestProfile?.columnCount || undefined}
+                queryCount={queryCountLast30Days || totalSqlQueries || undefined}
+                users={usageStats?.aggregations?.users || undefined}
+                lastUpdatedTime={lastUpdatedTime || undefined}
+                lastReportedTime={lastReportedTime || undefined}
+            />
+            {latestProfile?.fieldProfiles && latestProfile?.fieldProfiles?.length > 0 && (
+                <ColumnStats
+                    partitionSpec={latestProfile?.partitionSpec}
+                    columnStats={(latestProfile && latestProfile.fieldProfiles) || []}
+                />
+            )}
+        </SectionWrapper>
+    );
+
+    const historicalStats = <HistoricalStats urn={urn || ''} lookbackWindow={lookbackWindow} />;
+
+    return (
+        <>
+            {statsHeader}
+            {viewType === ViewType.LATEST ? latestStats : historicalStats}
+        </>
+    );
+}

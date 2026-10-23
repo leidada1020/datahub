@@ -1,0 +1,110 @@
+{
+    "query_type": "SELECT",
+    "query_type_props": {},
+    "query_fingerprint": "f2ac7c7d2236fce51b0d7c2b3f0e1a3c26cf6f26566b77f1d9084b7ab9c1d021",
+    "in_tables": [
+        "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.my_table,PROD)",
+        "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.my_table_b,PROD)"
+    ],
+    "out_tables": [],
+    "column_lineage": [
+        {
+            "downstream": {
+                "table": null,
+                "column": "id",
+                "column_type": null,
+                "native_column_type": null
+            },
+            "upstreams": [
+                {
+                    "table": "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.my_table,PROD)",
+                    "column": "id"
+                }
+            ],
+            "logic": {
+                "is_direct_copy": true,
+                "column_logic": "\"A\".\"ID\" AS \"ID\""
+            }
+        },
+        {
+            "downstream": {
+                "table": null,
+                "column": "name",
+                "column_type": null,
+                "native_column_type": null
+            },
+            "upstreams": [
+                {
+                    "table": "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.my_table_b,PROD)",
+                    "column": "name"
+                }
+            ],
+            "logic": {
+                "is_direct_copy": true,
+                "column_logic": "\"B\".\"NAME\" AS \"NAME\""
+            }
+        },
+        {
+            "downstream": {
+                "table": null,
+                "column": "userinfo",
+                "column_type": null,
+                "native_column_type": "VARIANT"
+            },
+            "upstreams": [
+                {
+                    "table": "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.my_table_b,PROD)",
+                    "column": "my_json"
+                }
+            ],
+            "logic": {
+                "is_direct_copy": false,
+                "column_logic": "PARSE_JSON(\"B\".\"MY_JSON\") AS :userInfo"
+            }
+        },
+        {
+            "downstream": {
+                "table": null,
+                "column": "address",
+                "column_type": null,
+                "native_column_type": null
+            },
+            "upstreams": [
+                {
+                    "table": "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.my_table_b,PROD)",
+                    "column": "address"
+                }
+            ],
+            "logic": {
+                "is_direct_copy": true,
+                "column_logic": "\"B\".\"ADDRESS\" AS \"ADDRESS\""
+            }
+        }
+    ],
+    "joins": [
+        {
+            "join_type": "LEFT JOIN",
+            "left_tables": [
+                "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.my_table,PROD)"
+            ],
+            "right_tables": [
+                "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.my_table_b,PROD)"
+            ],
+            "on_clause": "\"A\".\"ID\" = \"B\".\"ID\"",
+            "columns_involved": [
+                {
+                    "table": "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.my_table,PROD)",
+                    "column": "ID"
+                },
+                {
+                    "table": "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.my_table_b,PROD)",
+                    "column": "ID"
+                }
+            ]
+        }
+    ],
+    "debug_info": {
+        "confidence": 0.2,
+        "generalized_statement": "SELECT A.ID, B.NAME, PARSE_JSON(B.MY_JSON) AS :userInfo, B.ADDRESS FROM my_db.my_schema.my_table AS A LEFT JOIN my_db.my_schema.my_table_B AS B ON A.ID = B.ID"
+    }
+}

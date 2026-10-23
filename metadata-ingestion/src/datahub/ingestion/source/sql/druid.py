@@ -1,0 +1,94 @@
+# This import verifies that the dependencies are available.
+from typing import Annotated, Any, Dict, Optional
+
+import pydruid  # noqa: F401
+from pydantic.fields import Field
+from pydruid.db.sqlalchemy import DruidDialect
+from sqlalchemy.exc import ResourceClosedError
+
+from datahub.configuration.common import AllowDenyPattern, Filters, HiddenFromDocs
+from datahub.ingestion.api.decorators import (
+    SourceCapability,
+    SupportStatus,
+    capability,
+    config_class,
+    platform_name,
+    support_status,
+)
+from datahub.ingestion.source.common.subtypes import DatasetContainerSubTypes
+from datahub.ingestion.source.sql.sql_common import SQLAlchemySource
+from datahub.ingestion.source.sql.sql_config import BasicSQLAlchemyConfig
+
+get_table_names_source = DruidDialect.get_table_names
+
+
+def get_table_names(self, connection, schema=None, **kwargs):
+    try:
+        return get_table_names_source(self, connection, schema=schema, **kwargs)
+    # Druid throws ResourceClosedError when there is no table in the schema
+    except ResourceClosedError:
+        return []
+
+
+DruidDialect.get_table_names = get_table_names
+
+
+class DruidConfig(BasicSQLAlchemyConfig):
+    # defaults
+    scheme: HiddenFromDocs[str] = "druid"
+    # Annotated, not a bare redeclaration: pydantic v2 replaces the annotation
+    # wholesale, so restating an inherited field silently drops the Filters(...)
+    # the parent attached. Nothing failed when it did -- the `<kind>_pattern`
+    # name convention covered for it -- which is how BigQuery came to resolve
+    # to a deprecated alias and report wrong verdicts.
+    schema_pattern: Annotated[
+        AllowDenyPattern, Filters(DatasetContainerSubTypes.SCHEMA)
+    ] = Field(
+        default=AllowDenyPattern(deny=["^(lookup|sysgit|view).*"]),
+        description="regex patterns for schemas to filter in ingestion.",
+    )
+
+    def get_sql_alchemy_url(
+        self, uri_opts: Optional[Dict[str, Any]] = None, database: Optional[str] = None
+    ) -> str:
+        base_url = super().get_sql_alchemy_url(uri_opts=uri_opts, database=database)
+        return f"{base_url}/druid/v2/sql/"
+
+    """
+    The pydruid library already formats the table name correctly, so we do not
+    need to use the schema name when constructing the URN. Without this override,
+    every URN would incorrectly start with "druid.
+
+    For more information, see https://druid.apache.org/docs/latest/querying/sql.html#schemata-table
+    """
+
+    def get_identifier(self, schema: str, table: str) -> str:
+        return f"{table}"
+
+
+@platform_name("Druid")
+@config_class(DruidConfig)
+@support_status(SupportStatus.BETA)
+@capability(SourceCapability.PLATFORM_INSTANCE, "Enabled by default")
+@capability(
+    SourceCapability.PROBE,
+    "Check what a recipe would ingest before running it, with `datahub recipe probe`",
+)
+class DruidSource(SQLAlchemySource):
+    """
+    Source that extracts metadata from Apache Druid via SQLAlchemy.
+
+    Implementation notes:
+    - Uses pydruid SQLAlchemy dialect for database connectivity
+    - Overrides get_identifier to skip schema name in URNs (Druid table names are already fully qualified)
+    - Patches DruidDialect.get_table_names to handle ResourceClosedError for empty schemas
+    - Default schema pattern denies internal databases (lookup, sysgit, view)
+    """
+
+    def __init__(self, config, ctx):
+        super().__init__(config, ctx, "druid")
+
+    @classmethod
+    def create(cls, config_dict, ctx):
+        config = DruidConfig.model_validate(config_dict)
+        return cls(config, ctx)

@@ -1,0 +1,65 @@
+import { useLocation } from 'react-router-dom';
+
+import { getFieldPathFromSchemaFieldUrn } from '@app/entityV2/schemaField/utils';
+import { EntityTabPath } from '@app/entityV2/shared/constants';
+import { downgradeV2FieldPath } from '@app/lineageV3/utils/downgradeV2FieldPath';
+import { useEntityRegistry } from '@app/useEntityRegistry';
+import { EntityRegistry } from '@src/entityRegistryContext';
+
+import { EntityType } from '@types';
+
+export function processDocumentationString(docString): string {
+    if (!docString) {
+        return '';
+    }
+    const fieldRegex = /'(\[version=2\.0\](?:\.\[key=True\])?\.\[type=[^\]]+\]\.[^']+)'/g;
+    return docString.replace(fieldRegex, (_, fieldPath) => `'${downgradeV2FieldPath(fieldPath)}'`);
+}
+
+export function getV1FieldPathFromSchemaFieldUrn(schemaFieldUrn: string) {
+    return downgradeV2FieldPath(getFieldPathFromSchemaFieldUrn(schemaFieldUrn)) as string;
+}
+
+export function getEntityTypeFromEntityUrn(urn: string, registry: EntityRegistry): EntityType | undefined {
+    const [, , entityType] = urn.split(':');
+    return registry.getTypeFromGraphName(entityType);
+}
+
+export function getLineageUrl(
+    urn: string,
+    type: EntityType,
+    location: ReturnType<typeof useLocation>,
+    entityRegistry: EntityRegistry,
+) {
+    return `${entityRegistry.getEntityUrl(type, urn)}/${EntityTabPath.LINEAGE}${location.search}`;
+}
+
+export function useGetLineageUrl(urn?: string, type?: EntityType) {
+    const location = useLocation();
+    const entityRegistry = useEntityRegistry();
+
+    if (!urn || !type) {
+        return '';
+    }
+
+    return getLineageUrl(urn, type, location, entityRegistry);
+}
+
+export function downloadImage(dataUrl: string, name?: string) {
+    const now = new Date();
+    const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(
+        now.getDate(),
+    ).padStart(2, '0')}`;
+
+    const timeStr = `${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(
+        now.getSeconds(),
+    ).padStart(2, '0')}`;
+
+    const fileNamePrefix = name ? `${name}_` : 'reactflow_';
+    const fileName = `${fileNamePrefix}${dateStr}_${timeStr}.png`;
+
+    const a = document.createElement('a');
+    a.setAttribute('download', fileName);
+    a.setAttribute('href', dataUrl);
+    a.click();
+}

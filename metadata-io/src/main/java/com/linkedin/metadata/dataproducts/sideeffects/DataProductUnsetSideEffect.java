@@ -1,0 +1,241 @@
+package com.linkedin.metadata.dataproducts.sideeffects;
+
+import static com.linkedin.metadata.Constants.DATA_PRODUCT_ENTITY_NAME;
+import static com.linkedin.metadata.Constants.DATA_PRODUCT_PROPERTIES_ASPECT_NAME;
+import static com.linkedin.metadata.search.utils.QueryUtils.EMPTY_FILTER;
+
+import com.datahub.context.OperationFingerprint;
+import com.linkedin.common.urn.Urn;
+import com.linkedin.common.urn.UrnUtils;
+import com.linkedin.dataproduct.DataProductAssociation;
+import com.linkedin.dataproduct.DataProductAssociationArray;
+import com.linkedin.dataproduct.DataProductProperties;
+import com.linkedin.metadata.aspect.GraphRetriever;
+import com.linkedin.metadata.aspect.RetrieverContext;
+import com.linkedin.metadata.aspect.batch.ChangeMCP;
+import com.linkedin.metadata.aspect.batch.MCLItem;
+import com.linkedin.metadata.aspect.batch.MCPItem;
+import com.linkedin.metadata.aspect.models.graph.Edge;
+import com.linkedin.metadata.aspect.models.graph.RelatedEntities;
+import com.linkedin.metadata.aspect.models.graph.RelatedEntitiesScrollResult;
+import com.linkedin.metadata.aspect.patch.GenericJsonPatch;
+import com.linkedin.metadata.aspect.patch.PatchOperationType;
+import com.linkedin.metadata.aspect.patch.template.dataproduct.DataProductPropertiesTemplate;
+import com.linkedin.metadata.aspect.plugins.config.AspectPluginConfig;
+import com.linkedin.metadata.aspect.plugins.hooks.MCPSideEffect;
+import com.linkedin.metadata.entity.ebean.batch.PatchItemImpl;
+import com.linkedin.metadata.models.EntitySpec;
+import com.linkedin.metadata.query.filter.Condition;
+import com.linkedin.metadata.query.filter.RelationshipDirection;
+import com.linkedin.metadata.search.utils.QueryUtils;
+import com.linkedin.metadata.utils.CriterionUtils;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+import javax.annotation.Nonnull;
+import lombok.Getter;
+import lombok.Setter;
+import lombok.experimental.Accessors;
+import lombok.extern.slf4j.Slf4j;
+
+/**
+ * Side effect that enforces single data product being associated with each entity by removing any
+ * previous relation when evaluation updates to Data Product Properties aspects.
+ */
+@Slf4j
+@Getter
+@Setter
+@Accessors(chain = true)
+public class DataProductUnsetSideEffect extends MCPSideEffect {
+
+  /** Max asset URNs per graph scroll when batching unset lookups. */
+  static final int GRAPH_SCROLL_CHUNK_SIZE = 100;
+
+  @Nonnull private AspectPluginConfig config;
+
+  @Override
+  protected Stream<ChangeMCP> applyMCPSideEffect(
+      @Nonnull OperationFingerprint operationContext,
+      Collection<ChangeMCP> changeMCPS,
+      @Nonnull RetrieverContext retrieverContext) {
+    return Stream.of();
+  }
+
+  @Override
+  protected Stream<MCPItem> postMCPSideEffect(
+      @Nonnull OperationFingerprint operationContext,
+      Collection<MCLItem> mclItems,
+      @Nonnull RetrieverContext retrieverContext) {
+    return mclItems.stream().flatMap(item -> generatePatchRemove(item, retrieverContext));
+  }
+
+  private static Stream<MCPItem> generatePatchRemove(
+      MCLItem mclItem, @Nonnull RetrieverContext retrieverContext) {
+
+    if (DATA_PRODUCT_PROPERTIES_ASPECT_NAME.equals(mclItem.getAspectName())) {
+
+      DataProductProperties dataProductProperties = mclItem.getAspect(DataProductProperties.class);
+      if (dataProductProperties == null) {
+        log.error("Unable to process data product properties for urn: {}", mclItem.getUrn());
+        return Stream.empty();
+      }
+      DataProductAssociationArray newDataProductAssociationArray =
+          Optional.ofNullable(dataProductProperties.getAssets())
+              .orElse(new DataProductAssociationArray());
+
+      DataProductProperties previousDataProductProperties =
+          mclItem.getPreviousAspect(DataProductProperties.class);
+
+      if (previousDataProductProperties == null) {
+        return generateUnsetMCPs(mclItem, newDataProductAssociationArray, retrieverContext);
+      }
+
+      DataProductAssociationArray additions =
+          computeAssetAdditions(previousDataProductProperties, newDataProductAssociationArray);
+      return generateUnsetMCPs(mclItem, additions, retrieverContext);
+    }
+    return Stream.empty();
+  }
+
+  @Nonnull
+  static DataProductAssociationArray computeAssetAdditions(
+      @Nonnull DataProductProperties previousDataProductProperties,
+      @Nonnull DataProductAssociationArray newDataProductAssociationArray) {
+    Set<String> previousDestinationUrns =
+        extractDestinationUrns(
+            Optional.ofNullable(previousDataProductProperties.getAssets())
+                .orElse(new DataProductAssociationArray()));
+
+    return newDataProductAssociationArray.stream()
+        .filter(
+            association ->
+                association.hasDestinationUrn()
+                    && !previousDestinationUrns.contains(
+                        association.getDestinationUrn().toString()))
+        .collect(Collectors.toCollection(DataProductAssociationArray::new));
+  }
+
+  @Nonnull
+  private static Set<String> extractDestinationUrns(
+      @Nonnull DataProductAssociationArray associations) {
+    Set<String> urns = new HashSet<>();
+    for (DataProductAssociation association : associations) {
+      if (association.hasDestinationUrn()) {
+        urns.add(association.getDestinationUrn().toString());
+      }
+    }
+    return urns;
+  }
+
+  private static Stream<MCPItem> generateUnsetMCPs(
+      @Nonnull MCLItem dataProductItem,
+      @Nonnull DataProductAssociationArray dataProductAssociations,
+      @Nonnull RetrieverContext retrieverContext) {
+    List<MCPItem> mcpItems = new ArrayList<>();
+    Map<String, List<GenericJsonPatch.PatchOp>> patchOpMap = new HashMap<>();
+
+    List<String> destinationUrns = new ArrayList<>();
+    for (DataProductAssociation association : dataProductAssociations) {
+      if (association.hasDestinationUrn()) {
+        destinationUrns.add(association.getDestinationUrn().toString());
+      }
+    }
+
+    if (destinationUrns.isEmpty()) {
+      return Stream.empty();
+    }
+
+    GraphRetriever graphRetriever = retrieverContext.getGraphRetriever();
+    for (int offset = 0; offset < destinationUrns.size(); offset += GRAPH_SCROLL_CHUNK_SIZE) {
+      List<String> chunk =
+          destinationUrns.subList(
+              offset, Math.min(offset + GRAPH_SCROLL_CHUNK_SIZE, destinationUrns.size()));
+      scrollRelatedDataProductsForAssets(
+          graphRetriever, chunk, dataProductItem.getUrn(), patchOpMap);
+    }
+
+    for (String urn : patchOpMap.keySet()) {
+      EntitySpec entitySpec =
+          retrieverContext
+              .getAspectRetriever()
+              .getEntityRegistry()
+              .getEntitySpec(DATA_PRODUCT_ENTITY_NAME);
+      mcpItems.add(
+          PatchItemImpl.builder()
+              .urn(UrnUtils.getUrn(urn))
+              .entitySpec(
+                  retrieverContext
+                      .getAspectRetriever()
+                      .getEntityRegistry()
+                      .getEntitySpec(DATA_PRODUCT_ENTITY_NAME))
+              .aspectName(DATA_PRODUCT_PROPERTIES_ASPECT_NAME)
+              .aspectSpec(entitySpec.getAspectSpec(DATA_PRODUCT_PROPERTIES_ASPECT_NAME))
+              .patch(
+                  GenericJsonPatch.builder()
+                      .arrayPrimaryKeys(
+                          Map.of(
+                              DataProductPropertiesTemplate.ASSETS_FIELD_NAME,
+                              List.of(DataProductPropertiesTemplate.KEY_FIELD_NAME)))
+                      .patch(patchOpMap.get(urn))
+                      .build()
+                      .getJsonPatch())
+              .auditStamp(dataProductItem.getAuditStamp())
+              .systemMetadata(dataProductItem.getSystemMetadata())
+              .build(retrieverContext.getAspectRetriever().getEntityRegistry()));
+    }
+
+    return mcpItems.stream();
+  }
+
+  private static void scrollRelatedDataProductsForAssets(
+      @Nonnull GraphRetriever graphRetriever,
+      @Nonnull List<String> assetDestinationUrns,
+      @Nonnull Urn currentDataProductUrn,
+      @Nonnull Map<String, List<GenericJsonPatch.PatchOp>> patchOpMap) {
+    if (assetDestinationUrns.isEmpty()) {
+      return;
+    }
+
+    String scrollId = null;
+    boolean hasMore = true;
+    while (hasMore) {
+      RelatedEntitiesScrollResult result =
+          graphRetriever.scrollRelatedEntities(
+              null,
+              QueryUtils.newFilter(
+                  CriterionUtils.buildCriterion("urn", Condition.EQUAL, assetDestinationUrns)),
+              null,
+              EMPTY_FILTER,
+              Set.of("DataProductContains"),
+              QueryUtils.newRelationshipFilter(EMPTY_FILTER, RelationshipDirection.INCOMING),
+              Edge.EDGE_SORT_CRITERION,
+              scrollId,
+              GRAPH_SCROLL_CHUNK_SIZE,
+              null,
+              null);
+
+      if (result.getEntities().isEmpty()) {
+        break;
+      }
+
+      for (RelatedEntities entity : result.getEntities()) {
+        if (!currentDataProductUrn.equals(UrnUtils.getUrn(entity.getSourceUrn()))) {
+          GenericJsonPatch.PatchOp patchOp = new GenericJsonPatch.PatchOp();
+          patchOp.setOp(PatchOperationType.REMOVE.getValue());
+          patchOp.setPath(String.format("/assets/%s", entity.getDestinationUrn()));
+          patchOpMap.computeIfAbsent(entity.getSourceUrn(), urn -> new ArrayList<>()).add(patchOp);
+        }
+      }
+
+      scrollId = result.getScrollId();
+      hasMore = scrollId != null && !scrollId.isEmpty();
+    }
+  }
+}

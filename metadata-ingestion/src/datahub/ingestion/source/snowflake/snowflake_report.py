@@ -1,0 +1,234 @@
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import TYPE_CHECKING, Dict, List, MutableSet, Optional
+
+from datahub.ingestion.api.report import Report
+from datahub.ingestion.glossary.classification_mixin import ClassificationReportMixin
+from datahub.ingestion.source.snowflake.constants import SnowflakeEdition
+from datahub.ingestion.source.sql.sql_report import SQLSourceReport
+from datahub.ingestion.source.state.stateful_ingestion_base import (
+    StatefulIngestionReport,
+)
+from datahub.ingestion.source_report.time_window import BaseTimeWindowReport
+from datahub.sql_parsing.sql_parsing_aggregator import SqlAggregatorReport
+from datahub.utilities.lossy_collections import LossyDict
+from datahub.utilities.perf_timer import PerfTimer
+
+if TYPE_CHECKING:
+    from datahub.ingestion.source.snowflake.snowflake_queries import (
+        SnowflakeQueriesExtractorReport,
+    )
+    from datahub.ingestion.source.snowflake.snowflake_schema import (
+        SnowflakeDataDictionary,
+    )
+
+
+@dataclass
+class SnowflakeUsageAggregationReport(Report):
+    query_secs: float = -1
+    query_row_count: int = -1
+    result_fetch_timer: PerfTimer = field(default_factory=PerfTimer)
+    result_skip_timer: PerfTimer = field(default_factory=PerfTimer)
+    result_map_timer: PerfTimer = field(default_factory=PerfTimer)
+    users_map_timer: PerfTimer = field(default_factory=PerfTimer)
+    queries_map_timer: PerfTimer = field(default_factory=PerfTimer)
+    fields_map_timer: PerfTimer = field(default_factory=PerfTimer)
+
+
+@dataclass
+class SnowflakeUsageReport:
+    min_access_history_time: Optional[datetime] = None
+    max_access_history_time: Optional[datetime] = None
+    access_history_range_query_secs: float = -1
+    access_history_query_secs: float = -1
+
+    rows_processed: int = 0
+    rows_missing_query_text: int = 0
+    rows_zero_base_objects_accessed: int = 0
+    rows_zero_direct_objects_accessed: int = 0
+    rows_missing_email: int = 0
+    rows_parsing_error: int = 0
+
+    usage_start_time: Optional[datetime] = None
+    usage_end_time: Optional[datetime] = None
+    stateful_usage_ingestion_enabled: bool = False
+
+    usage_aggregation: SnowflakeUsageAggregationReport = field(
+        default_factory=SnowflakeUsageAggregationReport
+    )
+
+
+@dataclass
+class SnowflakeReport(SQLSourceReport, BaseTimeWindowReport):
+    num_table_to_table_edges_scanned: int = 0
+    num_table_to_view_edges_scanned: int = 0
+    num_view_to_table_edges_scanned: int = 0
+    num_external_table_edges_scanned: int = 0
+    # semanticModel lineage is emitted directly, not via the dataset-mode view
+    # lineage path, so it needs its own counter.
+    num_semantic_model_lineage_edges_scanned: int = 0
+    ignore_start_time_lineage: Optional[bool] = None
+    upstream_lineage_in_report: Optional[bool] = None
+    upstream_lineage: LossyDict[str, List[str]] = field(default_factory=LossyDict)
+
+    lineage_start_time: Optional[datetime] = None
+    lineage_end_time: Optional[datetime] = None
+    stateful_lineage_ingestion_enabled: bool = False
+
+    cleaned_account_id: str = ""
+    run_ingestion: bool = False
+
+    # https://community.snowflake.com/s/topic/0TO0Z000000Unu5WAC/releases
+    saas_version: Optional[str] = None
+    default_warehouse: Optional[str] = None
+    default_db: Optional[str] = None
+    default_schema: Optional[str] = None
+    role: str = ""
+
+    profile_if_updated_since: Optional[datetime] = None
+    profile_candidates: Dict[str, List[str]] = field(default_factory=dict)
+
+    # lineage/usage v2
+    sql_aggregator: Optional[SqlAggregatorReport] = None
+
+
+@dataclass
+class SnowflakeV2Report(
+    SnowflakeReport,
+    SnowflakeUsageReport,
+    StatefulIngestionReport,
+    ClassificationReportMixin,
+):
+    account_locator: Optional[str] = None
+    region: Optional[str] = None
+
+    schemas_scanned: int = 0
+    databases_scanned: int = 0
+    tags_scanned: int = 0
+    streams_scanned: int = 0
+    procedures_scanned: int = 0
+    streamlit_apps_scanned: int = 0
+    semantic_views_scanned: int = 0
+    stages_scanned: int = 0
+    tasks_scanned: int = 0
+    pipes_scanned: int = 0
+
+    include_usage_stats: bool = False
+    include_operational_stats: bool = False
+    include_technical_schema: bool = False
+    include_column_lineage: bool = False
+
+    table_lineage_query_secs: float = -1
+    external_lineage_queries_secs: float = -1
+    num_tables_with_known_upstreams: int = 0
+    num_streams_with_known_upstreams: int = 0
+    num_upstream_lineage_edge_parsing_failed: int = 0
+    num_secure_views_missing_definition: int = 0
+    num_dynamic_tables_missing_definition: int = 0
+    # No DYNAMIC_TABLE_GRAPH_HISTORY row matched the dynamic table's qualified name, so its
+    # INPUTS upstreams and target_lag fallback are unavailable. Counted because that loss is
+    # otherwise invisible: this equalling the dynamic-table count is the signature of the
+    # keying bug fixed in #19143, and of the graph-history query's filters excluding
+    # everything on an edition whose output differs from the documented one.
+    num_dynamic_tables_missing_graph_info: int = 0
+    num_structured_property_templates_created: int = 0
+    # sqlglot parse failures while resolving metric-to-metric derivedFrom refs;
+    # best-effort, the metric is still emitted without those edges.
+    num_semantic_view_metric_expr_parse_failures: int = 0
+
+    marketplace_listings_scanned: int = 0
+    marketplace_listings_filtered: int = 0
+    marketplace_purchases_scanned: int = 0
+    marketplace_usage_events_processed: int = 0
+    marketplace_data_products_created: int = 0
+    marketplace_enhanced_datasets: int = 0
+
+    # Lineage consistency tracking
+    num_tables_added_from_column_lineage: int = 0
+    num_queries_with_empty_directsources: int = 0
+
+    data_dictionary_cache: Optional["SnowflakeDataDictionary"] = None
+
+    queries_extractor: Optional["SnowflakeQueriesExtractorReport"] = None
+
+    # These will be non-zero if snowflake information_schema queries fail with error -
+    # "Information schema query returned too much data. Please repeat query with more selective predicates.""
+    # This will result in overall increase in time complexity
+    num_get_tables_for_schema_queries: int = 0
+    num_get_views_for_schema_queries: int = 0
+
+    num_get_streams_for_schema_queries: int = 0
+
+    rows_zero_objects_modified: int = 0
+
+    _processed_tags: MutableSet[str] = field(default_factory=set)
+    _scanned_tags: MutableSet[str] = field(default_factory=set)
+
+    edition: Optional[SnowflakeEdition] = None
+
+    # Server-aware resolution of semantic_views.emit_semantic_model_entities.
+    semantic_model_emission_effective: Optional[bool] = None
+    semantic_model_emission_reason: Optional[str] = None
+    semantic_model_emission_is_saas: Optional[bool] = None
+    semantic_model_emission_metrics_enabled: Optional[bool] = None
+    # Whether the server can accept semanticModel/metric in structured-property
+    # entityTypes (managed server: version only; OSS: recipe). Gates the tag extractor's
+    # entityTypes list independently of the emit decision, so it never flaps.
+    semantic_model_entity_types_capable: Optional[bool] = None
+
+    def report_entity_scanned(self, name: str, ent_type: str = "table") -> None:
+        """
+        Entity could be a view or a table or a schema or a database
+        """
+        if ent_type == "table":
+            self.tables_scanned += 1
+        elif ent_type == "view":
+            self.views_scanned += 1
+        elif ent_type == "semantic view":
+            self.semantic_views_scanned += 1
+        elif ent_type == "schema":
+            self.schemas_scanned += 1
+        elif ent_type == "database":
+            self.databases_scanned += 1
+        elif ent_type == "tag":
+            # the same tag can be assigned to multiple objects, so we need
+            # some extra logic account for each tag only once.
+            if self._is_tag_scanned(name):
+                return
+            self._scanned_tags.add(name)
+            self.tags_scanned += 1
+        elif ent_type == "stream":
+            self.streams_scanned += 1
+        elif ent_type == "procedure":
+            self.procedures_scanned += 1
+        elif ent_type == "streamlit":
+            self.streamlit_apps_scanned += 1
+        else:
+            raise KeyError(f"Unknown entity {ent_type}.")
+
+    def is_tag_processed(self, tag_name: str) -> bool:
+        return tag_name in self._processed_tags
+
+    def _is_tag_scanned(self, tag_name: str) -> bool:
+        return tag_name in self._scanned_tags
+
+    def report_tag_processed(self, tag_name: str) -> None:
+        self._processed_tags.add(tag_name)
+
+    def report_marketplace_listing_scanned(self) -> None:
+        self.marketplace_listings_scanned += 1
+
+    def report_marketplace_listing_filtered(self) -> None:
+        self.marketplace_listings_filtered += 1
+
+    def report_marketplace_purchase_scanned(self) -> None:
+        self.marketplace_purchases_scanned += 1
+
+    def report_marketplace_data_product_created(self) -> None:
+        self.marketplace_data_products_created += 1
+
+    def report_marketplace_dataset_enhanced(self) -> None:
+        self.marketplace_enhanced_datasets += 1
+
+    def report_marketplace_usage_events_processed(self, count: int) -> None:
+        self.marketplace_usage_events_processed += count

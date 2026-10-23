@@ -1,0 +1,21 @@
+query getBrowseResultsV2($input: BrowseV2Input!) {
+    browseV2(input: $input) {
+        groups {
+            name
+            count
+            hasSubGroups
+            entity {
+                urn
+                type
+                ...entityDisplayNameFields
+            }
+        }
+        start
+        count
+        total
+        metadata {
+            path
+            totalNumEntities
+        }
+    }
+}

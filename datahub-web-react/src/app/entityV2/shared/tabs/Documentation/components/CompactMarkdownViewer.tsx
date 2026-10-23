@@ -1,0 +1,182 @@
+import React, { useCallback, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { Editor } from '@components/components/Editor';
+
+import OptionalTooltip from '@app/sharedV2/OptionalTooltip';
+import { Button } from '@src/alchemy-components';
+
+const LINE_HEIGHT = 1.5;
+const ELLIPSIS = '...';
+
+const ShowMoreWrapper = styled.div`
+    align-items: start;
+    justify-content: center;
+    display: flex;
+    flex-direction: column;
+`;
+
+const MarkdownContainer = styled.div<{ lineLimit?: number | null }>`
+    max-width: 100%;
+    position: relative;
+    flex: 1;
+    ${(props) =>
+        props.lineLimit &&
+        props.lineLimit <= 1 &&
+        `
+        display: flex;
+        align-items: center;
+        gap: 4px;
+    `}
+    min-width: 0;
+`;
+
+const MarkdownViewContainer = styled.div<{ scrollableY: boolean }>`
+    display: block;
+    overflow-wrap: break-word;
+    word-wrap: break-word;
+    overflow-x: hidden;
+    overflow-y: ${(props) => (props.scrollableY ? 'auto' : 'hidden')};
+    flex: 1;
+`;
+
+// Wrapper div that applies compact editor styles via CSS class selectors,
+// so the lazy-loaded Editor can be styled without a static component reference.
+const CompactEditor = styled(Editor)<{ limit: number | null; customStyle?: React.CSSProperties }>`
+    border: none;
+
+    .remirror-theme {
+        max-width: 100%;
+    }
+
+    .remirror-editor.ProseMirror,
+    .datahub-editor-content {
+        ${({ limit }) => limit && `max-height: ${limit * LINE_HEIGHT}em;`}
+        h1 {
+            font-size: 1.4em;
+        }
+
+        h2 {
+            font-size: 1.3em;
+        }
+
+        h3 {
+            font-size: 1.2em;
+        }
+
+        h4 {
+            font-size: 1.1em;
+        }
+
+        h5,
+        h6 {
+            font-size: 1em;
+        }
+
+        p {
+            ${(props) => props?.customStyle?.fontSize && `font-size: ${props?.customStyle?.fontSize}`};
+            margin-bottom: 0;
+        }
+
+        padding: 0 !important;
+    }
+`;
+
+const FixedLineHeightEditor = styled(CompactEditor)<{ customStyle?: React.CSSProperties }>`
+    .remirror-editor.ProseMirror,
+    .datahub-editor-content {
+        * {
+            line-height: ${LINE_HEIGHT};
+            font-size: 1em !important;
+            margin-top: 0;
+            margin-bottom: 0;
+        }
+        p {
+            font-size: ${(props) => (props?.customStyle?.fontSize ? props?.customStyle?.fontSize : '1em')} !important;
+        }
+    }
+`;
+
+const MoreIndicator = styled.span`
+    break-word: normal;
+`;
+
+type Props = {
+    content: string;
+    lineLimit?: number | null;
+    fixedLineHeight?: boolean;
+    customStyle?: React.CSSProperties;
+    scrollableY?: boolean; // Whether the viewer is vertically scrollable.
+    handleShowMore?: () => void;
+    hideShowMore?: boolean;
+    hideTooltip?: boolean;
+};
+
+export default function CompactMarkdownViewer({
+    content,
+    lineLimit = 4,
+    fixedLineHeight = false,
+    customStyle = {},
+    scrollableY = true,
+    handleShowMore,
+    hideShowMore,
+    hideTooltip,
+}: Props) {
+    const { t: tc } = useTranslation('common.actions');
+    const [isShowingMore, setIsShowingMore] = useState(false);
+    const [isTruncated, setIsTruncated] = useState(false);
+
+    const measuredRef = useCallback((node: HTMLDivElement | null) => {
+        if (node !== null) {
+            const resizeObserver = new ResizeObserver(() => {
+                setIsTruncated(node.scrollHeight > node.clientHeight + 2);
+            });
+            resizeObserver.observe(node);
+        }
+    }, []);
+
+    const StyledEditor = fixedLineHeight ? FixedLineHeightEditor : CompactEditor;
+
+    return (
+        <MarkdownContainer lineLimit={lineLimit}>
+            <MarkdownViewContainer scrollableY={scrollableY} ref={measuredRef} data-testid="compact-markdown-viewver">
+                <StyledEditor
+                    customStyle={customStyle}
+                    limit={isShowingMore ? null : lineLimit}
+                    content={content}
+                    readOnly
+                />
+            </MarkdownViewContainer>
+            {hideShowMore && isTruncated && (
+                <OptionalTooltip title={content} enabled={!hideTooltip}>
+                    <MoreIndicator>{ELLIPSIS}</MoreIndicator>
+                </OptionalTooltip>
+            )}
+
+            {!hideShowMore &&
+                (isShowingMore || isTruncated) && ( // "show more" when isTruncated, "show less" when isShowingMore
+                    <ShowMoreWrapper>
+                        <Button
+                            variant="text"
+                            color="gray"
+                            size={lineLimit && lineLimit <= 1 ? 'sm' : undefined}
+                            // Drop the button's horizontal padding so the label left-aligns
+                            // with the content above it instead of sitting indented.
+                            style={{ paddingLeft: 0, paddingRight: 0 }}
+                            onClick={(e) => {
+                                if (handleShowMore) {
+                                    handleShowMore();
+                                } else {
+                                    setIsShowingMore(!isShowingMore);
+                                }
+                                e.stopPropagation();
+                            }}
+                        >
+                            {isShowingMore ? tc('showLess') : tc('showMoreCapitalized')}
+                        </Button>
+                    </ShowMoreWrapper>
+                )}
+        </MarkdownContainer>
+    );
+}

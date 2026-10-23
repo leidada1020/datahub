@@ -1,0 +1,390 @@
+import difflib
+import json
+from pathlib import Path
+from typing import Any, Dict
+
+import pytest
+import time_machine
+
+from datahub.api.entities.dataproduct.dataproduct import DataProduct
+from datahub.emitter.mcp import MetadataChangeProposalWrapper
+from datahub.metadata.schema_classes import (
+    DataProductPropertiesClass,
+    DomainPropertiesClass,
+)
+from datahub.testing.mce_helpers import check_golden_file
+from tests.test_helpers.graph_helpers import MockDataHubGraph
+
+FROZEN_TIME = "2023-04-14 07:00:00+00:00"
+PARENT_DATA_PRODUCT_URN = "urn:li:dataProduct:vendor_equities"
+
+
+@pytest.fixture
+def base_entity_metadata():
+    return {
+        "urn:li:domain:12345": {
+            "domainProperties": DomainPropertiesClass(
+                name="Marketing", description="Marketing Domain"
+            )
+        },
+        PARENT_DATA_PRODUCT_URN: {
+            "dataProductProperties": DataProductPropertiesClass(
+                name="Vendor Equities",
+                description="Vendor equities feed",
+            )
+        },
+    }
+
+
+@pytest.fixture
+def base_mock_graph(
+    base_entity_metadata: Dict[str, Dict[str, Any]],
+) -> MockDataHubGraph:
+    return MockDataHubGraph(entity_graph=base_entity_metadata)
+
+
+@pytest.fixture
+def test_resources_dir(pytestconfig: pytest.Config) -> Path:
+    return pytestconfig.rootpath / "tests/unit/api/entities/dataproducts"
+
+
+def check_yaml_golden_file(input_file: str, golden_file: str) -> bool:
+    with open(input_file) as input:
+        input_lines = input.readlines()
+
+    with open(golden_file) as golden:
+        golden_lines = golden.readlines()
+
+    diff_exists = False
+    for line in difflib.unified_diff(
+        input_lines, golden_lines, fromfile=input_file, tofile=golden_file, lineterm=""
+    ):
+        print(line)
+        diff_exists = True
+
+    return diff_exists
+
+
+@time_machine.travel(FROZEN_TIME, tick=False)
+@pytest.mark.parametrize(
+    "data_product_filename, upsert,golden_filename",
+    [
+        ("dataproduct.yaml", False, "golden_dataproduct_out.json"),
+        ("dataproduct_upsert.yaml", True, "golden_dataproduct_out_upsert.json"),
+        (
+            "dataproduct_output_ports.yaml",
+            False,
+            "golden_dataproduct_output_ports.json",
+        ),
+        (
+            "dataproduct_output_ports_upsert.yaml",
+            True,
+            "golden_dataproduct_output_ports_upsert.json",
+        ),
+    ],
+    ids=["update", "upsert", "update_with_output_ports", "upsert_with_output_ports"],
+)
+def test_dataproduct_from_yaml(
+    pytestconfig: pytest.Config,
+    test_resources_dir: Path,
+    tmp_path: Path,
+    base_mock_graph: MockDataHubGraph,
+    data_product_filename: str,
+    upsert: bool,
+    golden_filename: str,
+) -> None:
+    data_product_file = test_resources_dir / data_product_filename
+    mock_graph = base_mock_graph
+    data_product = DataProduct.from_yaml(data_product_file, mock_graph)
+    assert data_product._resolved_domain_urn == "urn:li:domain:12345"
+    assert data_product.assets is not None
+    assert len(data_product.assets) == 3
+
+    for mcp in data_product.generate_mcp(upsert=upsert):
+        mock_graph.emit(mcp)
+
+    output_file = Path(tmp_path / "test_dataproduct_out.json")
+    mock_graph.sink_to_file(output_file)
+    golden_file = Path(test_resources_dir / golden_filename)
+    check_golden_file(pytestconfig, output_file, golden_file)
+
+
+@time_machine.travel(FROZEN_TIME, tick=False)
+def test_dataproduct_from_datahub(
+    pytestconfig: pytest.Config,
+    test_resources_dir: Path,
+    tmp_path: Path,
+    base_mock_graph: MockDataHubGraph,
+) -> None:
+    mock_graph = base_mock_graph
+    golden_file = Path(test_resources_dir / "golden_dataproduct_out.json")
+    mock_graph.import_file(golden_file)
+
+    data_product: DataProduct = DataProduct.from_datahub(
+        mock_graph, id="urn:li:dataProduct:pet_of_the_week"
+    )
+    assert data_product.domain == "urn:li:domain:12345"
+    assert data_product.assets is not None
+    assert len(data_product.assets) == 3
+
+    # validate that output looks exactly the same
+
+    for mcp in data_product.generate_mcp(upsert=False):
+        mock_graph.emit(mcp)
+
+    output_file = Path(tmp_path / "test_dataproduct_to_datahub_out.json")
+    mock_graph.sink_to_file(output_file)
+    golden_file = Path(test_resources_dir / "golden_dataproduct_out.json")
+    check_golden_file(pytestconfig, output_file, golden_file)
+
+
+@time_machine.travel(FROZEN_TIME, tick=False)
+@pytest.mark.parametrize(
+    "original_file",
+    [
+        ("dataproduct_v2_asset_add.yaml"),
+        ("dataproduct_v2_asset_remove.yaml"),
+    ],
+    ids=["asset_add", "asset_remove"],
+)
+def test_dataproduct_patch_yaml(
+    pytestconfig: pytest.Config,
+    tmp_path: Path,
+    test_resources_dir: Path,
+    base_mock_graph: MockDataHubGraph,
+    original_file: str,
+) -> None:
+    """Validates that patching data product files by reading from DataHub works as expected"""
+    mock_graph = base_mock_graph
+    golden_file = Path(test_resources_dir / "golden_dataproduct_out.json")
+    mock_graph.import_file(golden_file)
+
+    data_product_file = test_resources_dir / original_file
+    original_data_product: DataProduct = DataProduct.from_yaml(
+        data_product_file, mock_graph
+    )
+    data_product: DataProduct = DataProduct.from_datahub(
+        mock_graph, id="urn:li:dataProduct:pet_of_the_week"
+    )
+    dataproduct_output_file = Path(tmp_path / f"patch_{original_file}")
+    data_product.patch_yaml(original_data_product, dataproduct_output_file)
+    dataproduct_golden_file = Path(test_resources_dir / "golden_dataproduct_v2.yaml")
+    assert (
+        check_yaml_golden_file(
+            str(dataproduct_output_file), str(dataproduct_golden_file)
+        )
+        is False
+    )
+
+
+@time_machine.travel(FROZEN_TIME, tick=False)
+def test_dataproduct_ownership_type_urn_from_yaml(
+    pytestconfig: pytest.Config,
+    tmp_path: Path,
+    test_resources_dir: Path,
+    base_mock_graph: MockDataHubGraph,
+) -> None:
+    data_product_file = test_resources_dir / "dataproduct_ownership_type_urn.yaml"
+    mock_graph = base_mock_graph
+    data_product = DataProduct.from_yaml(data_product_file, mock_graph)
+
+    for mcp in data_product.generate_mcp(upsert=False):
+        mock_graph.emit(mcp)
+
+    output_file = tmp_path / "test_dataproduct_out.json"
+    mock_graph.sink_to_file(output_file)
+    golden_file = test_resources_dir / "golden_dataproduct_out_ownership_type_urn.json"
+    check_golden_file(pytestconfig, output_file, golden_file)
+
+
+@time_machine.travel(FROZEN_TIME, tick=False)
+def test_dataproduct_ownership_type_urn_patch_yaml(
+    tmp_path: Path, test_resources_dir: Path, base_mock_graph: MockDataHubGraph
+) -> None:
+    mock_graph = base_mock_graph
+    source_file = test_resources_dir / "golden_dataproduct_out_ownership_type_urn.json"
+    mock_graph.import_file(source_file)
+
+    data_product_file = (
+        test_resources_dir / "dataproduct_ownership_type_urn_different_owner.yaml"
+    )
+    original_data_product: DataProduct = DataProduct.from_yaml(
+        data_product_file, mock_graph
+    )
+
+    data_product: DataProduct = DataProduct.from_datahub(
+        mock_graph, id="urn:li:dataProduct:pet_of_the_week"
+    )
+
+    dataproduct_output_file = (
+        tmp_path / "patch_dataproduct_ownership_type_urn_different_owner.yaml"
+    )
+    data_product.patch_yaml(original_data_product, dataproduct_output_file)
+
+    assert not check_yaml_golden_file(
+        str(dataproduct_output_file),
+        str(test_resources_dir / "dataproduct_ownership_type_urn.yaml"),
+    )
+
+
+@time_machine.travel(FROZEN_TIME, tick=False)
+@pytest.mark.parametrize(
+    "data_product_filename",
+    [
+        "dataproduct_with_parent.yaml",
+        "dataproduct_with_parent_by_name.yaml",
+    ],
+    ids=["parent_urn", "parent_name"],
+)
+def test_dataproduct_parent_from_yaml(
+    test_resources_dir: Path,
+    base_mock_graph: MockDataHubGraph,
+    data_product_filename: str,
+) -> None:
+    data_product = DataProduct.from_yaml(
+        test_resources_dir / data_product_filename, base_mock_graph
+    )
+    assert data_product._resolved_parent_data_product_urn == PARENT_DATA_PRODUCT_URN
+
+    mcps = list(data_product.generate_mcp(upsert=False))
+    properties_mcp = next(
+        mcp
+        for mcp in mcps
+        if isinstance(mcp, MetadataChangeProposalWrapper)
+        and mcp.aspectName == "dataProductProperties"
+    )
+    assert isinstance(properties_mcp.aspect, DataProductPropertiesClass)
+    assert properties_mcp.aspect.parentDataProduct == PARENT_DATA_PRODUCT_URN
+
+
+@time_machine.travel(FROZEN_TIME, tick=False)
+def test_dataproduct_parent_upsert_from_yaml(
+    test_resources_dir: Path,
+    base_mock_graph: MockDataHubGraph,
+) -> None:
+    data_product = DataProduct.from_yaml(
+        test_resources_dir / "dataproduct_with_parent.yaml", base_mock_graph
+    )
+    mcps = list(data_product.generate_mcp(upsert=True))
+    properties_mcp = next(
+        mcp
+        for mcp in mcps
+        if getattr(mcp, "aspectName", None) == "dataProductProperties"
+    )
+    patch_ops = json.loads(properties_mcp.aspect.value)  # type: ignore[union-attr]
+    assert {
+        "op": "add",
+        "path": "/parentDataProduct",
+        "value": PARENT_DATA_PRODUCT_URN,
+    } in patch_ops
+
+
+@time_machine.travel(FROZEN_TIME, tick=False)
+def test_dataproduct_parent_round_trip_from_datahub(
+    test_resources_dir: Path,
+    base_mock_graph: MockDataHubGraph,
+) -> None:
+    data_product = DataProduct.from_yaml(
+        test_resources_dir / "dataproduct_with_parent.yaml", base_mock_graph
+    )
+    for mcp in data_product.generate_mcp(upsert=False):
+        if (
+            isinstance(mcp, MetadataChangeProposalWrapper)
+            and mcp.entityUrn
+            and mcp.aspectName
+            and mcp.aspect
+        ):
+            if mcp.entityUrn not in base_mock_graph.entity_graph:
+                base_mock_graph.entity_graph[mcp.entityUrn] = {}
+            base_mock_graph.entity_graph[mcp.entityUrn][mcp.aspectName] = mcp.aspect
+
+    loaded = DataProduct.from_datahub(
+        base_mock_graph, id="urn:li:dataProduct:portfolio_analytics"
+    )
+    assert loaded.parent_data_product == PARENT_DATA_PRODUCT_URN
+    assert loaded._resolved_parent_data_product_urn == PARENT_DATA_PRODUCT_URN
+
+
+def _write_parent_yaml(tmp_path: Path, product_id: str, parent: str) -> Path:
+    path = tmp_path / f"{product_id}.yaml"
+    path.write_text(
+        "\n".join(
+            [
+                f"id: {product_id}",
+                "domain: Marketing",
+                f"parent_data_product: {parent}",
+                "assets:",
+                "  - urn:li:container:DATABASE",
+                "",
+            ]
+        )
+    )
+    return path
+
+
+def test_dataproduct_rejects_self_parent_from_yaml(
+    tmp_path: Path,
+    base_mock_graph: MockDataHubGraph,
+) -> None:
+    yaml_file = _write_parent_yaml(tmp_path, "vendor_equities", PARENT_DATA_PRODUCT_URN)
+    with pytest.raises(ValueError, match="Cannot nest a data product"):
+        DataProduct.from_yaml(yaml_file, base_mock_graph)
+
+
+def test_dataproduct_rejects_descendant_parent_from_yaml(
+    tmp_path: Path,
+    base_mock_graph: MockDataHubGraph,
+) -> None:
+    research_urn = "urn:li:dataProduct:research"
+    leaf_urn = "urn:li:dataProduct:portfolio_analytics"
+    base_mock_graph.entity_graph[research_urn] = {
+        "dataProductProperties": DataProductPropertiesClass(
+            name="Research",
+            parentDataProduct=PARENT_DATA_PRODUCT_URN,
+        )
+    }
+    base_mock_graph.entity_graph[leaf_urn] = {
+        "dataProductProperties": DataProductPropertiesClass(
+            name="Portfolio Analytics",
+            parentDataProduct=research_urn,
+        )
+    }
+    yaml_file = _write_parent_yaml(tmp_path, "vendor_equities", leaf_urn)
+    with pytest.raises(ValueError, match="Cannot nest a data product"):
+        DataProduct.from_yaml(yaml_file, base_mock_graph)
+
+
+def test_dataproduct_rejects_self_parent_on_generate_mcp() -> None:
+    data_product = DataProduct(
+        id="vendor_equities",
+        domain="urn:li:domain:12345",
+        parent_data_product=PARENT_DATA_PRODUCT_URN,
+    )
+    with pytest.raises(ValueError, match="Cannot nest a data product"):
+        list(data_product.generate_mcp(upsert=False))
+
+
+def test_dataproduct_output_ports_validation_not_urn(
+    base_mock_graph: MockDataHubGraph,
+) -> None:
+    """Test that output_ports must be valid URNs"""
+    with pytest.raises(ValueError, match="Output port .* is not an urn"):
+        DataProduct(
+            id="test_product",
+            domain="urn:li:domain:12345",
+            assets=["urn:li:container:DATABASE", "not-a-urn"],
+            output_ports=["not-a-urn"],
+        )
+
+
+def test_dataproduct_output_ports_validation_not_in_assets(
+    base_mock_graph: MockDataHubGraph,
+) -> None:
+    """Test that output_ports must be in the assets list"""
+    with pytest.raises(ValueError, match="Output port .* is not in asset list"):
+        DataProduct(
+            id="test_product",
+            domain="urn:li:domain:12345",
+            assets=["urn:li:container:DATABASE"],
+            output_ports=["urn:li:container:SCHEMA"],
+        )

@@ -1,0 +1,232 @@
+query appConfig {
+    appConfig {
+        appVersion
+        policiesConfig {
+            enabled
+        }
+        analyticsConfig {
+            enabled
+        }
+        authConfig {
+            tokenAuthEnabled
+            allowNoExpiry
+            allowedAccessTokenDurations
+        }
+        identityManagementConfig {
+            enabled
+        }
+        lineageConfig {
+            supportsImpactAnalysis
+        }
+        managedIngestionConfig {
+            enabled
+        }
+        visualConfig {
+            logoUrl
+            faviconUrl
+            appTitle
+            showFullTitleInLineage
+            queriesTab {
+                queriesTabResultSize
+            }
+            entityProfiles {
+                domain {
+                    defaultTab
+                }
+            }
+            searchResult {
+                enableNameHighlight
+            }
+            theme {
+                themeId
+            }
+            application {
+                showSidebarSectionWhenEmpty
+                showApplicationInNavigation
+            }
+        }
+        telemetryConfig {
+            enableThirdPartyLogging
+        }
+        testsConfig {
+            enabled
+        }
+        viewsConfig {
+            enabled
+        }
+        searchBarConfig {
+            apiVariant
+        }
+        searchCardConfig {
+            showDescription
+        }
+        searchFlagsConfig {
+            defaultSkipHighlighting
+        }
+        homePageConfig {
+            firstInPersonalSidebar
+        }
+        featureFlags {
+            readOnlyModeEnabled
+            showSearchFiltersV2
+            showBrowseV2
+            showAcrylInfo
+            erModelRelationshipFeatureEnabled
+            showAccessManagement
+            nestedDomainsEnabled
+            platformBrowseV2
+            businessAttributeEntityEnabled
+            contextDocumentsEnabled
+            documentExplicitSaveEnabled
+            dataContractsEnabled
+            editableDatasetNameEnabled
+            themeV2Enabled
+            themeV2Default
+            themeV2Toggleable
+            themeDarkModeEnabled
+            showSeparateSiblings
+            showManageStructuredProperties
+            schemaFieldCLLEnabled
+            hideDbtSourceInLineage
+            schemaFieldLineageIgnoreStatus
+            showNavBarRedesign
+            showAutoCompleteResults
+            entityVersioningEnabled
+            showHasSiblingsFilter
+            showSearchBarAutocompleteRedesign
+            showManageTags
+            showIntroducePage
+            showIngestionPageRedesign
+            showLineageExpandMore
+            showLineageFilterNodes
+            showStatsTabRedesign
+            showHomePageRedesign
+            showDefaultExternalLinks
+            showProductUpdates
+            logicalModelsEnabled
+            showHomepageUserRole
+            assetSummaryPageV1
+            datasetSummaryPageV1
+            metricsEnabled
+            ingestionOnboardingRedesignV1
+            documentationFileUploadV1
+            contextDocumentsEnabled
+            hideLineageInSearchCards
+            dataProductLineageEnabled
+            glossaryBasedPoliciesEnabled
+            structuredPropertiesInPoliciesEnabled
+            multipleDataProductsPerAsset
+            showTestsInHealthIcon
+            i18nEnabled
+            browserTracingEnabled
+            browserWebVitalsEnabled
+        }
+        chromeExtensionConfig {
+            enabled
+            lineageEnabled
+        }
+    }
+}
+
+query getPolicyPrivileges {
+    appConfig {
+        policiesConfig {
+            platformPrivileges {
+                type
+                displayName
+                description
+            }
+            resourcePrivileges {
+                resourceType
+                resourceTypeDisplayName
+                entityType
+                privileges {
+                    type
+                    displayName
+                    description
+                }
+            }
+        }
+    }
+}
+
+query getEntityCounts($input: EntityCountInput) {
+    getEntityCounts(input: $input) {
+        counts {
+            entityType
+            count
+        }
+    }
+}
+
+query getGlobalViewsSettings {
+    globalViewsSettings {
+        defaultView
+    }
+}
+
+query getDocPropagationSettings {
+    docPropagationSettings {
+        docColumnPropagation
+    }
+}
+
+query getHomePageSettings {
+    globalHomePageSettings {
+        defaultTemplate {
+            ...PageTemplate
+        }
+    }
+}
+
+query getPresignedUploadUrl($input: GetPresignedUploadUrlInput!) {
+    getPresignedUploadUrl(input: $input) {
+        url
+        fileId
+    }
+}
+
+mutation createDataHubFile($input: CreateDataHubFileInput!) {
+    createDataHubFile(input: $input) {
+        file {
+            urn
+        }
+    }
+}
+
+mutation updateGlobalViewsSettings($input: UpdateGlobalViewsSettingsInput!) {
+    updateGlobalViewsSettings(input: $input)
+}
+
+mutation updateDocPropagationSettings($input: UpdateDocPropagationSettingsInput!) {
+    updateDocPropagationSettings(input: $input)
+}
+
+mutation updateApplicationsSettings($input: UpdateApplicationsSettingsInput!) {
+    updateApplicationsSettings(input: $input)
+}
+
+query getLatestProductUpdate($locale: String) {
+    latestProductUpdate(locale: $locale) {
+        enabled
+        id
+        releaseMonth
+        title
+        header
+        requiredVersion
+        description
+        image
+        primaryCtaText
+        primaryCtaLink
+        secondaryCtaText
+        secondaryCtaLink
+        ctaText
+        ctaLink
+        features {
+            title
+            description
+            icon
+            availability
+        }
+    }
+}

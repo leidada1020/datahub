@@ -1,0 +1,122 @@
+import os
+import pathlib
+
+import setuptools
+
+package_metadata: dict = {}
+with open("./src/prefect_datahub/_version.py") as fp:
+    exec(fp.read(), package_metadata)
+
+
+def get_long_description():
+    root = os.path.dirname(__file__)
+    return pathlib.Path(os.path.join(root, "README.md")).read_text()
+
+
+_version: str = package_metadata["__version__"]
+_self_pin = (
+    f"=={_version}"
+    if not (_version.endswith(("dev0", "dev1")) or "docker" in _version)
+    else ""
+)
+
+
+rest_common = {"requests", "requests_file"}
+
+base_requirements = {
+    # Actual dependencies.
+    "prefect >= 3.0.0,<4.0.0",
+    # Pin asyncpg to a version compatible with Python 3.13
+    "asyncpg>=0.30.0",
+    *rest_common,
+    f"acryl-datahub[datahub-rest]{_self_pin}",
+}
+
+
+mypy_stubs = {
+    "types-dataclasses",
+    "sqlalchemy-stubs",
+    "types-setuptools",
+    "types-six",
+    "types-python-dateutil",
+    "types-requests",
+    "types-toml",
+    "types-PyYAML",
+    "types-freezegun",
+    "types-cachetools",
+    # versions 0.1.13 and 0.1.14 seem to have issues
+    "types-click==0.1.12",
+    "types-tabulate",
+    # avrogen package requires this
+    "types-pytz",
+}
+
+dev_requirements = {
+    *base_requirements,
+    *mypy_stubs,
+    "coverage>=5.1",
+    "ruff==0.15.22",
+    "mypy==1.17.1",
+    "pydantic>=2.0.0",
+    "pytest>=6.2.2",
+    "pytest-asyncio>=0.16.0",
+    "pytest-cov>=2.8.1",
+    "tox",
+    # CVE-2026-33155: pickle Delta memory-exhaustion DoS; fixed in 8.6.2.
+    "deepdiff>=8.6.2,<9.0.0",
+    "requests-mock",
+    "freezegun",
+    "jsonpickle",
+    "build",
+    "twine",
+    "packaging",
+}
+
+entry_points = {
+    "prefect.collections": "prefect-datahub = prefect_datahub.datahub_emitter"
+}
+
+
+setuptools.setup(
+    # Package metadata.
+    name=package_metadata["__package_name__"],
+    version=package_metadata["__version__"],
+    url="https://datahub.com/",
+    project_urls={
+        "Documentation": "https://docs.datahub.com/",
+        "Source": "https://github.com/datahub-project/datahub",
+        "Changelog": "https://github.com/acryldata/datahub/releases",
+        "Releases": "https://github.com/acryldata/datahub/releases",
+    },
+    license="Apache-2.0",
+    description="DataHub Prefect plugin — automatically capture flow lineage and run metadata from Prefect workflows into your DataHub catalog",
+    long_description=get_long_description(),
+    long_description_content_type="text/markdown",
+    classifiers=[
+        "Development Status :: 5 - Production/Stable",
+        "Programming Language :: Python",
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3 :: Only",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Intended Audience :: Developers",
+        "Intended Audience :: Information Technology",
+        "Intended Audience :: System Administrators",
+        "Operating System :: Unix",
+        "Operating System :: POSIX :: Linux",
+        "Environment :: Console",
+        "Environment :: MacOS X",
+        "Topic :: Software Development",
+    ],
+    # Package info.
+    zip_safe=False,
+    python_requires=">=3.10",
+    package_dir={"": "src"},
+    packages=setuptools.find_namespace_packages(where="./src"),
+    entry_points=entry_points,
+    # Dependencies.
+    install_requires=list(base_requirements),
+    extras_require={
+        "dev": list(dev_requirements),
+    },
+)

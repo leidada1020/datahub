@@ -1,0 +1,149 @@
+/* eslint-disable import/no-cycle */
+import { X } from '@phosphor-icons/react/dist/csr/X';
+import { Button } from 'antd';
+import React from 'react';
+import styled from 'styled-components/macro';
+
+import { SEARCH_COLORS } from '@app/entityV2/shared/constants';
+import OperatorSelector from '@app/searchV2/filters/OperatorSelector';
+import { operatorRequiresValues } from '@app/searchV2/filters/operator/operator';
+import { FilterOperatorType, FilterPredicate, FilterValue } from '@app/searchV2/filters/types';
+import { getIsDateRangeFilter, useFilterDisplayName } from '@app/searchV2/filters/utils';
+import ValueName from '@app/searchV2/filters/value/ValueName';
+import ValueSelector from '@app/searchV2/filters/value/ValueSelector';
+import { useLoadAggregationOptions } from '@app/searchV2/filters/value/utils';
+import DatePicker from '@utils/DayjsDatePicker';
+import dayjs from '@utils/dayjs';
+
+const DAYJS_DISPLAY_FORMAT = 'll';
+const LIST_SEPARATOR = ', ';
+
+const Values = styled.div`
+    border: 1.5px solid transparent;
+    border-radius: 6px;
+    padding: 2px;
+
+    :hover {
+        cursor: pointer;
+        border: 1.5px solid ${(p) => p.theme.colors.borderBrand};
+        background-color: ${(p) => p.theme.colors.buttonFillBrand};
+        color: ${(p) => p.theme.colors.textOnFillBrand};
+    }
+`;
+
+const Value = styled.span``;
+
+const Container = styled.div<{ $isCompact?: boolean }>`
+    border-radius: 4px;
+    padding: 4px 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    margin-right: 8px;
+    background-color: ${(props) => props.theme.colors.bgSurfaceBrand};
+
+    ${(props) =>
+        props.$isCompact &&
+        `
+        font-size: 12px;
+        padding: 0 6px;
+    `}
+`;
+
+const Icon = styled.div`
+    margin-right: 4px;
+    display: flex;
+    align-items: center;
+`;
+
+const FilterName = styled.div`
+    margin-right: 2px;
+    color: ${SEARCH_COLORS.LINK_BLUE};
+    display: flex;
+    align-items: center;
+`;
+
+const RemoveButton = styled(Button)`
+    padding: 0px;
+    margin: 0px;
+    width: 20px;
+    height: 20px;
+    margin-left: 0px;
+`;
+
+interface SelectedFilterProps {
+    predicate: FilterPredicate;
+    onChangeOperator: (operator: FilterOperatorType) => void;
+    onChangeValues: (newValues: FilterValue[]) => void;
+    onRemoveFilter: () => void;
+    isCompact?: boolean;
+}
+
+export default function SelectedFilter({
+    predicate,
+    onChangeOperator,
+    onChangeValues,
+    onRemoveFilter,
+    isCompact,
+}: SelectedFilterProps) {
+    const { field, operator, values } = predicate;
+    const showValueSelector = operatorRequiresValues(predicate.operator) || false;
+    const displayName = useFilterDisplayName(predicate.field);
+    const isDateRangeFilter = getIsDateRangeFilter(predicate.field);
+
+    const useDatePicker = field.useDatePicker || isDateRangeFilter;
+
+    const { options: aggregatedOptions } = useLoadAggregationOptions({
+        field,
+        visible: true,
+        includeCounts: true,
+    });
+
+    return (
+        <Container
+            $isCompact={isCompact}
+            data-testid={`active-filter-${field.field}`}
+            key={`${field.field}-${operator}-${values.map((value) => value.value).join('-')}`}
+        >
+            <FilterName>
+                {(field.icon && <Icon>{field.icon}</Icon>) || null}
+                {displayName || field.field}
+            </FilterName>
+            <OperatorSelector predicate={predicate} onChangeOperator={onChangeOperator} />
+            {showValueSelector && useDatePicker && (
+                <DatePicker
+                    defaultValue={dayjs(Number(values[0].value))}
+                    disabledDate={isDateRangeFilter ? undefined : (current) => current > dayjs().startOf('day')}
+                    format={DAYJS_DISPLAY_FORMAT}
+                    showToday={false}
+                    allowClear={false}
+                    onChange={(v) => onChangeValues(v ? [{ value: v.valueOf().toString(), entity: null }] : [])}
+                />
+            )}
+            {showValueSelector && !useDatePicker && (
+                <ValueSelector
+                    field={field}
+                    values={values}
+                    defaultOptions={aggregatedOptions}
+                    onChangeValues={onChangeValues}
+                >
+                    <Values>
+                        {values.map((value, index) => (
+                            <Value data-testid={`active-filter-value-${field.field}-${value.value}`}>
+                                <ValueName field={field} value={value} />
+                                {index < values.length - 1 ? LIST_SEPARATOR : ''}
+                            </Value>
+                        ))}
+                    </Values>
+                </ValueSelector>
+            )}
+            <RemoveButton
+                type="text"
+                icon={<X size={12} />}
+                onClick={onRemoveFilter}
+                data-testid={`remove-filter-${field.field}`}
+            />
+        </Container>
+    );
+}

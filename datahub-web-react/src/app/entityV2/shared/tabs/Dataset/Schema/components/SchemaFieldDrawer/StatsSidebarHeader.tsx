@@ -1,0 +1,115 @@
+import { ChartLine } from '@phosphor-icons/react/dist/csr/ChartLine';
+import { Clock } from '@phosphor-icons/react/dist/csr/Clock';
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import LookbackWindowSelect from '@app/entityV2/shared/tabs/Dataset/Stats/historical/LookbackWindowSelect';
+import { LookbackWindow } from '@app/entityV2/shared/tabs/Dataset/Stats/lookbackWindows';
+
+export enum StatsViewType {
+    LATEST,
+    HISTORICAL,
+}
+
+const TabContainer = styled.div`
+    display: flex;
+    margin: 15px 0px 0px;
+    align-items: start;
+    padding: 0 15px;
+    gap: 20px;
+    flex-direction: column;
+`;
+
+const StatsTabViewSwitch = styled.div<{ isActive: boolean }>`
+    background: ${({ isActive, theme }) => (isActive ? `${theme.colors.buttonFillBrand}` : 'transperent')};
+    border-radius: 4px;
+    color: ${({ isActive, theme }) => (isActive ? theme.colors.bg : theme.colors.textSecondary)};
+    cursor: pointer;
+    display: flex;
+    font-size: 14px;
+    justify-content: center;
+    line-height: 30px;
+    height: 42px;
+    width: 180px;
+    align-items: center;
+    gap: 5px;
+    transition:
+        background 0.3s ease,
+        color 0.3s ease;
+`;
+
+const SwitchWrapper = styled.div`
+    border-radius: 4.5px;
+    display: flex;
+    width: 250px;
+    width: 100%;
+    background: ${(props) => props.theme.colors.bgSurface};
+`;
+
+const ReportedAtLabel = styled.div`
+    padding: 0;
+    margin: 0;
+    display: flex;
+    align-items: center;
+    color: ${(props) => props.theme.colors.textTertiary};
+`;
+
+const ActionContainer = styled.div`
+    display: flex;
+    justify-content: end;
+    width: 100%;
+    span {
+        font-size: 12px;
+    }
+`;
+
+type Props = {
+    activeTab: StatsViewType;
+    setActiveTab: (type: StatsViewType) => void;
+    reportedAt: string;
+    lookbackWindow: LookbackWindow;
+    setLookbackWindow: (window: LookbackWindow) => void;
+};
+
+export default function StatsSidebarHeader({
+    activeTab,
+    setActiveTab,
+    lookbackWindow,
+    setLookbackWindow,
+    reportedAt,
+}: Props) {
+    const { t } = useTranslation('entity.profile.schema');
+    const handleTabClick = (type: StatsViewType) => {
+        setActiveTab(type);
+    };
+
+    const actionView =
+        activeTab === StatsViewType.HISTORICAL ? (
+            <LookbackWindowSelect lookbackWindow={lookbackWindow} setLookbackWindow={setLookbackWindow} />
+        ) : (
+            <ReportedAtLabel>{reportedAt}</ReportedAtLabel>
+        );
+
+    return (
+        <TabContainer>
+            <SwitchWrapper>
+                <StatsTabViewSwitch
+                    isActive={activeTab === StatsViewType.LATEST}
+                    onClick={() => handleTabClick(StatsViewType.LATEST)}
+                >
+                    <ChartLine />
+                    {t('statsSidebar.statsAndInsights')}
+                </StatsTabViewSwitch>
+                <StatsTabViewSwitch
+                    isActive={activeTab === StatsViewType.HISTORICAL}
+                    onClick={() => handleTabClick(StatsViewType.HISTORICAL)}
+                >
+                    <Clock />
+                    {t('statsSidebar.historicalStats')}
+                </StatsTabViewSwitch>
+            </SwitchWrapper>
+            <ActionContainer>{actionView}</ActionContainer>
+        </TabContainer>
+    );
+}

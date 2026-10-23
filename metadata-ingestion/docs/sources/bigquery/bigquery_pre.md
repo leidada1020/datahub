@@ -1,0 +1,180 @@
+### Overview
+
+The `bigquery` module ingests metadata from Bigquery into DataHub. It is intended for production ingestion workflows and module-specific capabilities are documented below.
+
+### Prerequisites
+
+Familiarize yourself with BigQuery ingestion architecture:
+
+<p align="center">
+  <img width="70%"  src="https://github.com/datahub-project/static-assets/raw/main/imgs/integrations/bigquery/source-bigquery-setup.png"/>
+</p>
+
+Two key concepts:
+
+- **Extractor Project**: Project containing the service account used to run metadata extraction queries
+- **BigQuery Projects**: Projects from which DataHub collects metadata (tables, lineage, usage, profiling). By default includes the extractor project; configure `project_ids` to specify projects explicitly
+
+With `use_queries_v2: true` (the default), lineage and usage come from each ingested project's own job history. If the jobs that write your tables run in a different project, such as a separate billing or backfill project, make sure that project is ingested too: add it to `project_ids` if you set that, otherwise include it in `project_id_pattern` (and `project_labels`, if set). Grant it the same roles as your other projects, including `roles/bigquery.resourceViewer`. Otherwise those jobs are never read, and their tables show no lineage. Ingested projects are also scanned for their own datasets; use `dataset_pattern` to skip datasets you don't want catalogued.
+
+#### Create a datahub profile in GCP
+
+1. Create a custom role for DataHub following [BigQuery docs](https://cloud.google.com/iam/docs/creating-custom-roles#creating_a_custom_role)
+2. Grant permissions to this role on the extractor project and all target projects (see below)
+
+##### Basic Requirements (needed for metadata ingestion)
+
+**1. Grant the following permissions on the Extractor Project:**
+
+| permission                       | Description                                                                                                                         | Capability                                                                                                    |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `bigquery.jobs.create`           | Run jobs (e.g. queries) within the project. _This only needs for the extractor project where the service account belongs_           |                                                                                                               |
+| `bigquery.jobs.list`             | Manage the queries that the service account has sent. _This only needs for the extractor project where the service account belongs_ |                                                                                                               |
+| `bigquery.readsessions.create`   | Create a session for streaming large results. _This only needs for the extractor project where the service account belongs_         |                                                                                                               |
+| `bigquery.readsessions.getData`  | Get data from the read session. _This only needs for the extractor project where the service account belongs_                       |
+
+**2. Grant the following permissions on all target projects for metadata extraction:**
+
+:::info
+
+These permissions must be granted on **every project** you want to extract metadata from.
+
+:::
+| Permission | Description | Capability | Default GCP Role Which Contains This Permission |
+|----------------------------------|-----------------------------------------------------------------------------------------------------------------|-------------------------------------|---------------------------------------------------------------------------|
+| `bigquery.datasets.get` | Retrieve metadata about a dataset; also used on the lineage-only path to detect BigQuery Sharing linked datasets. | Table Metadata Extraction, Lineage Extraction | [roles/bigquery.metadataViewer](https://cloud.google.com/bigquery/docs/access-control#bigquery.metadataViewer) |
+| `bigquery.datasets.getIamPolicy` | Read a dataset's IAM permissions. | Table Metadata Extraction | [roles/bigquery.metadataViewer](https://cloud.google.com/bigquery/docs/access-control#bigquery.metadataViewer) |
+| `bigquery.tables.list` | List BigQuery tables. | Table Metadata Extraction | [roles/bigquery.metadataViewer](https://cloud.google.com/bigquery/docs/access-control#bigquery.metadataViewer) |
+| `bigquery.tables.get` | Retrieve metadata for a table. | Table Metadata Extraction | [roles/bigquery.metadataViewer](https://cloud.google.com/bigquery/docs/access-control#bigquery.metadataViewer) |
+| `bigquery.routines.get` | Get Routines. Needs to retrieve metadata for a table from system table. | Table Metadata Extraction | [roles/bigquery.metadataViewer](https://cloud.google.com/bigquery/docs/access-control#bigquery.metadataViewer) |
+| `bigquery.routines.list` | List Routines. Needs to retrieve metadata for a table from system table. | Table Metadata Extraction | [roles/bigquery.metadataViewer](https://cloud.google.com/bigquery/docs/access-control#bigquery.metadataViewer) |
+| `resourcemanager.projects.get` | Get project metadata. | Table Metadata Extraction | [roles/bigquery.metadataViewer](https://cloud.google.com/bigquery/docs/access-control#bigquery.metadataViewer) |
+| `resourcemanager.projects.list` | Search projects. Needed if not setting `project_ids`. | Table Metadata Extraction | [roles/bigquery.metadataViewer](https://cloud.google.com/bigquery/docs/access-control#bigquery.metadataViewer) |
+| `bigquery.jobs.listAll` | List all jobs (queries) submitted by any user. Needs for Lineage extraction. | Lineage Extraction/Usage Extraction | [roles/bigquery.resourceViewer](https://cloud.google.com/bigquery/docs/access-control#bigquery.resourceViewer) |
+| `logging.logEntries.list` | Fetch log entries for lineage/usage data. Not required if `use_exported_bigquery_audit_metadata` is enabled. | Lineage Extraction/Usage Extraction | [roles/logging.privateLogViewer](https://cloud.google.com/logging/docs/access-control#logging.privateLogViewer) |
+| `logging.privateLogEntries.list` | Fetch log entries for lineage/usage data. Not required if `use_exported_bigquery_audit_metadata` is enabled. | Lineage Extraction/Usage Extraction | [roles/logging.privateLogViewer](https://cloud.google.com/logging/docs/access-control#logging.privateLogViewer) |
+| `bigquery.tables.getData` | Access table data to extract storage size, last updated at, partition information, data profiles etc. **Required when profiling is enabled or when `use_tables_list_query_v2` is enabled.** This permission is needed to query BigQuery's `__TABLES__` pseudo-table. | Profiling/Enhanced Table Metadata | |
+| `datacatalog.taxonomies.get` | _Optional_ Get policy tags for columns with associated policy tags. This permission is required only if `extract_policy_tags_from_catalog` is enabled. | Policy Tag Extraction | [roles/datacatalog.viewer](https://cloud.google.com/iam/docs/roles-permissions/datacatalog#datacatalog.viewer) |
+| `analyticshub.subscriptions.list` | _Optional_ List BigQuery Sharing subscriptions, to record which listing a linked dataset came from and whether the subscription is still active. Required only if `extract_subscriptions_from_analytics_hub` is enabled. | BigQuery Sharing Properties | [roles/analyticshub.subscriptionOwner](https://cloud.google.com/bigquery/docs/analytics-hub-grant-roles) |
+
+:::warning Important: bigquery.tables.getData Permission
+
+The `bigquery.tables.getData` permission is **required** in the following scenarios:
+
+- When **profiling is enabled** (`profiling.enabled: true`)
+- When **`use_tables_list_query_v2` is enabled** (for enhanced table metadata extraction)
+
+Without this permission, you'll encounter errors when the connector tries to access BigQuery's `__TABLES__` pseudo-table for detailed table information including partition data, row counts, and storage metrics.
+
+:::
+
+##### BigQuery Sharing (linked datasets)
+
+A linked dataset is a read-only pointer into a dataset published by another project. The dataset
+itself is labelled `Linked Dataset`, and its tables are given lineage back to the objects they were
+shared from, using the permissions listed above. Nothing extra is needed on the project that holds
+the linked dataset.
+
+Lineage points at the **publisher's** project, so the ingestion account needs to be able to resolve
+that project's name. What you grant there decides the outcome:
+
+| Granted on the publisher project                                                                                                         | Result                                                                                                |
+| ---------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Nothing                                                                                                                                  | No lineage for datasets shared from it. The ingestion report says which project could not be resolved |
+| Any role carrying `resourcemanager.projects.get`, such as [roles/browser](https://cloud.google.com/iam/docs/understanding-roles#browser) | Lineage resolves. The publisher's own tables are not catalogued unless that project is also ingested  |
+| The permissions listed above, i.e. you ingest the publisher project too                                                                  | Lineage resolves and both ends appear in the catalogue                                                |
+
+:::note
+
+The share reports its source as a project **number**, not a project ID. When the publisher project
+is one the ingestion account can already see in BigQuery, the number is resolved from the project
+list at no extra cost; otherwise it falls back to the Resource Manager API, which is where
+`resourcemanager.projects.get` on the publisher project is needed.
+
+:::
+
+This is off by default; set `include_linked_dataset_lineage: true` to enable it. Set
+`extract_subscriptions_from_analytics_hub: true` to additionally record the listing and
+subscription state. That reads the BigQuery Sharing API and needs
+`analyticshub.subscriptions.list` plus the `analyticshub.googleapis.com` service enabled on the
+project holding the linked dataset.
+
+#### Create a service account in the Extractor Project
+
+1. Create a service account following [BigQuery docs](https://cloud.google.com/iam/docs/creating-managing-service-accounts#iam-service-accounts-create-console) and assign the custom role created above
+2. Download a service account JSON keyfile
+   Example credential file:
+
+```json
+{
+  "type": "service_account",
+  "project_id": "project-id-1234567",
+  "private_key_id": "d0121d0000882411234e11166c6aaa23ed5d74e0",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIyourkey\n-----END PRIVATE KEY-----",
+  "client_email": "test@suppproject-id-1234567.iam.gserviceaccount.com",
+  "client_id": "113545814931671546333",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/test%suppproject-id-1234567.iam.gserviceaccount.com"
+}
+```
+
+3. To provide credentials to the source, you can either:
+
+   Set an environment variable:
+
+   ```sh
+   $ export GOOGLE_APPLICATION_CREDENTIALS="/path/to/keyfile.json"
+   ```
+
+   _or_
+
+   Set credential config in your source based on the credential json file. For example:
+
+   ```yml
+   credential:
+     project_id: project-id-1234567
+     private_key_id: "d0121d0000882411234e11166c6aaa23ed5d74e0"
+     private_key: "-----BEGIN PRIVATE KEY-----\nMIIyourkey\n-----END PRIVATE KEY-----\n"
+     client_email: "test@suppproject-id-1234567.iam.gserviceaccount.com"
+     client_id: "123456678890"
+   ```
+
+#### Workload Identity Federation (keyless authentication)
+
+As an alternative to long-lived service account keys, you can authenticate with [Workload Identity Federation](https://cloud.google.com/iam/docs/workload-identity-federation) (WIF). WIF lets workloads running outside of Google Cloud (for example in AWS, Azure, on-prem Kubernetes, or self-hosted Docker) impersonate a Google service account using short-lived tokens minted from an external identity provider.
+
+To use WIF, set `auth_type: workload_identity_federation` and supply the WIF configuration in one of three mutually exclusive ways:
+
+| Field                               | Description                                                                                               |
+| ----------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `gcp_wif_configuration`             | Path to the WIF configuration JSON file on disk.                                                          |
+| `gcp_wif_configuration_json`        | The WIF configuration as an inline YAML/JSON dict (or JSON string). Useful when storing the value inline. |
+| `gcp_wif_configuration_json_string` | The WIF configuration as a single JSON string. Useful when injecting from a secret manager.               |
+
+The WIF configuration is the standard `external_account` JSON produced by `gcloud iam workload-identity-pools create-cred-config` — for example:
+
+```json
+{
+  "type": "external_account",
+  "audience": "//iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL_ID/providers/PROVIDER_ID",
+  "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+  "token_url": "https://sts.googleapis.com/v1/token",
+  "credential_source": { "file": "/var/run/secrets/tokens/gcp-ksa/token" },
+  "service_account_impersonation_url": "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/SERVICE_ACCOUNT_EMAIL:generateAccessToken"
+}
+```
+
+The impersonated service account must have the BigQuery permissions described above. When `auth_type` is `workload_identity_federation`, the `credential` field is not used and must be omitted.
+
+##### Profiling Requirements
+
+**For external tables backed by Google Drive:**
+
+Grant "Viewer" access to the service account's email (`client_email` from credentials JSON) on the Google Drive documents:
+
+1. Find the source document: BigQuery Console → Table → Details → "Source" field
+2. Share the document: Open document → Share → Add service account email with "Viewer" access
+
+![Google Drive Sharing Dialog](https://github.com/datahub-project/static-assets/raw/main/imgs/integrations/bigquery/google_drive_share.png)

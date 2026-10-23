@@ -1,0 +1,56 @@
+source:
+  type: hive
+  config:
+    # Coordinates
+    host_port: localhost:10000
+    database: DemoDatabase # optional, if not specified, ingests from all databases
+
+    # Credentials
+    username: user # optional
+    password: pass # optional
+
+    # For more details on authentication, see the impyla docs:
+    # https://github.com/cloudera/impyla#usage.
+    # LDAP, Kerberos, etc. are supported using connect_args, which can be
+    # added under the `options` config parameter.
+    #options:
+    #  connect_args:
+    #    auth: KERBEROS
+    #    kerberos_service_name: hive
+    #scheme: 'hive+http' # set this if Thrift should use the HTTP transport
+    #scheme: 'hive+https' # set this if Thrift should use the HTTP with SSL transport
+    #scheme: 'sparksql' # set this for Spark Thrift Server
+
+    # Storage Lineage Configuration (Optional)
+    # Enables lineage between Hive tables and their underlying storage locations
+    #emit_storage_lineage: false  # Set to true to enable storage lineage
+    #hive_storage_lineage_direction: upstream  # Direction: 'upstream' (storage -> Hive) or 'downstream' (Hive -> storage)
+    #include_column_lineage: true  # Set to false to disable column-level lineage
+    #storage_platform_instance: "prod-s3"  # Optional: platform instance for storage URNs
+
+sink:
+  # sink configs
+
+# ---------------------------------------------------------
+# Recipe (Azure HDInsight)
+# Connecting to Microsoft Azure HDInsight using TLS.
+# ---------------------------------------------------------
+
+source:
+  type: hive
+  config:
+    # Coordinates
+    host_port: <cluster_name>.azurehdinsight.net:443
+
+    # Credentials
+    username: admin
+    password: password
+
+    # Options
+    options:
+      connect_args:
+        http_path: "/hive2"
+        auth: BASIC
+
+sink:
+  # sink configs

@@ -1,0 +1,192 @@
+import { Button, PageTitle, Pagination, SearchBar, StructuredPopover } from '@components';
+import { Plus } from '@phosphor-icons/react/dist/csr/Plus';
+import React, { useEffect, useMemo, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { useUserContext } from '@app/context/useUserContext';
+import {
+    ButtonContainer,
+    HeaderContainer,
+    HeaderContent,
+    PageContainer,
+} from '@app/govern/structuredProperties/styledComponents';
+import CreateNewTagModal from '@app/tags/CreateNewTagModal/CreateNewTagModal';
+import EmptyTags from '@app/tags/EmptyTags';
+import TagsTable from '@app/tags/TagsTable';
+import { Message } from '@src/app/sharedV2/Message';
+import { useEntityRegistry } from '@src/app/useEntityRegistry';
+import { useShowNavBarRedesign } from '@src/app/useShowNavBarRedesign';
+import { useGetSearchResultsForMultipleQuery } from '@src/graphql/search.generated';
+import { EntityType } from '@src/types.generated';
+
+// Simple loading indicator at the top of the page
+const LoadingBar = styled.div`
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 4px;
+    background-color: ${(props) => props.theme.colors.bgSurfaceBrand};
+    z-index: 1000;
+    animation: loading 2s infinite ease-in-out;
+
+    @keyframes loading {
+        0% {
+            opacity: 0.6;
+        }
+        50% {
+            opacity: 1;
+        }
+        100% {
+            opacity: 0.6;
+        }
+    }
+`;
+
+const PAGE_SIZE = 10;
+
+const ManageTags = () => {
+    const { t } = useTranslation('misc');
+    const isShowNavBarRedesign = useShowNavBarRedesign();
+    const [searchQuery, setSearchQuery] = useState('');
+    const [currentPage, setCurrentPage] = useState(1);
+    const [pageSize, setPageSize] = useState(PAGE_SIZE);
+    const [debouncedSearchQuery, setDebouncedSearchQuery] = useState('*');
+    const entityRegistry = useEntityRegistry();
+    const [showCreateTagModal, setShowCreateTagModal] = useState(false);
+
+    const userContext = useUserContext();
+    const canCreateTags = userContext?.platformPrivileges?.createTags || userContext?.platformPrivileges?.manageTags;
+
+    useEffect(() => {
+        const timer = setTimeout(() => {
+            setDebouncedSearchQuery(searchQuery);
+        }, 300);
+
+        return () => clearTimeout(timer);
+    }, [searchQuery]);
+
+    const searchInputs = useMemo(
+        () => ({
+            types: [EntityType.Tag],
+            query: debouncedSearchQuery,
+            start: (currentPage - 1) * pageSize,
+            count: pageSize,
+            filters: [],
+        }),
+        [currentPage, debouncedSearchQuery, pageSize],
+    );
+
+    const {
+        data: searchData,
+        loading: searchLoading,
+        error: searchError,
+        refetch,
+        networkStatus,
+    } = useGetSearchResultsForMultipleQuery({
+        variables: { input: searchInputs },
+        fetchPolicy: 'cache-first',
+        notifyOnNetworkStatusChange: false,
+    });
+
+    const totalTags = searchData?.searchAcrossEntities?.total || 0;
+
+    const hasSearchResults = useMemo(() => {
+        const results = searchData?.searchAcrossEntities?.searchResults || [];
+        if (debouncedSearchQuery) {
+            return results.some((result) => {
+                const tag = result.entity;
+                const displayName = entityRegistry.getDisplayName(EntityType.Tag, tag);
+                return displayName.toLowerCase().includes(debouncedSearchQuery.toLowerCase());
+            });
+        }
+        return results.length > 0;
+    }, [searchData, debouncedSearchQuery, entityRegistry]);
+
+    if (searchError) {
+        return <Message type="error" content={t('tags.loadError', { error: searchError.message })} />;
+    }
+
+    const createButton = !canCreateTags ? (
+        <StructuredPopover
+            title={t('tags.noCreatePermissionTooltip')}
+            placement="left"
+            showArrow
+            mouseEnterDelay={0.1}
+            mouseLeaveDelay={0.1}
+        >
+            <span>
+                <Button size="md" color="primary" icon={{ icon: Plus }} disabled>
+                    {t('tags.createButton')}
+                </Button>
+            </span>
+        </StructuredPopover>
+    ) : (
+        <Button
+            onClick={() => setShowCreateTagModal(true)}
+            size="md"
+            color="primary"
+            icon={{ icon: Plus }}
+            data-testid="add-tag-button"
+        >
+            {t('tags.createButton')}
+        </Button>
+    );
+
+    return (
+        <PageContainer $isShowNavBarRedesign={isShowNavBarRedesign}>
+            {searchLoading && <LoadingBar />}
+            <HeaderContainer>
+                <HeaderContent>
+                    <PageTitle title={t('tags.pageTitle')} subTitle={t('tags.pageSubtitle')} />
+                </HeaderContent>
+                <ButtonContainer>{createButton}</ButtonContainer>
+            </HeaderContainer>
+            <SearchBar
+                placeholder={t('tags.searchPlaceholder')}
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e)}
+                data-testid="tag-search-input"
+                width="280px"
+            />
+            {!searchLoading && !hasSearchResults ? (
+                <EmptyTags isEmptySearch={debouncedSearchQuery.length > 0} />
+            ) : (
+                <>
+                    <TagsTable
+                        searchQuery={debouncedSearchQuery}
+                        searchData={searchData}
+                        loading={searchLoading}
+                        networkStatus={networkStatus}
+                        refetch={refetch}
+                    />
+                    <Pagination
+                        currentPage={currentPage}
+                        itemsPerPage={pageSize}
+                        total={totalTags}
+                        loading={searchLoading}
+                        onPageChange={(newPage, newPageSize) => {
+                            if (newPageSize !== pageSize) {
+                                setCurrentPage(1);
+                                setPageSize(newPageSize);
+                            } else {
+                                setCurrentPage(newPage);
+                            }
+                        }}
+                    />
+                </>
+            )}
+
+            <CreateNewTagModal
+                open={showCreateTagModal}
+                onClose={() => {
+                    setShowCreateTagModal(false);
+                    setTimeout(() => refetch(), 3000);
+                }}
+            />
+        </PageContainer>
+    );
+};
+
+export { ManageTags };

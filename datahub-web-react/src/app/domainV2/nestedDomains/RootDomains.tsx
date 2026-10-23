@@ -1,0 +1,71 @@
+import { BookOpen } from '@phosphor-icons/react/dist/csr/BookOpen';
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import EmptyDomainDescription from '@app/domainV2/EmptyDomainDescription';
+import EmptyDomainsSection from '@app/domainV2/EmptyDomainsSection';
+import useScrollDomains from '@app/domainV2/useScrollDomains';
+import Loading from '@app/sharedV2/Loading';
+import { Message } from '@app/sharedV2/Message';
+import { useEntityRegistry } from '@app/useEntityRegistry';
+
+import { EntityType } from '@types';
+
+const DomainsWrapper = styled.div`
+    overflow: auto;
+    padding: 0 20px 12px 20px;
+`;
+
+const ResultWrapper = styled.div`
+    padding: 16px;
+    margin: 0px;
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    background-color: ${(props) => props.theme.colors.bg};
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: ${(props) => props.theme.colors.shadowXs};
+    border: 1px solid ${(props) => props.theme.colors.border};
+`;
+
+const LoadingWrapper = styled.div`
+    padding: 16px;
+`;
+
+interface Props {
+    setIsCreatingDomain: React.Dispatch<React.SetStateAction<boolean>>;
+}
+export default function RootDomains({ setIsCreatingDomain }: Props) {
+    const { t } = useTranslation('governance.domain');
+    const entityRegistry = useEntityRegistry();
+    const { domains, hasInitialized, loading, error, scrollRef } = useScrollDomains({});
+
+    return (
+        <>
+            {error && <Message type="error" content={t('list.loadError')} />}
+            {hasInitialized && domains.length === 0 && (
+                <EmptyDomainsSection
+                    icon={<BookOpen />}
+                    title={t('empty.organizeTitle')}
+                    description={<EmptyDomainDescription />}
+                    setIsCreatingDomain={setIsCreatingDomain}
+                />
+            )}
+            <DomainsWrapper>
+                {domains?.map((domain) => (
+                    <ResultWrapper key={domain.urn}>
+                        {entityRegistry.renderSearchResult(EntityType.Domain, { entity: domain, matchedFields: [] })}
+                    </ResultWrapper>
+                ))}
+                {loading && (
+                    <LoadingWrapper>
+                        <Loading height={24} marginTop={0} />
+                    </LoadingWrapper>
+                )}
+                {domains.length > 0 && <div ref={scrollRef} />}
+            </DomainsWrapper>
+        </>
+    );
+}

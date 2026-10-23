@@ -1,0 +1,58 @@
+import { InfiniteScrollList } from '@components';
+import { FileText } from '@phosphor-icons/react/dist/csr/FileText';
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import { useHistory } from 'react-router';
+
+import { useEntityData } from '@app/entity/shared/EntityContext';
+import { EntityTabPath } from '@app/entityV2/shared/constants';
+import { useGetChildDataProducts } from '@app/entityV2/summary/modules/dataProducts/useGetChildDataProducts';
+import EmptyContent from '@app/homeV3/module/components/EmptyContent';
+import EntityItem from '@app/homeV3/module/components/EntityItem';
+import LargeModule from '@app/homeV3/module/components/LargeModule';
+import { ModuleProps } from '@app/homeV3/module/types';
+import { useEntityRegistry } from '@app/useEntityRegistry';
+
+import { DataHubPageModuleType, Entity } from '@types';
+
+const DEFAULT_PAGE_SIZE = 10;
+
+export default function DataProductsModule(props: ModuleProps) {
+    const { t } = useTranslation('modules');
+    const entityRegistry = useEntityRegistry();
+    const { urn, entityType } = useEntityData();
+    const { loading, fetchEntities, total } = useGetChildDataProducts(DEFAULT_PAGE_SIZE);
+
+    const history = useHistory();
+
+    const navigateToDataProductsTab = () => {
+        history.push(`${entityRegistry.getEntityUrl(entityType, urn)}/${EntityTabPath.DATA_PRODUCTS}`);
+    };
+
+    return (
+        <LargeModule
+            {...props}
+            loading={loading}
+            onClickViewAll={navigateToDataProductsTab}
+            dataTestId="data-products-module"
+        >
+            <InfiniteScrollList<Entity>
+                fetchData={fetchEntities}
+                renderItem={(entity) => (
+                    <EntityItem entity={entity} key={entity.urn} moduleType={DataHubPageModuleType.DataProducts} />
+                )}
+                pageSize={DEFAULT_PAGE_SIZE}
+                emptyState={
+                    <EmptyContent
+                        icon={FileText}
+                        title={t('dataProducts.emptyTitle')}
+                        description={t('dataProducts.emptyDescription')}
+                        linkText={t('dataProducts.emptyLink')}
+                        onLinkClick={navigateToDataProductsTab}
+                    />
+                }
+                totalItemCount={total}
+            />
+        </LargeModule>
+    );
+}

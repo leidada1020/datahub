@@ -1,0 +1,78 @@
+import { toast } from '@components';
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { GroupProfileInfoCard, SidebarData } from '@app/entityV2/group/GroupProfileInfoCard';
+import { GroupSidebarMembersSection } from '@app/entityV2/group/GroupSidebarMembersSection';
+import { GroupSidebarOwnersSection } from '@app/entityV2/group/GroupSidebarOwnersSection';
+import { Content, SideBar } from '@app/entityV2/shared/SidebarStyledComponents';
+import { AboutSidebarSection } from '@app/entityV2/shared/sidebarSection/AboutSidebarSection';
+
+import { useUpdateCorpGroupPropertiesMutation } from '@graphql/group.generated';
+
+type Props = {
+    sidebarData: SidebarData;
+    refetch: () => Promise<any>;
+};
+
+export const MemberCount = styled.div`
+    font-size: 10px;
+    color: ${(props) => props.theme.colors.bg};
+    font-weight: 400;
+    text-align: left;
+`;
+
+/**
+ * Responsible for reading & writing users.
+ */
+export default function GroupSidebar({ sidebarData, refetch }: Props) {
+    const { t } = useTranslation('entity.types');
+    const { t: tf } = useTranslation('common.feedback');
+    const {
+        aboutText,
+        groupMemberRelationships,
+        urn,
+        groupOwnership: ownership,
+        isExternalGroup,
+        externalGroupType,
+    } = sidebarData;
+    const [updateCorpGroupPropertiesMutation] = useUpdateCorpGroupPropertiesMutation();
+
+    // About Text save
+    const onSaveAboutMe = (inputString) => {
+        updateCorpGroupPropertiesMutation({
+            variables: {
+                urn: urn || '',
+                input: {
+                    description: inputString,
+                },
+            },
+        })
+            .then(() => {
+                toast.success(tf('changesSaved'), { duration: 3 });
+                refetch();
+            })
+            .catch((e) => {
+                toast.destroy();
+                toast.error(t('shared.saveChangesError', { error: e.message || '' }), { duration: 3 });
+            });
+    };
+
+    return (
+        <SideBar>
+            <GroupProfileInfoCard sidebarData={sidebarData} refetch={refetch} />
+            <Content>
+                <AboutSidebarSection aboutText={aboutText || ''} isProfileOwner onSaveAboutMe={onSaveAboutMe} />
+                <GroupSidebarOwnersSection ownership={ownership} refetch={refetch} urn={urn} />
+                <GroupSidebarMembersSection
+                    groupMemberRelationships={groupMemberRelationships}
+                    urn={urn}
+                    refetch={refetch}
+                    isExternalGroup={isExternalGroup}
+                    externalGroupType={externalGroupType}
+                />
+            </Content>
+        </SideBar>
+    );
+}

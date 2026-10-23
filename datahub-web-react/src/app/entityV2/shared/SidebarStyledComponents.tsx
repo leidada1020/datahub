@@ -1,0 +1,294 @@
+import { Icon } from '@components';
+import { EnvelopeOpen } from '@phosphor-icons/react/dist/csr/EnvelopeOpen';
+import { PencilSimple } from '@phosphor-icons/react/dist/csr/PencilSimple';
+import React from 'react';
+import styled from 'styled-components';
+
+export const SideBar = styled.div`
+    padding: 0 17px;
+    text-align: center;
+    font-style: normal;
+    font-weight: bold;
+    position: relative;
+
+    .divider-infoSection {
+        margin: 18px 0px 18px 0;
+    }
+    .divider-aboutSection {
+        margin: 23px 0px 11px 0;
+    }
+    .divider-groupsSection {
+        margin: 23px 0px 11px 0;
+    }
+`;
+
+export const EmptyValue = styled.div<{ color?: string }>`
+    &:after {
+        content: 'None';
+        color: ${(props) => props.color || props.theme.colors.textDisabled};
+        font-style: italic;
+        font-weight: 100;
+    }
+`;
+
+export const Name = styled.div`
+    font-size: 12px;
+    line-height: 18px;
+    color: ${(props) => props.theme.colors.text};
+    text-align: left;
+    display: flex;
+    align-items: center;
+    gap: 0.2rem;
+    span {
+        text-overflow: ellipsis;
+        overflow: hidden;
+        white-space: nowrap;
+    }
+    @media only screen and (min-width: 1200px) {
+        color: ${(props) => props.theme.colors.textOnFillBrand};
+    }
+`;
+
+export const TitleRole = styled.div`
+    font-size: 12px;
+    line-height: 18px;
+    color: ${(props) => props.theme.colors.text};
+    text-align: left;
+    white-space: wrap;
+    @media only screen and (min-width: 1200px) {
+        color: ${(props) => props.theme.colors.textOnFillBrand};
+    }
+`;
+
+export const RoleName = styled.div`
+    text-align: center;
+    color: ${(props) => props.theme.colors.textOnFillBrand};
+    border-radius: 30px;
+    background-color: ${(props) => props.theme.colors.bgActive};
+    padding: 3px 5px;
+    text-transform: uppercase;
+    font-size: 7px;
+    line-height: 9px;
+    position: relative;
+    z-index: 2;
+    @media only screen and (min-width: 1200px) {
+        background-color: ${(props) => props.theme.colors.overlayLight};
+    }
+`;
+
+export const SocialDetails = styled.div`
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 12px;
+    line-height: 20px;
+    color: ${(props) => props.theme.colors.text};
+    text-align: left;
+    span {
+        text-overflow: ellipsis;
+        overflow: hidden;
+        white-space: nowrap;
+    }
+    .ant-space-item {
+        display: flex;
+        align-items: center;
+    }
+`;
+
+export const AboutSection = styled.div`
+    text-align: left;
+    font-weight: bold;
+    font-size: 14px;
+    line-height: 22px;
+    color: ${(props) => props.theme.colors.text};
+`;
+
+export const AboutSectionText = styled.div`
+    font-size: 12px;
+    font-weight: 100;
+    line-height: 15px;
+    color: ${(props) => props.theme.colors.textSecondary};
+
+    &&& .ant-typography {
+        margin-bottom: 0;
+    }
+    &&& .ant-typography-edit-content {
+        padding-left: 15px;
+        padding-top: 5px;
+    }
+`;
+
+export const TagsSection = styled.div`
+    display: flex;
+    align-items: start;
+    justify-content: start;
+    flex-wrap: wrap;
+    margin-top: 0.5rem;
+    align-self: start;
+`;
+
+export const Content = styled.div`
+    display: flex;
+    flex-direction: column;
+    align-items: start;
+    justify-content: start;
+
+    & > div {
+        padding-top: 12px;
+        padding-bottom: 12px;
+        width: 100%;
+        &:not(:last-child) {
+            border-bottom: 1px solid;
+            border-color: ${(props) => props.theme.colors.border};
+        }
+    }
+`;
+
+export const CustomAvatarContainer = styled.div`
+    position: relative;
+    margin-top: 20px;
+    &:hover {
+        .edit-button-container {
+            display: block;
+        }
+    }
+`;
+
+export const UserInfo = styled.div`
+    display: flex;
+    gap: 1rem;
+    padding: 10px 10px;
+    background: ${(props) => props.theme.colors.bgSurface};
+    border-radius: 10px;
+    justify-content: center;
+    @media only screen and (min-width: 1200px) {
+        justify-content: flex-start;
+    }
+    @media only screen and (min-width: 1600px) {
+        padding: 20px 20px;
+    }
+`;
+
+export const GroupInfo = styled.div`
+    display: flex;
+    flex-direction: column;
+    flex-wrap: wrap;
+    background: ${(props) => props.theme.colors.bgSurface};
+    border-radius: 10px;
+    overflow: hidden;
+`;
+
+export const SocialInfo = styled.div`
+    display: flex;
+    flex-direction: column;
+    z-index: 2;
+    position: relative;
+    justify-content: flex-end;
+    gap: 0.4rem;
+`;
+
+export const GradientContainer = styled.div<{ gradient?: string; height?: number }>`
+    border-radius: 10px 10px 0px 0px;
+    background: ${(props) => props.gradient || props.theme.colors.brandGradient};
+    height: 65px;
+    width: 100%;
+    z-index: 1;
+    display: flex;
+    gap: 10px;
+    justify-content: start;
+    padding: 0 10px;
+    position: absolute;
+    @media only screen and (min-width: 1200px) and (max-width: 1600px) {
+        height: 55px;
+    }
+`;
+
+export const BasicDetailsContainer = styled.div`
+    font-size: 12px;
+    align-items: start;
+    position: relative;
+`;
+
+export const EditProfileButtonContainer = styled.div`
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    z-index: 2;
+    cursor: pointer;
+    &&& div {
+        color: ${(props) => props.theme.colors.textOnFillBrand};
+        border-color: transparent;
+        height: 18px;
+        width: 18px;
+        display: flex;
+        align-items: center;
+        &:hover {
+            background: ${(props) => props.theme.colors.buttonFillBrand};
+        }
+    }
+`;
+
+export const BasicDetails = styled.div`
+    position: relative;
+    z-index: 2;
+    display: flex;
+    flex-direction: column;
+    .ant-divider {
+        margin: 0.5rem 0px;
+    }
+    @media only screen and (min-width: 1200px) {
+        gap: 1rem;
+        .ant-divider {
+            display: none;
+        }
+    }
+`;
+
+export const DraftsOutlinedIconStyle = () => <Icon icon={EnvelopeOpen} size="sm" color="inherit" />;
+
+export const SubscriptionContainer = styled.div`
+    display: flex;
+    gap: 0.5rem;
+`;
+
+export const OwnershipContainer = styled.div`
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+`;
+
+export const NameTitleContainer = styled.div`
+    display: flex;
+    flex-direction: column;
+`;
+
+export const WhiteEditOutlinedIconStyle = () => <Icon icon={PencilSimple} size="md" color="inherit" />;
+
+export const ShowMoreButton = styled.div`
+    margin-top: 8px;
+    padding: 0px;
+    color: ${(props) => props.theme.colors.textSecondary};
+    text-align: left;
+    :hover {
+        cursor: pointer;
+        color: ${(props) => props.theme.colors.textHover};
+        text-decoration: underline;
+    }
+`;
+
+export const ShowMoreText = styled.div`
+    margin-top: 8px;
+    padding: 0px;
+    color: ${(props) => props.theme.colors.textSecondary};
+    text-align: left;
+`;
+
+export const CountStyle = styled.div`
+    background-color: ${(props) => props.theme.colors.bgSurface};
+    border-radius: 100px;
+    color: ${(props) => props.theme.colors.textSecondary};
+    padding: 0px 10px;
+    margin: 0px 5px;
+    font-size: 10px;
+    line-height: 18px;
+`;

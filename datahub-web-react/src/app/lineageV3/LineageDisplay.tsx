@@ -1,0 +1,232 @@
+import React, { useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import { useOnSelectionChange, useReactFlow } from 'reactflow';
+
+import { LINEAGE_ANNOTATION_NODE_NAME } from '@app/lineageV3/LineageAnnotationNode/LineageAnnotationNode';
+import useAddAnnotationNodes from '@app/lineageV3/LineageAnnotationNode/useAddAnnotationNodes';
+import { DATA_FLOW_LINEAGE_CONTROL_NODE_NAME } from '@app/lineageV3/LineageBoundingBoxNode/DataFlowLineageControlNode';
+import { useTrackLineageView } from '@app/lineageV3/LineageDisplay.hooks';
+import { LINEAGE_FILTER_NODE_NAME } from '@app/lineageV3/LineageFilterNode/LineageFilterNodeBasic';
+import LineageGraphContext from '@app/lineageV3/LineageGraphContext';
+import LineageSidebar from '@app/lineageV3/LineageSidebar';
+import LineageVisualization from '@app/lineageV3/LineageVisualization';
+import {
+    ColumnRef,
+    LineageDisplayContext,
+    LineageEntity,
+    LineageNodesContext,
+    setDefault,
+} from '@app/lineageV3/common';
+import useBulkBoundingBoxMemberships from '@app/lineageV3/queries/useBulkBoundingBoxMemberships';
+import useBulkEntityLineage from '@app/lineageV3/queries/useBulkEntityLineage';
+import useColumnHighlighting from '@app/lineageV3/useColumnHighlighting';
+import { getNodePriority } from '@app/lineageV3/useComputeGraph/NodeBuilder';
+import useComputeGraph from '@app/lineageV3/useComputeGraph/useComputeGraph';
+import useNodeHighlighting from '@app/lineageV3/useNodeHighlighting';
+import EntitySidebarContext from '@app/sharedV2/EntitySidebarContext';
+
+type Props = {
+    refetchCenterNode?: () => void;
+    dragToSelect?: boolean;
+    initialized?: boolean;
+};
+
+export default function LineageDisplay({
+    refetchCenterNode: _refetchCenterNode,
+    dragToSelect: _dragToSelect,
+    initialized,
+}: Props) {
+    const { getEdge, setNodes, setEdges } = useReactFlow();
+
+    const [selectedColumn, setSelectedColumn] = useState<ColumnRef | null>(null);
+    const [hoveredColumn, setHoveredColumn] = useState<ColumnRef | null>(null);
+    const [hoveredNode, setHoveredNode] = useState<string | null>(null);
+    const [selectedNode, setSelectedNode] = useSelectedNode();
+    const [displayedMenuNode, setDisplayedMenuNode] = useState<string | null>(null);
+
+    const {
+        fineGrainedLineage,
+        flowNodes,
+        flowEdges,
+        resetPositions,
+        levelsInfo,
+        levelsMap,
+        lineageFilters,
+        adjacencyList: displayedAdjacencyList,
+    } = useComputeGraph();
+
+    const addAnnotationNodes = useAddAnnotationNodes();
+
+    const { isModuleView } = useContext(LineageGraphContext);
+
+    const shownUrns = useMemo(
+        () =>
+            flowNodes
+                .filter(
+                    (node) =>
+                        node.type !== LINEAGE_FILTER_NODE_NAME &&
+                        node.type !== LINEAGE_ANNOTATION_NODE_NAME &&
+                        node.type !== DATA_FLOW_LINEAGE_CONTROL_NODE_NAME,
+                )
+                .map((node) => node.data.urn || node.id),
+        [flowNodes],
+    );
+    // Node ids are not always urns: data product members have data-product-qualified ids, and an
+    // entity in multiple data products is rendered once per product. Column edges are computed from
+    // urns, so they need this to find the nodes to attach to.
+    const nodeIdsByUrn = useMemo(() => {
+        const map = new Map<string, string[]>();
+        flowNodes.forEach((node) => setDefault(map, node.data.urn || node.id, []).push(node.id));
+        return map;
+    }, [flowNodes]);
+    const refetchUrn = useBulkEntityLineage(shownUrns);
+    useBulkBoundingBoxMemberships();
+
+    const { highlightedNodes, highlightedEdges } = useNodeHighlighting(hoveredNode, displayedAdjacencyList);
+    const {
+        columnHighlightSource,
+        columnHighlightedEdges,
+        cllHighlightedNodes,
+        highlightedColumns,
+        shownRelatedColumns,
+    } = useColumnHighlighting(
+        { selectedColumn, hoveredColumn, selectedNode: selectedNode?.urn ?? null, hoveredNode },
+        fineGrainedLineage.indirect,
+        shownUrns,
+        nodeIdsByUrn,
+    );
+
+    const finalNodes = useMemo(() => {
+        if (!isModuleView) {
+            return flowNodes;
+        }
+        return addAnnotationNodes(flowNodes, levelsInfo, levelsMap ?? new Map());
+    }, [isModuleView, addAnnotationNodes, flowNodes, levelsInfo, levelsMap]);
+
+    const { rootUrn, rootType, nodes, adjacencyList, nodeVersion } = useContext(LineageNodesContext);
+
+    // Track lineage view analytics
+    useTrackLineageView({
+        initialized: initialized !== undefined ? initialized && nodeVersion > 0 : nodeVersion > 0,
+        type: rootType,
+        adjacencyList,
+        rootUrn,
+        nodes,
+    });
+
+    useEffect(() => {
+        const newNodeMap = new Map(finalNodes.map((node) => [node.id, node]));
+        setNodes((oldNodes) => {
+            const oldNodeIds = new Set(oldNodes.map((n) => n.id));
+            const nodesToAdd = finalNodes.filter((n) => !oldNodeIds.has(n.id));
+            const nodesToResetPosition = resetPositions ? finalNodes : nodesToAdd;
+            nodesToResetPosition.forEach((n) => {
+                // eslint-disable-next-line no-param-reassign
+                n.data.dragged = false;
+            });
+            return [
+                ...oldNodes
+                    .filter((n) => newNodeMap.has(n.id))
+                    .map((n) => {
+                        const newNode = newNodeMap.get(n.id);
+                        return {
+                            ...n,
+                            position: (!n.data.dragged && newNode?.position) || n.position,
+                            // Preserve dragged data so dragged nodes don't reset position
+                            data: { ...(newNode?.data ?? n.data), dragged: n.data.dragged },
+                            selectable: newNode?.selectable ?? n.selectable,
+                        };
+                    }),
+                ...nodesToAdd.map((n) => ({ ...n, data: { ...n.data, dragged: false } })),
+            ].sort((a, b) => getNodePriority(b) - getNodePriority(a));
+        });
+    }, [finalNodes, setNodes, resetPositions]);
+
+    useEffect(() => setEdges(flowEdges), [flowEdges, getEdge, setEdges]);
+
+    useFitView(initialized !== undefined ? initialized && nodeVersion > 0 : nodeVersion > 0);
+
+    return (
+        <LineageDisplayContext.Provider
+            value={{
+                hoveredNode,
+                setHoveredNode,
+                lineageFilters,
+                displayedMenuNode,
+                setDisplayedMenuNode,
+                selectedNode,
+                setSelectedNode,
+                selectedColumn,
+                setSelectedColumn,
+                hoveredColumn,
+                setHoveredColumn,
+                columnHighlightSource,
+                columnHighlightedEdges,
+                highlightedNodes,
+                cllHighlightedNodes,
+                highlightedColumns,
+                shownRelatedColumns,
+                highlightedEdges,
+                fineGrainedLineage: fineGrainedLineage.indirect,
+                fineGrainedOperations: fineGrainedLineage.fineGrainedOperations,
+                shownUrns,
+                refetchUrn,
+            }}
+        >
+            <LineageVisualization initialNodes={finalNodes} initialEdges={flowEdges} />
+            <LineageSidebar />
+        </LineageDisplayContext.Provider>
+    );
+}
+
+/**
+ * The entity whose node is selected on the graph: shown in the lineage sidebar, and the source of
+ * column highlights for an entity that takes part in column lineage as a whole, e.g. a metric.
+ */
+function useSelectedNode(): [LineageEntity | null, (v: LineageEntity | null) => void] {
+    // Entity Profile sidebar, not lineage sidebar
+    const { setSidebarClosed } = useContext(EntitySidebarContext);
+    const [selectedNode, setSelectedNode] = useState<LineageEntity | null>(null);
+
+    useOnSelectionChange({
+        onChange: useCallback(
+            ({ nodes }) => {
+                if (nodes.length) setSidebarClosed(true);
+                setSelectedNode(nodes.length ? nodes[nodes.length - 1].data : null);
+            },
+            [setSidebarClosed],
+        ),
+    });
+
+    return [selectedNode, setSelectedNode];
+}
+
+function useFitView(loaded: boolean) {
+    const { fitView } = useReactFlow();
+    const { displayVersion } = useContext(LineageNodesContext);
+    const [, displayVersionNodes] = displayVersion;
+
+    useEffect(() => {
+        if (!loaded) return () => {};
+        const timeout = setTimeout(() => fitView({ duration: 1000, maxZoom: 2, padding: 0.5 }), 1000);
+        return () => {
+            clearTimeout(timeout);
+        };
+    }, [loaded, fitView]);
+
+    useEffect(() => {
+        if (!loaded || !displayVersionNodes.length) return () => {};
+        const timeout = setTimeout(
+            () =>
+                fitView({
+                    duration: 1000,
+                    nodes: displayVersionNodes.map((urn) => ({ id: urn })),
+                    maxZoom: 1,
+                    padding: 0.2,
+                }),
+            100,
+        );
+        return () => {
+            clearTimeout(timeout);
+        };
+    }, [loaded, displayVersionNodes, fitView]);
+}

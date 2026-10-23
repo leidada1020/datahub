@@ -1,0 +1,454 @@
+/*
+/* Copyright 2018-2026 contributors to the OpenLineage project
+/* SPDX-License-Identifier: Apache-2.0
+*/
+
+package io.openlineage.spark.agent.util;
+
+import static io.openlineage.spark.agent.util.ScalaConversionUtils.asJavaOptional;
+
+import com.typesafe.config.Config;
+import com.typesafe.config.ConfigFactory;
+import datahub.spark.conf.SparkLineageConf;
+import io.datahubproject.openlineage.dataset.HdfsPathDataset;
+import io.openlineage.client.OpenLineage;
+import io.openlineage.client.utils.DatasetIdentifier;
+import io.openlineage.spark.agent.Versions;
+import io.openlineage.spark.api.naming.NameNormalizer;
+import java.io.IOException;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.stream.Collectors;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.spark.SparkConf;
+import org.apache.spark.SparkEnv;
+import org.apache.spark.rdd.RDD;
+import org.apache.spark.sql.catalyst.expressions.Attribute;
+import org.apache.spark.sql.types.ArrayType;
+import org.apache.spark.sql.types.MapType;
+import org.apache.spark.sql.types.Metadata;
+import org.apache.spark.sql.types.StructField;
+import org.apache.spark.sql.types.StructType;
+import scala.PartialFunction;
+import scala.PartialFunction$;
+
+/**
+ * Utility functions for traversing a {@link
+ * org.apache.spark.sql.catalyst.plans.logical.LogicalPlan}.
+ */
+@Slf4j
+public class PlanUtils {
+  /**
+   * Given a list of {@link PartialFunction}s merge to produce a single function that will test the
+   * input against each function one by one until a match is found or {@link
+   * PartialFunction$#empty()} is returned.
+   *
+   * @param fns
+   * @param <T>
+   * @param <D>
+   * @return
+   */
+  public static <T, D> OpenLineageAbstractPartialFunction<T, Collection<D>> merge(
+      Collection<? extends PartialFunction<T, ? extends Collection<D>>> fns) {
+    return new OpenLineageAbstractPartialFunction<T, Collection<D>>() {
+      String appliedClassName;
+
+      @Override
+      public boolean isDefinedAt(T x) {
+        return fns.stream()
+            .filter(pfn -> PlanUtils.safeIsDefinedAt(pfn, x))
+            .findFirst()
+            .isPresent();
+      }
+
+      private boolean isDefinedAt(T x, PartialFunction<T, ? extends Collection<D>> pfn) {
+        return PlanUtils.safeIsDefinedAt(pfn, x);
+      }
+
+      @Override
+      public Collection<D> apply(T x) {
+        return fns.stream()
+            .filter(pfn -> PlanUtils.safeIsDefinedAt(pfn, x))
+            .map(
+                pfn -> {
+                  try {
+                    Collection<D> collection = pfn.apply(x);
+                    if (log.isDebugEnabled()) {
+                      log.debug(
+                          "Visitor {} visited {}, returned {}",
+                          pfn.getClass().getCanonicalName(),
+                          x.getClass().getCanonicalName(),
+                          collection);
+                    }
+                    appliedClassName = x.getClass().getName();
+                    return collection;
+                  } catch (RuntimeException | NoClassDefFoundError | NoSuchMethodError e) {
+                    log.error("Apply failed:", e);
+                    return null;
+                  }
+                })
+            .filter(Objects::nonNull)
+            .flatMap(Collection::stream)
+            .collect(Collectors.toList());
+      }
+
+      @Override
+      String appliedName() {
+        return appliedClassName;
+      }
+    };
+  }
+
+  /**
+   * Given a schema, construct a valid {@link OpenLineage.SchemaDatasetFacet}.
+   *
+   * @param structType
+   * @return
+   */
+  public static OpenLineage.SchemaDatasetFacet schemaFacet(
+      OpenLineage openLineage, StructType structType) {
+    return openLineage
+        .newSchemaDatasetFacetBuilder()
+        .fields(transformFields(openLineage, structType.fields()))
+        .build();
+  }
+
+  private static List<OpenLineage.SchemaDatasetFacetFields> transformFields(
+      OpenLineage openLineage, StructField... fields) {
+    return Arrays.stream(fields)
+        .map(field -> transformField(openLineage, field))
+        .collect(Collectors.toList());
+  }
+
+  private static OpenLineage.SchemaDatasetFacetFields transformField(
+      OpenLineage openLineage, StructField field) {
+    OpenLineage.SchemaDatasetFacetFieldsBuilder builder =
+        openLineage
+            .newSchemaDatasetFacetFieldsBuilder()
+            .name(field.name())
+            .type(field.dataType().typeName());
+
+    if (field.metadata() != null) {
+      // field.getComment() actually tries to access field.metadata(),
+      // and fails with NullPointerException if it is null instead of expected Metadata.empty()
+      builder = builder.description(asJavaOptional(field.getComment()).orElse(null));
+    }
+
+    if (field.dataType() instanceof StructType) {
+      StructType structField = (StructType) field.dataType();
+      return builder
+          .type("struct")
+          .fields(transformFields(openLineage, structField.fields()))
+          .build();
+    }
+
+    if (field.dataType() instanceof MapType) {
+      MapType mapField = (MapType) field.dataType();
+      return builder
+          .type("map")
+          .fields(
+              transformFields(
+                  openLineage,
+                  new StructField("key", mapField.keyType(), false, Metadata.empty()),
+                  new StructField(
+                      "value",
+                      mapField.valueType(),
+                      mapField.valueContainsNull(),
+                      Metadata.empty())))
+          .build();
+    }
+
+    if (field.dataType() instanceof ArrayType) {
+      ArrayType arrayField = (ArrayType) field.dataType();
+      return builder
+          .type("array")
+          .fields(
+              transformFields(
+                  openLineage,
+                  new StructField(
+                      "_element",
+                      arrayField.elementType(),
+                      arrayField.containsNull(),
+                      Metadata.empty())))
+          .build();
+    }
+
+    return builder.build();
+  }
+
+  /**
+   * Given a list of attributes, constructs a valid {@link OpenLineage.SchemaDatasetFacet}.
+   *
+   * @param attributes
+   * @return
+   */
+  public static StructType toStructType(List<Attribute> attributes) {
+    return new StructType(
+        attributes.stream()
+            .map(
+                attr ->
+                    new StructField(attr.name(), attr.dataType(), attr.nullable(), attr.metadata()))
+            .collect(Collectors.toList())
+            .toArray(new StructField[0]));
+  }
+
+  public static String namespaceUri(URI outputPath) {
+    return Optional.ofNullable(outputPath.getAuthority())
+        .map(a -> String.format("%s://%s", outputPath.getScheme(), a))
+        .orElse(outputPath.getScheme());
+  }
+
+  /**
+   * Construct a {@link OpenLineage.DatasourceDatasetFacet} given a namespace for the datasource.
+   *
+   * @param namespaceUri
+   * @return
+   */
+  public static OpenLineage.DatasourceDatasetFacet datasourceFacet(
+      OpenLineage openLineage, String namespaceUri) {
+    return openLineage
+        .newDatasourceDatasetFacetBuilder()
+        .uri(URI.create(namespaceUri))
+        .name(namespaceUri)
+        .build();
+  }
+
+  /**
+   * Construct a {@link OpenLineage.ParentRunFacet} given the parent job's parentRunId, job name,
+   * and namespace.
+   *
+   * @param parentRunId
+   * @param parentJobName
+   * @param parentJobNamespace
+   * @return
+   */
+  public static OpenLineage.ParentRunFacet parentRunFacet(
+      UUID parentRunId,
+      String parentJobName,
+      String parentJobNamespace,
+      UUID rootParentRunId,
+      String rootParentJobName,
+      String rootParentJobNamespace) {
+    return parentRunFacet(
+        parentRunId,
+        parentJobName,
+        parentJobNamespace,
+        null,
+        null,
+        rootParentRunId,
+        rootParentJobName,
+        rootParentJobNamespace,
+        null,
+        null);
+  }
+
+  /**
+   * Construct a {@link OpenLineage.ParentRunFacet} given the parent job's parentRunId, job name,
+   * and namespace, along with any facets forwarded via {@code spark.openlineage.context} for the
+   * parent and root run/job.
+   */
+  public static OpenLineage.ParentRunFacet parentRunFacet(
+      UUID parentRunId,
+      String parentJobName,
+      String parentJobNamespace,
+      OpenLineage.ParentRunFacetRunFacets parentRunFacets,
+      OpenLineage.ParentRunFacetJobFacets parentJobFacets,
+      UUID rootParentRunId,
+      String rootParentJobName,
+      String rootParentJobNamespace,
+      OpenLineage.RootRunFacets rootRunFacets,
+      OpenLineage.RootJobFacets rootJobFacets) {
+    return new OpenLineage(Versions.OPEN_LINEAGE_PRODUCER_URI)
+        .newParentRunFacetBuilder()
+        .run(
+            new OpenLineage.ParentRunFacetRunBuilder()
+                .runId(parentRunId)
+                .facets(parentRunFacets)
+                .build())
+        .job(
+            new OpenLineage.ParentRunFacetJobBuilder()
+                .name(NameNormalizer.normalize(parentJobName))
+                .namespace(parentJobNamespace)
+                .facets(parentJobFacets)
+                .build())
+        .root(
+            new OpenLineage.ParentRunFacetRootBuilder()
+                .run(
+                    new OpenLineage.RootRunBuilder()
+                        .runId(rootParentRunId)
+                        .facets(rootRunFacets)
+                        .build())
+                .job(
+                    new OpenLineage.RootJobBuilder()
+                        .namespace(rootParentJobNamespace)
+                        .name(rootParentJobName)
+                        .facets(rootJobFacets)
+                        .build())
+                .build())
+        .build();
+  }
+
+  /**
+   * Given a list of paths, it collects list of data location directories. For each path, a parent
+   * directory is taken and list of distinct locations is returned. Operation is optimized to check
+   * for each path if it was already added to the list of normalized paths.
+   *
+   * @param paths
+   * @param hadoopConf
+   * @return
+   */
+  public static List<Path> getDirectoryPaths(Collection<Path> paths, Configuration hadoopConf) {
+    LinkedHashSet<Path> normalizedPaths = new LinkedHashSet<>();
+    for (Path path : paths) {
+      // check if the root path is already contained in normalized Paths
+      Path parent = path.getParent();
+      if (parent != null && !normalizedPaths.contains(parent)) {
+        // if not, add new path to normalized paths -> call getDirectoryPath
+        normalizedPaths.add(PlanUtils.getDirectoryPath(path, hadoopConf));
+      }
+    }
+    return new ArrayList<>(normalizedPaths);
+  }
+
+  public static Path getDirectoryPathOl(Path p, Configuration hadoopConf) {
+    try {
+      if (p.getFileSystem(hadoopConf).getFileStatus(p).isFile()) {
+        return p.getParent();
+      } else {
+        return p;
+      }
+    } catch (IOException e) {
+      log.warn("Unable to get file system for path ", e);
+      return p;
+    }
+  }
+
+  // This method was replaced to support Datahub PathSpecs
+  public static Path getDirectoryPath(Path p, Configuration hadoopConf) {
+    SparkEnv sparkEnv = SparkEnv.get();
+    if (sparkEnv == null) {
+      log.warn("SparkEnv is not available; falling back to original path resolution for {}", p);
+      return getDirectoryPathOl(p, hadoopConf);
+    }
+    SparkConf conf = sparkEnv.conf();
+    String propertiesString =
+        Arrays.stream(conf.getAllWithPrefix("spark.datahub."))
+            .map(tup -> tup._1 + "= \"" + tup._2 + "\"")
+            .collect(Collectors.joining("\n"));
+    Config datahubConfig = ConfigFactory.parseString(propertiesString);
+    SparkLineageConf sparkLineageConf =
+        SparkLineageConf.toSparkLineageConf(datahubConfig, null, null);
+    try {
+      URI uri = new URI(p.toString());
+      HdfsPathDataset hdfsPath = HdfsPathDataset.create(uri, sparkLineageConf.getOpenLineageConf());
+      String datasetPath = hdfsPath.getDatasetPath();
+      if (datasetPath == null) {
+        log.warn("HdfsPathDataset.getDatasetPath() returned null for {}; using original path", p);
+        return p;
+      }
+      log.debug("Path {} transformed to {}", p, datasetPath);
+      return new Path(datasetPath);
+    } catch (InstantiationException | URISyntaxException e) {
+      log.warn("Unable to convert path to hdfs path {} the exception was {}", p, e.getMessage());
+      return p;
+    }
+  }
+
+  /**
+   * Given a list of RDDs, it collects list of data location directories. For each RDD, a parent
+   * directory is taken and list of distinct locations is returned, converted to DatasetIdentifiers.
+   *
+   * @param rdds
+   * @return
+   */
+  public static List<DatasetIdentifier> findDatasetIdentifiers(List<RDD<?>> rdds) {
+    return rdds.stream()
+        .flatMap(RddDatasetInfoExtractor::findDatasetIdentifiers)
+        .distinct()
+        .collect(Collectors.toList());
+  }
+
+  /**
+   * Attempts to find schema from a list of RDDs. Returns the first schema found.
+   *
+   * @param rdds the list of RDDs to extract schema from
+   * @return an Optional containing the schema if available, empty otherwise
+   */
+  public static Optional<StructType> findSchema(List<RDD<?>> rdds) {
+    return rdds.stream()
+        .map(RddDatasetInfoExtractor::findSchema)
+        .filter(Optional::isPresent)
+        .map(Optional::get)
+        .findFirst();
+  }
+
+  /**
+   * instanceOf alike implementation which does not fail in case of a missing class.
+   *
+   * @param instance
+   * @param classCanonicalName
+   * @return
+   */
+  public static boolean safeIsInstanceOf(Object instance, String classCanonicalName) {
+    try {
+      Class c = Class.forName(classCanonicalName);
+      return instance.getClass().isAssignableFrom(c);
+    } catch (ClassNotFoundException e) {
+      return false;
+    }
+  }
+
+  /**
+   * isDefinedAt method implementation that should never throw an error or exception
+   *
+   * @param pfn
+   * @param x
+   * @return
+   */
+  public static boolean safeIsDefinedAt(PartialFunction pfn, Object x) {
+    try {
+      return pfn.isDefinedAt(x);
+    } catch (ClassCastException e) {
+      // do nothing
+      return false;
+    } catch (TypeNotPresentException e) {
+      log.info("isDefinedAt method failed due to missing type: {}", e.getMessage());
+      return false;
+    } catch (Exception e) {
+      if (e != null) {
+        log.info("isDefinedAt method failed on {}", e);
+      }
+      return false;
+    } catch (NoClassDefFoundError e) {
+      log.info("isDefinedAt method failed on {}", e.getMessage());
+      return false;
+    }
+  }
+
+  /**
+   * apply method implementation that should never throw an error or exception
+   *
+   * @param pfn
+   * @param x
+   * @return
+   */
+  public static <T, D> List<T> safeApply(PartialFunction<D, List<T>> pfn, D x) {
+    try {
+      return pfn.apply(x);
+    } catch (Exception | NoClassDefFoundError | NoSuchMethodError e) {
+      log.info("apply method failed with", e);
+      return Collections.emptyList();
+    }
+  }
+}

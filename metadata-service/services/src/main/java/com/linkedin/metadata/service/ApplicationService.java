@@ -1,0 +1,466 @@
+package com.linkedin.metadata.service;
+
+import com.google.common.collect.ImmutableSet;
+import com.linkedin.application.ApplicationKey;
+import com.linkedin.application.ApplicationProperties;
+import com.linkedin.application.Applications;
+import com.linkedin.common.UrnArray;
+import com.linkedin.common.urn.Urn;
+import com.linkedin.common.urn.UrnUtils;
+import com.linkedin.data.DataMap;
+import com.linkedin.data.template.SetMode;
+import com.linkedin.domain.Domains;
+import com.linkedin.entity.EntityResponse;
+import com.linkedin.entity.client.EntityClient;
+import com.linkedin.metadata.Constants;
+import com.linkedin.metadata.entity.AspectUtils;
+import com.linkedin.metadata.utils.EntityKeyUtils;
+import com.linkedin.mxe.MetadataChangeProposal;
+import com.linkedin.r2.RemoteInvocationException;
+import io.datahubproject.metadata.context.OperationContext;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.UUID;
+import java.util.stream.Collectors;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+import lombok.extern.slf4j.Slf4j;
+
+/**
+ * This class is used to permit easy CRUD operations on an Application
+ *
+ * <p>Note that no Authorization is performed within the service. The expectation is that the caller
+ * has already verified the permissions of the active Actor.
+ */
+@Slf4j
+public class ApplicationService {
+  private final EntityClient entityClient;
+
+  public ApplicationService(@Nonnull EntityClient entityClient) {
+    this.entityClient = entityClient;
+  }
+
+  /**
+   * Creates a new Application.
+   *
+   * <p>Note that this method does not do authorization validation. It is assumed that users of this
+   * class have already authorized the operation.
+   *
+   * @param name optional name of the Application
+   * @param description optional description of the Application
+   * @return the urn of the newly created Application
+   */
+  public Urn createApplication(
+      @Nonnull OperationContext opContext,
+      @Nullable String id,
+      @Nullable String name,
+      @Nullable String description) {
+    final ApplicationKey key = new ApplicationKey();
+    if (id != null && !id.isBlank()) {
+      key.setId(id);
+    } else {
+      key.setId(UUID.randomUUID().toString());
+    }
+    try {
+      if (this.entityClient.exists(
+          opContext,
+          EntityKeyUtils.convertEntityKeyToUrn(key, Constants.APPLICATION_ENTITY_NAME))) {
+        throw new IllegalArgumentException("This Application already exists!");
+      }
+    } catch (RemoteInvocationException e) {
+      throw new RuntimeException("Unable to check for existence of Application!", e);
+    }
+
+    final ApplicationProperties properties = new ApplicationProperties();
+    properties.setName(name, SetMode.IGNORE_NULL);
+    properties.setDescription(description, SetMode.IGNORE_NULL);
+
+    try {
+      final Urn entityUrn =
+          EntityKeyUtils.convertEntityKeyToUrn(key, Constants.APPLICATION_ENTITY_NAME);
+      return UrnUtils.getUrn(
+          this.entityClient.ingestProposal(
+              opContext,
+              AspectUtils.buildMetadataChangeProposal(
+                  entityUrn, Constants.APPLICATION_PROPERTIES_ASPECT_NAME, properties),
+              false));
+    } catch (Exception e) {
+      throw new RuntimeException("Failed to create Application", e);
+    }
+  }
+
+  /**
+   * @param applicationUrn the urn of the Application
+   * @return an instance of {@link ApplicationProperties} for the Application, null if it does not
+   *     exist.
+   */
+  @Nullable
+  public ApplicationProperties getApplicationProperties(
+      @Nonnull OperationContext opContext, @Nonnull final Urn applicationUrn) {
+    Objects.requireNonNull(applicationUrn, "applicationUrn must not be null");
+    Objects.requireNonNull(opContext.getSessionAuthentication(), "authentication must not be null");
+    final EntityResponse response;
+    try {
+      response =
+          this.entityClient.getV2(
+              opContext,
+              Constants.APPLICATION_ENTITY_NAME,
+              applicationUrn,
+              ImmutableSet.of(Constants.APPLICATION_PROPERTIES_ASPECT_NAME));
+    } catch (Exception e) {
+      log.error(
+          String.format("Failed to retrieve ApplicationProperties for urn %s", applicationUrn), e);
+      return null;
+    }
+    if (response != null
+        && response.getAspects().containsKey(Constants.APPLICATION_PROPERTIES_ASPECT_NAME)) {
+      return new ApplicationProperties(
+          response
+              .getAspects()
+              .get(Constants.APPLICATION_PROPERTIES_ASPECT_NAME)
+              .getValue()
+              .data());
+    }
+    return null;
+  }
+
+  @Nullable
+  public EntityResponse getApplicationEntityResponse(
+      @Nonnull OperationContext opContext, @Nonnull final Urn applicationUrn) {
+    Objects.requireNonNull(applicationUrn, "applicationUrn must not be null");
+    Objects.requireNonNull(opContext.getSessionAuthentication(), "authentication must not be null");
+    try {
+      return this.entityClient.getV2(
+          opContext,
+          Constants.APPLICATION_ENTITY_NAME,
+          applicationUrn,
+          ImmutableSet.of(Constants.APPLICATION_PROPERTIES_ASPECT_NAME));
+    } catch (Exception e) {
+      log.error(String.format("Failed to fetch Application with urn %s", applicationUrn), e);
+    }
+    return null;
+  }
+
+  public void setDomain(
+      @Nonnull OperationContext opContext,
+      @Nonnull final Urn applicationUrn,
+      @Nonnull final Urn domainUrn) {
+    Objects.requireNonNull(applicationUrn, "applicationUrn must not be null");
+    Objects.requireNonNull(domainUrn, "domainUrn must not be null");
+    Objects.requireNonNull(opContext.getSessionAuthentication(), "authentication must not be null");
+
+    Domains domains = new Domains(new DataMap());
+    domains.setDomains(new UrnArray());
+    domains.getDomains().add(domainUrn);
+
+    try {
+      this.entityClient.ingestProposal(
+          opContext,
+          AspectUtils.buildMetadataChangeProposal(
+              applicationUrn, Constants.DOMAINS_ASPECT_NAME, domains),
+          false);
+    } catch (Exception e) {
+      throw new RuntimeException(
+          String.format(
+              "Failed to set domain for Application with urn %s domain %s",
+              applicationUrn, domainUrn),
+          e);
+    }
+  }
+
+  public void deleteApplication(@Nonnull OperationContext opContext, @Nonnull Urn applicationUrn) {
+    Objects.requireNonNull(applicationUrn, "applicationUrn must not be null");
+    Objects.requireNonNull(opContext.getSessionAuthentication(), "authentication must not be null");
+    try {
+      this.entityClient.deleteEntity(opContext, applicationUrn);
+    } catch (Exception e) {
+      throw new RuntimeException(
+          String.format("Failed to delete Application with urn %s", applicationUrn), e);
+    }
+  }
+
+  /**
+   * {@link #deleteApplication}, then hands back the cleanup of the references to the Application
+   * for the caller to run.
+   */
+  @Nonnull
+  public EntityClient.ReferencesCleanup deleteApplicationThenReferences(
+      @Nonnull OperationContext opContext, @Nonnull Urn applicationUrn) {
+    Objects.requireNonNull(applicationUrn, "applicationUrn must not be null");
+    Objects.requireNonNull(opContext.getSessionAuthentication(), "authentication must not be null");
+    try {
+      return this.entityClient.deleteEntityThenReferences(opContext, applicationUrn);
+    } catch (Exception e) {
+      throw new RuntimeException(
+          String.format("Failed to delete Application with urn %s", applicationUrn), e);
+    }
+  }
+
+  public void batchSetApplicationAssets(
+      @Nonnull OperationContext opContext,
+      @Nonnull Urn applicationUrn,
+      @Nonnull List<Urn> resourceUrns,
+      @Nonnull Urn actorUrn) { // actorUrn for audit stamp if not in opContext
+    Objects.requireNonNull(applicationUrn, "applicationUrn must not be null");
+    Objects.requireNonNull(resourceUrns, "resourceUrns must not be null");
+
+    log.info(
+        "Batch setting application {} to {} resource(s): {}",
+        applicationUrn,
+        resourceUrns.size(),
+        resourceUrns);
+
+    final Map<Urn, Applications> existingApplications =
+        getExistingApplications(opContext, resourceUrns);
+    final List<MetadataChangeProposal> proposals =
+        resourceUrns.stream()
+            .map(
+                resourceUrn ->
+                    buildAddApplicationAssetsProposal(
+                        existingApplications.get(resourceUrn), applicationUrn, resourceUrn))
+            .collect(Collectors.toList());
+
+    try {
+      this.entityClient.batchIngestProposals(opContext, proposals, false);
+    } catch (Exception e) {
+      throw new RuntimeException(
+          String.format(
+              "Failed to batch set application assets for application %s", applicationUrn),
+          e);
+    }
+  }
+
+  private MetadataChangeProposal buildAddApplicationAssetsProposal(
+      @Nonnull Applications applications, @Nonnull Urn applicationUrn, Urn resourceUrn) {
+    if (!applications.getApplications().contains(applicationUrn)) {
+      applications.getApplications().add(applicationUrn);
+    } else {
+      log.info(
+          "Application {} already exists on resource {}. Skipping duplicate.",
+          applicationUrn,
+          resourceUrn);
+    }
+
+    return AspectUtils.buildMetadataChangeProposal(
+        resourceUrn, Constants.APPLICATION_MEMBERSHIP_ASPECT_NAME, applications);
+  }
+
+  private MetadataChangeProposal buildSetApplicationAssetsProposal(
+      @Nullable Urn applicationUrn, Urn resourceUrn) {
+    Applications applications = new Applications(new DataMap());
+    applications.setApplications(new UrnArray());
+    if (applicationUrn != null) {
+      applications.getApplications().add(applicationUrn);
+    }
+
+    return AspectUtils.buildMetadataChangeProposal(
+        resourceUrn, Constants.APPLICATION_MEMBERSHIP_ASPECT_NAME, applications);
+  }
+
+  /**
+   * Reads the current application membership of every given resource. One request per entity type,
+   * since batchGetV2 handles a single type at a time. A resource with no aspect yet maps to an
+   * empty one.
+   *
+   * <p>Throws if a read fails. Callers replace the whole aspect, so treating a failed read as "no
+   * applications" would wipe the memberships that were really there.
+   *
+   * <p>A urn listed twice shares one instance. Callers only add-if-absent or remove, so duplicates
+   * still produce the same proposal.
+   */
+  private Map<Urn, Applications> getExistingApplications(
+      @Nonnull OperationContext opContext, @Nonnull List<Urn> resourceUrns) {
+    final Map<Urn, Applications> results = new HashMap<>();
+
+    resourceUrns.stream()
+        .collect(Collectors.groupingBy(Urn::getEntityType, Collectors.toSet()))
+        .forEach(
+            (entityType, urns) -> {
+              try {
+                final Map<Urn, EntityResponse> responses =
+                    this.entityClient.batchGetV2(
+                        opContext,
+                        entityType,
+                        urns,
+                        ImmutableSet.of(Constants.APPLICATION_MEMBERSHIP_ASPECT_NAME));
+                urns.forEach(
+                    resourceUrn -> {
+                      final EntityResponse response =
+                          responses == null ? null : responses.get(resourceUrn);
+                      if (response != null
+                          && response
+                              .getAspects()
+                              .containsKey(Constants.APPLICATION_MEMBERSHIP_ASPECT_NAME)) {
+                        results.put(
+                            resourceUrn,
+                            new Applications(
+                                response
+                                    .getAspects()
+                                    .get(Constants.APPLICATION_MEMBERSHIP_ASPECT_NAME)
+                                    .getValue()
+                                    .data()));
+                      } else {
+                        log.debug(
+                            "No existing applications aspect found for resource {}", resourceUrn);
+                      }
+                    });
+              } catch (Exception e) {
+                throw new RuntimeException(
+                    String.format(
+                        "Failed to retrieve existing Applications for %d resource(s) of type %s",
+                        urns.size(), entityType),
+                    e);
+              }
+            });
+
+    resourceUrns.forEach(
+        resourceUrn -> results.computeIfAbsent(resourceUrn, urn -> emptyApplications()));
+
+    return results;
+  }
+
+  private static Applications emptyApplications() {
+    Applications applications = new Applications(new DataMap());
+    applications.setApplications(new UrnArray());
+    return applications;
+  }
+
+  public void batchRemoveApplicationAssets(
+      @Nonnull OperationContext opContext,
+      @Nonnull Urn applicationUrn,
+      @Nonnull List<Urn> resourceUrnsToRemove,
+      @Nonnull Urn actorUrn) { // actorUrn for audit stamp
+    Objects.requireNonNull(applicationUrn, "applicationUrn must not be null");
+    Objects.requireNonNull(resourceUrnsToRemove, "resourceUrnsToRemove must not be null");
+
+    final List<MetadataChangeProposal> proposals =
+        resourceUrnsToRemove.stream()
+            .map(resourceUrn -> buildSetApplicationAssetsProposal(null, resourceUrn))
+            .collect(Collectors.toList());
+
+    try {
+      this.entityClient.batchIngestProposals(opContext, proposals, false);
+    } catch (Exception e) {
+      throw new RuntimeException(
+          String.format(
+              "Failed to batch remove application from assets for application %s", applicationUrn),
+          e);
+    }
+  }
+
+  /**
+   * Clears the application membership of every given resource in a single ingest batch. Unlike
+   * {@link #batchUnsetApplication}, this does not target a specific application - it overwrites the
+   * aspect with an empty list, so it must only be used where the caller means "remove whatever
+   * application is set".
+   */
+  public void batchUnsetAllApplications(
+      @Nonnull OperationContext opContext, @Nonnull List<Urn> resourceUrns, @Nonnull Urn actorUrn) {
+    Objects.requireNonNull(resourceUrns, "resourceUrns must not be null");
+    Objects.requireNonNull(actorUrn, "actorUrn must not be null");
+    Objects.requireNonNull(opContext.getSessionAuthentication(), "authentication must not be null");
+
+    log.info("Batch unsetting application from {} resource(s)", resourceUrns.size());
+
+    final List<MetadataChangeProposal> proposals =
+        resourceUrns.stream()
+            .map(resourceUrn -> buildSetApplicationAssetsProposal(null, resourceUrn))
+            .collect(Collectors.toList());
+
+    try {
+      this.entityClient.batchIngestProposals(opContext, proposals, false);
+    } catch (Exception e) {
+      throw new RuntimeException(
+          String.format("Failed to batch unset application for resources %s", resourceUrns), e);
+    }
+  }
+
+  public void unsetApplication(
+      @Nonnull OperationContext opContext, @Nonnull Urn resourceUrn, @Nonnull Urn actorUrn) {
+    Objects.requireNonNull(resourceUrn, "resourceUrn must not be null");
+    Objects.requireNonNull(actorUrn, "actorUrn must not be null");
+    Objects.requireNonNull(opContext.getSessionAuthentication(), "authentication must not be null");
+
+    // To unset, we build a proposal that sets an empty list of applications.
+    final MetadataChangeProposal proposal = buildSetApplicationAssetsProposal(null, resourceUrn);
+
+    try {
+      this.entityClient.ingestProposal(opContext, proposal, false);
+      log.info("Successfully unset application for resource {}", resourceUrn);
+    } catch (Exception e) {
+      throw new RuntimeException(
+          String.format("Failed to unset application for resource %s", resourceUrn), e);
+    }
+  }
+
+  public void batchUnsetApplication(
+      @Nonnull OperationContext opContext,
+      @Nonnull Urn applicationUrn,
+      @Nonnull List<Urn> resourceUrns,
+      @Nonnull Urn actorUrn) {
+    Objects.requireNonNull(applicationUrn, "applicationUrn must not be null");
+    Objects.requireNonNull(resourceUrns, "resourceUrns must not be null");
+    Objects.requireNonNull(actorUrn, "actorUrn must not be null");
+    Objects.requireNonNull(opContext.getSessionAuthentication(), "authentication must not be null");
+
+    log.info(
+        "Batch unsetting application {} from {} resources", applicationUrn, resourceUrns.size());
+
+    final Map<Urn, Applications> existingApplications =
+        getExistingApplications(opContext, resourceUrns);
+    final List<MetadataChangeProposal> proposals =
+        resourceUrns.stream()
+            .map(
+                resourceUrn ->
+                    buildUnsetApplicationProposal(
+                        existingApplications.get(resourceUrn), applicationUrn, resourceUrn))
+            .collect(Collectors.toList());
+
+    try {
+      this.entityClient.batchIngestProposals(opContext, proposals, false);
+    } catch (Exception e) {
+      log.error("Failed to batch unset application {} from resources", applicationUrn, e);
+      throw new RuntimeException(
+          String.format("Failed to batch unset application %s from resources", applicationUrn), e);
+    }
+  }
+
+  private MetadataChangeProposal buildUnsetApplicationProposal(
+      @Nonnull Applications applications, @Nonnull Urn applicationUrn, Urn resourceUrn) {
+    // Remove the specific application from the list
+    applications.getApplications().remove(applicationUrn);
+
+    return AspectUtils.buildMetadataChangeProposal(
+        resourceUrn, Constants.APPLICATION_MEMBERSHIP_ASPECT_NAME, applications);
+  }
+
+  public boolean verifyEntityExists(@Nonnull OperationContext opContext, @Nonnull Urn entityUrn) {
+    try {
+      return this.entityClient.exists(opContext, entityUrn);
+    } catch (RemoteInvocationException e) {
+      throw new RuntimeException("Failed to check entity existence: " + e.getMessage(), e);
+    }
+  }
+
+  /**
+   * Batched equivalent of {@link #verifyEntityExists}: returns the subset of the given urns whose
+   * entities exist. Soft-deleted entities count as existing, matching the single-urn check.
+   */
+  @Nonnull
+  public Set<Urn> filterExistingEntities(
+      @Nonnull OperationContext opContext, @Nonnull Collection<Urn> entityUrns) {
+    if (entityUrns.isEmpty()) {
+      return Collections.emptySet();
+    }
+    try {
+      return this.entityClient.filterExistingUrns(opContext, entityUrns);
+    } catch (RemoteInvocationException e) {
+      throw new RuntimeException("Failed to check entity existence: " + e.getMessage(), e);
+    }
+  }
+}

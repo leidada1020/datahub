@@ -1,0 +1,648 @@
+import atexit
+import errno
+import json
+import logging
+import os
+import platform
+import queue
+import sys
+import threading
+import uuid
+from functools import wraps
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, TypeVar
+
+from mixpanel import Consumer, Mixpanel
+from typing_extensions import ParamSpec
+
+from datahub._version import __version__, nice_version_name
+from datahub.cli.config_utils import DATAHUB_ROOT_FOLDER
+from datahub.cli.env_utils import get_boolean_env_variable
+from datahub.configuration.common import ExceptionWithProps
+from datahub.configuration.env_vars import (
+    get_sentry_dsn,
+    get_sentry_environment,
+    get_telemetry_timeout,
+)
+from datahub.metadata.schema_classes import _custom_package_path
+from datahub.utilities.caller_context import identify_caller
+from datahub.utilities.perf_timer import PerfTimer
+
+if TYPE_CHECKING:
+    from datahub.ingestion.graph.client import DataHubGraph
+
+logger = logging.getLogger(__name__)
+
+DATAHUB_FOLDER = Path(DATAHUB_ROOT_FOLDER)
+
+CONFIG_FILE = DATAHUB_FOLDER / "telemetry-config.json"
+
+# also fall back to environment variable if config file is not found
+ENV_ENABLED = get_boolean_env_variable("DATAHUB_TELEMETRY_ENABLED", True)
+
+# see
+# https://adamj.eu/tech/2020/03/09/detect-if-your-tests-are-running-on-ci/
+# https://github.com/watson/ci-info
+CI_ENV_VARS = {
+    "APPCENTER",
+    "APPCIRCLE",
+    "APPCIRCLEAZURE_PIPELINES",
+    "APPVEYOR",
+    "AZURE_PIPELINES",
+    "BAMBOO",
+    "BITBUCKET",
+    "BITRISE",
+    "BUDDY",
+    "BUILDKITE",
+    "BUILD_ID",
+    "CI",
+    "CIRCLE",
+    "CIRCLECI",
+    "CIRRUS",
+    "CIRRUS_CI",
+    "CI_NAME",
+    "CODEBUILD",
+    "CODEBUILD_BUILD_ID",
+    "CODEFRESH",
+    "CODESHIP",
+    "CYPRESS_HOST",
+    "DRONE",
+    "DSARI",
+    "EAS_BUILD",
+    "GITHUB_ACTIONS",
+    "GITLAB",
+    "GITLAB_CI",
+    "GOCD",
+    "HEROKU_TEST_RUN_ID",
+    "HUDSON",
+    "JENKINS",
+    "JENKINS_URL",
+    "LAYERCI",
+    "MAGNUM",
+    "NETLIFY",
+    "NEVERCODE",
+    "RENDER",
+    "SAIL",
+    "SCREWDRIVER",
+    "SEMAPHORE",
+    "SHIPPABLE",
+    "SOLANO",
+    "STRIDER",
+    "TASKCLUSTER",
+    "TEAMCITY",
+    "TEAMCITY_VERSION",
+    "TF_BUILD",
+    "TRAVIS",
+    "VERCEL",
+    "WERCKER_ROOT",
+    "bamboo.buildKey",
+}
+
+# disable when running in any CI
+if any(var in os.environ for var in CI_ENV_VARS):
+    ENV_ENABLED = False
+
+# Also disable if a custom metadata model package is in use.
+if _custom_package_path:
+    ENV_ENABLED = False
+
+TIMEOUT = int(get_telemetry_timeout())
+MIXPANEL_ENDPOINT = "track.datahubproject.io/mp"
+MIXPANEL_TOKEN = "5ee83d940754d63cacbf7d34daa6f44a"
+SENTRY_DSN: Optional[str] = get_sentry_dsn()
+SENTRY_ENVIRONMENT: str = get_sentry_environment()
+
+
+def _default_global_properties() -> Dict[str, Any]:
+    return {
+        "datahub_version": nice_version_name(),
+        "python_version": platform.python_version(),
+        "os": platform.system(),
+        "arch": platform.machine(),
+        # caller is populated lazily in ping() to avoid subprocess calls at import time
+    }
+
+
+# ---------------------------------------------------------------------------
+# Background telemetry dispatch
+#
+# Telemetry must never sit on the CLI's critical path. A *refused* connection to
+# the collector fails fast, but a *dropped* one -- a corporate proxy, firewall,
+# airgap, or any network that blackholes egress rather than rejecting it --
+# blocks for the full socket timeout on every call. Sending synchronously
+# therefore stalls startup by minutes on such networks, and silently, since it
+# is all logged at DEBUG.
+#
+# So we enqueue each send and drain it on a single daemon worker. Enqueue is
+# non-blocking and sheds load when the queue is full, so the caller never waits
+# on the network regardless of its state. At exit we flush with a small bounded
+# timeout, then abandon anything still in flight: losing best-effort telemetry
+# is fine, a multi-minute hang is not.
+# ---------------------------------------------------------------------------
+
+# The CLI emits only a handful of events per invocation, so a small bound is
+# plenty; it caps memory if the collector is unreachable and the worker stalls.
+_TELEMETRY_QUEUE_MAX_SIZE = 100
+
+# Upper bound on how long process exit waits for in-flight telemetry to drain.
+_TELEMETRY_EXIT_FLUSH_SECONDS = 1.0
+
+_telemetry_queue: queue.Queue = queue.Queue(maxsize=_TELEMETRY_QUEUE_MAX_SIZE)
+_telemetry_worker_thread: Optional[threading.Thread] = None
+_telemetry_worker_lock = threading.Lock()
+_TELEMETRY_STOP = object()
+
+
+def _telemetry_worker_loop() -> None:
+    while True:
+        task = _telemetry_queue.get()
+        if task is _TELEMETRY_STOP:
+            return
+        try:
+            task()
+        except Exception as e:
+            logger.debug(f"Error reporting telemetry: {e}")
+
+
+def _shutdown_telemetry_worker() -> None:
+    thread = _telemetry_worker_thread
+    if thread is None:
+        return
+    try:
+        _telemetry_queue.put_nowait(_TELEMETRY_STOP)
+    except queue.Full:
+        # Worker is still busy, most likely stuck on a dropped connection. It is a
+        # daemon thread, so the interpreter reaps it on exit; don't wait on it.
+        return
+    thread.join(timeout=_TELEMETRY_EXIT_FLUSH_SECONDS)
+
+
+def _ensure_telemetry_worker() -> None:
+    global _telemetry_worker_thread
+    if _telemetry_worker_thread is not None:
+        return
+    with _telemetry_worker_lock:
+        if _telemetry_worker_thread is not None:
+            return
+        thread = threading.Thread(
+            target=_telemetry_worker_loop, name="datahub-telemetry", daemon=True
+        )
+        thread.start()
+        _telemetry_worker_thread = thread
+        atexit.register(_shutdown_telemetry_worker)
+
+
+def _dispatch_telemetry(task: Callable[[], None]) -> None:
+    """Run a telemetry send on the background worker; never blocks the caller.
+
+    Starts the worker on first use and drops the event if the queue is full, so a
+    slow or blackholed collector can't stall the CLI's critical path. Never raises:
+    telemetry must not break the caller, so even a failed worker start is swallowed.
+    """
+    try:
+        _ensure_telemetry_worker()
+        _telemetry_queue.put_nowait(task)
+    except queue.Full:
+        logger.debug("Telemetry queue full, dropping event")
+    except Exception as e:
+        # Telemetry must never break the caller: swallow anything (e.g. a failed
+        # worker-thread start) rather than let it propagate into a CLI command.
+        logger.debug(f"Error dispatching telemetry: {e}")
+
+
+class Telemetry:
+    client_id: str
+    enabled: bool = True
+    tracking_init: bool = False
+    sentry_enabled: bool = False
+
+    context_properties: Dict[str, Any] = {}
+
+    def __init__(self):
+        self.global_properties = _default_global_properties()
+        self.context_properties = {}
+
+        if SENTRY_DSN:
+            self.sentry_enabled = True
+            try:
+                import sentry_sdk
+
+                sentry_sdk.init(
+                    dsn=SENTRY_DSN,
+                    environment=SENTRY_ENVIRONMENT,
+                    release=__version__,
+                )
+            except Exception as e:
+                # We need to print initialization errors to stderr, since logger is not initialized yet
+                print(f"Error initializing Sentry: {e}", file=sys.stderr)
+                logger.info(f"Error initializing Sentry: {e}")
+
+        # try loading the config if it exists, update it if that fails
+        if not CONFIG_FILE.exists() or not self.load_config():
+            # set up defaults
+            self.client_id = str(uuid.uuid4())
+            self.enabled = self.enabled and ENV_ENABLED
+            if not self.update_config():
+                # If we're not able to persist the client ID, we should default
+                # to a standardized value. This prevents us from minting a new
+                # client ID every time we start the CLI.
+                self.client_id = "00000000-0000-0000-0000-000000000001"
+
+        # send updated user-level properties
+        self.mp = None
+        if self.enabled:
+            try:
+                self.mp = Mixpanel(
+                    MIXPANEL_TOKEN,
+                    consumer=Consumer(
+                        request_timeout=int(TIMEOUT),
+                        api_host=MIXPANEL_ENDPOINT,
+                        # Telemetry is best-effort: never retry a failed send. The
+                        # mixpanel default (retry_limit=4 -> 5 attempts) turns a
+                        # dropped connection into 5x the timeout; the background
+                        # worker below relies on each send failing fast instead.
+                        retry_limit=0,
+                    ),
+                )
+            except Exception as e:
+                logger.debug(f"Error connecting to mixpanel: {e}")
+
+        # Initialize the default properties for all events.
+        self.set_context()
+
+    def update_config(self) -> bool:
+        """
+        Update the config file with the current client ID and enabled status.
+        Return True if the update succeeded, False otherwise
+        """
+        logger.debug("Updating telemetry config")
+
+        try:
+            os.makedirs(DATAHUB_FOLDER, exist_ok=True)
+            try:
+                with open(CONFIG_FILE, "w") as f:
+                    json.dump(
+                        {"client_id": self.client_id, "enabled": self.enabled},
+                        f,
+                        indent=2,
+                    )
+                return True
+            except OSError as x:
+                if x.errno == errno.ENOENT:
+                    logger.debug(
+                        f"{CONFIG_FILE} does not exist and could not be created. Please check permissions on the parent folder."
+                    )
+                elif x.errno == errno.EACCES:
+                    logger.debug(
+                        f"{CONFIG_FILE} cannot be read. Please check the permissions on this file."
+                    )
+                else:
+                    logger.debug(
+                        f"{CONFIG_FILE} had an IOError, please inspect this file for issues."
+                    )
+        except Exception as e:
+            logger.debug(f"Failed to update config file at {CONFIG_FILE} due to {e}")
+
+        return False
+
+    def enable(self) -> None:
+        """
+        Enable telemetry.
+        """
+
+        self.enabled = True
+        self.update_config()
+
+    def disable(self) -> None:
+        """
+        Disable telemetry.
+        """
+
+        self.enabled = False
+        self.update_config()
+
+    def load_config(self) -> bool:
+        """
+        Load the saved config for the telemetry client ID and enabled status.
+        Returns True if config was correctly loaded, False otherwise.
+        """
+
+        try:
+            with open(CONFIG_FILE) as f:
+                config = json.load(f)
+                self.client_id = config["client_id"]
+                self.enabled = config["enabled"] & ENV_ENABLED
+                return True
+        except OSError as x:
+            if x.errno == errno.ENOENT:
+                logger.debug(
+                    f"{CONFIG_FILE} does not exist and could not be created. Please check permissions on the parent folder."
+                )
+            elif x.errno == errno.EACCES:
+                logger.debug(
+                    f"{CONFIG_FILE} cannot be read. Please check the permissions on this file."
+                )
+            else:
+                logger.debug(
+                    f"{CONFIG_FILE} had an IOError, please inspect this file for issues."
+                )
+        except Exception as e:
+            logger.debug(f"Failed to load {CONFIG_FILE} due to {e}")
+
+        return False
+
+    def add_global_property(self, key: str, value: Any) -> None:
+        self.global_properties[key] = value
+        self._update_sentry_properties()
+
+    def set_context(
+        self,
+        server: Optional["DataHubGraph"] = None,
+        properties: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.context_properties = {
+            **self._server_props(server),
+            **(properties or {}),
+        }
+
+        self._update_sentry_properties()
+
+    def _update_sentry_properties(self) -> None:
+        properties = {
+            **self.global_properties,
+            **self.context_properties,
+        }
+        if self.sentry_enabled:
+            import sentry_sdk
+
+            # Note: once we're on sentry-sdk 2.1.0+, we can use sentry_sdk.set_tags(properties)
+            # See https://github.com/getsentry/sentry-python/commit/6c960d752c7c7aff3fd7469d2e9ad98f19663aa8
+            for key, value in properties.items():
+                sentry_sdk.set_tag(key, value)
+
+    def init_capture_exception(self) -> None:
+        if self.sentry_enabled:
+            import sentry_sdk
+
+            sentry_sdk.set_user({"client_id": self.client_id})
+            sentry_sdk.set_context(
+                "environment",
+                {
+                    "environment": SENTRY_ENVIRONMENT,
+                    "datahub_version": nice_version_name(),
+                    "os": platform.system(),
+                    "python_version": platform.python_version(),
+                },
+            )
+
+    def capture_exception(self, e: BaseException) -> None:
+        try:
+            if self.sentry_enabled:
+                import sentry_sdk
+
+                sentry_sdk.capture_exception(e)
+        except Exception as e:
+            logger.warning("Failed to capture exception in Sentry.", exc_info=e)
+
+    def init_tracking(self) -> None:
+        if not self.enabled or self.mp is None or self.tracking_init is True:
+            return
+
+        logger.debug("Sending init telemetry")
+        mp = self.mp
+        client_id = self.client_id
+        # Snapshot: global_properties is mutated elsewhere (add_global_property and
+        # the lazy "caller" population in ping) and would otherwise be read by the
+        # worker thread mid-send.
+        properties = dict(self.global_properties)
+        _dispatch_telemetry(lambda: mp.people_set(client_id, properties))
+        self.tracking_init = True
+
+    def ping(
+        self,
+        event_name: str,
+        properties: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Send a single telemetry event.
+
+        Args:
+            event_name: name of the event to send.
+            properties: metadata for the event
+        """
+
+        if not self.enabled or self.mp is None:
+            return
+
+        properties = properties or {}
+
+        # Lazily populate caller to avoid subprocess calls at import time
+        if "caller" not in self.global_properties:
+            self.global_properties["caller"] = identify_caller()
+
+        # send event
+        try:
+            if event_name == "function-call":
+                logger.debug(
+                    f"Sending telemetry for {event_name} {properties.get('function')}, status {properties.get('status')}"
+                )
+            else:
+                logger.debug(f"Sending telemetry for {event_name}")
+
+            properties = {
+                **self.global_properties,
+                **self.context_properties,
+                **properties,
+            }
+            mp = self.mp
+            client_id = self.client_id
+            _dispatch_telemetry(lambda: mp.track(client_id, event_name, properties))
+        except Exception as e:
+            logger.debug(f"Error reporting telemetry: {e}")
+
+    @classmethod
+    def _server_props(cls, server: Optional["DataHubGraph"]) -> Dict[str, str]:
+        if not server:
+            return {
+                "server_type": "n/a",
+                "server_version": "n/a",
+                "server_id": "n/a",
+            }
+        else:
+            return {
+                "server_type": server.server_config.raw_config.get("datahub", {}).get(
+                    "serverType", "missing"
+                ),
+                "server_version": server.server_config.raw_config.get("versions", {})
+                .get("acryldata/datahub", {})
+                .get("version", "missing"),
+                "server_id": server.server_id or "missing",
+            }
+
+
+telemetry_instance = Telemetry()
+
+
+def suppress_telemetry() -> None:
+    """disables telemetry for this invocation, doesn't affect persistent client settings"""
+    if telemetry_instance.enabled:
+        logger.debug("Disabling telemetry locally due to server config")
+    telemetry_instance.enabled = False
+
+
+def get_full_class_name(obj):
+    module = obj.__class__.__module__
+    if module is None or module == str.__class__.__module__:
+        return obj.__class__.__name__
+    return f"{module}.{obj.__class__.__name__}"
+
+
+def _error_props(error: BaseException) -> Dict[str, Any]:
+    props = {
+        "error": get_full_class_name(error),
+    }
+
+    if isinstance(error, ExceptionWithProps):
+        try:
+            props.update(error.get_telemetry_props())
+        except Exception as e:
+            logger.debug(f"Error getting telemetry props for {error}: {e}")
+
+    return props
+
+
+_T = TypeVar("_T")
+_P = ParamSpec("_P")
+
+
+def _get_cli_context() -> Dict[str, str]:
+    """Read --context key=value pairs from the Click context, if available."""
+    try:
+        import click
+
+        ctx = click.get_current_context(silent=True)
+        if ctx and ctx.obj and isinstance(ctx.obj, dict):
+            return {f"ctx_{k}": v for k, v in ctx.obj.get("context", {}).items()}
+    except Exception:
+        pass
+    return {}
+
+
+# Set on every wrapper this decorator produces, and the only reliable way to
+# recognise one. cli_utils.enable_auto_decorators used to look for "telemetry" in
+# __module__ and "with_telemetry" in __name__, but the wrapper below carries
+# @wraps(func) and so advertises the *wrapped* function's identity -- the check
+# could never match, and every explicitly decorated command got a second,
+# auto-applied wrapper on top. An attribute survives @wraps in both directions.
+TELEMETRY_WRAPPED_ATTR = "__datahub_telemetry_wrapped__"
+
+
+def is_telemetry_wrapped(func: object) -> bool:
+    """Whether `func` already has a with_telemetry wrapper anywhere in its chain.
+
+    Bounded by identity rather than by depth. The walk has to terminate --
+    wraps(f)(f) sets f.__wrapped__ = f, a cycle this codebase has already met
+    once -- but a fixed cap ends it by ANSWERING, and the answer it gives is
+    False. enable_auto_decorators reads False as "needs a wrapper", so a
+    chain longer than the cap got a second one and every function-call event
+    for that command fired twice: the exact defect this detection exists to
+    prevent, reintroduced by the guard against a different one.
+
+    In practice @wraps copies __dict__, so the marker propagates to every
+    wrapper above it and depth rarely mattered. A decorator that sets
+    __wrapped__ without copying __dict__ is the shape that reached the cap.
+    """
+    current: object = func
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        if getattr(current, TELEMETRY_WRAPPED_ATTR, False):
+            return True
+        seen.add(id(current))
+        current = getattr(current, "__wrapped__", None)
+    return False
+
+
+def with_telemetry(
+    *, capture_kwargs: Optional[List[str]] = None
+) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+    kwargs_to_track = capture_kwargs or []
+
+    def with_telemetry_decorator(func: Callable[_P, _T]) -> Callable[_P, _T]:
+        function = f"{func.__module__}.{func.__name__}"
+
+        @wraps(func)
+        def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+            telemetry_instance.init_tracking()
+            telemetry_instance.init_capture_exception()
+
+            call_props: Dict[str, Any] = {"function": function}
+            call_props.update(_get_cli_context())
+            for kwarg in kwargs_to_track:
+                call_props[f"arg_{kwarg}"] = kwargs.get(kwarg)
+
+            telemetry_instance.ping(
+                "function-call",
+                {**call_props, "status": "start"},
+            )
+            try:
+                try:
+                    with PerfTimer() as timer:
+                        res = func(*args, **kwargs)
+                finally:
+                    call_props["duration"] = timer.elapsed_seconds()
+
+                telemetry_instance.ping(
+                    "function-call",
+                    {**call_props, "status": "completed"},
+                )
+                return res
+            # System exits (used in ingestion and Docker commands) are not caught by the exception handler,
+            # so we need to catch them here.
+            except SystemExit as e:
+                # Forward successful exits
+                # 0 or None imply success
+                if not e.code:
+                    telemetry_instance.ping(
+                        "function-call",
+                        {**call_props, "status": "completed"},
+                    )
+                # Report failed exits
+                else:
+                    telemetry_instance.ping(
+                        "function-call",
+                        {
+                            **call_props,
+                            "status": "error",
+                            **_error_props(e),
+                            "code": e.code,
+                        },
+                    )
+                telemetry_instance.capture_exception(e)
+                raise e
+            # Catch SIGINTs
+            except KeyboardInterrupt as e:
+                telemetry_instance.ping(
+                    "function-call",
+                    {**call_props, "status": "cancelled"},
+                )
+                telemetry_instance.capture_exception(e)
+                raise e
+
+            # Catch general exceptions
+            except BaseException as e:
+                telemetry_instance.ping(
+                    "function-call",
+                    {
+                        **call_props,
+                        "status": "error",
+                        **_error_props(e),
+                    },
+                )
+                telemetry_instance.capture_exception(e)
+                raise e
+
+        # After @wraps, which would otherwise not carry it.
+        setattr(wrapper, TELEMETRY_WRAPPED_ATTR, True)
+        return wrapper
+
+    return with_telemetry_decorator

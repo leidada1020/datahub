@@ -1,0 +1,300 @@
+// Disabling no hardcoded colors rule right now
+// TO-DO: Remove these colors once their usage in other files is migrated to semantic tokens
+/* eslint-disable rulesdir/no-hardcoded-colors */
+import i18next from 'i18next';
+
+import { EntityType } from '@types';
+
+// TODO(Gabe): integrate this w/ the theme
+// These colors are deprecated, use the colors in @components/theme/foundations/colors
+export const REDESIGN_COLORS = {
+    BACKGROUND: '#F4F5F7',
+    GREY: '#e5e5e5',
+    BLUE: '#1890FF',
+    DARK_GREY: '#56668E',
+    HEADING_COLOR: '#403D5C',
+    LIGHT_GREY: '#F6F7FA',
+    BACKGROUND_GREY: '#F5F5F5',
+    PRIMARY_DARK_GREEN: '#113633',
+    TERTIARY_GREEN: '#3CB47A',
+    WHITE_WIRE: '#F1F1F1',
+    WHITE: '#FFF',
+    BLACK: '#000',
+    SIDE_BAR: '#E8E6EB',
+    TEXT_HEADING: '#374066',
+    LINK_HOVER_BLUE: '#5280E2',
+    RED_ERROR_BORDER: '#FFA39E',
+    BACKGROUND_SECONDARY_GRAY: '#AAA2CB0F',
+    BACKGROUND_GRAY_2: '#FAF9FC',
+    BACKGROUND_GRAY_3: '#F6F7FA',
+    BACKGROUND_GRAY_4: '#F8F7FE',
+    BACKGROUND_OVERLAY_BLACK: '#171723',
+    BACKGROUND_OVERLAY_BLACK_SEARCH: '#404053',
+    BOX_SHADOW: '#E0E0E025',
+    BORDER_1: '#4b4b54',
+    BORDER_2: '#E6E6E6',
+    BORDER_3: '#EFEFEF',
+    SECONDARY_LIGHT_GREY: '#9DA7C0',
+    ACTION_ICON_GREY: '#676b75',
+    AVATAR_STYLE_WHITE_BACKGROUND: '#ffffff66',
+    SIDE_BAR_BORDER_RIGHT: '#e8e8e8',
+    LINK_GREY: '#586287',
+    TEXT_GREY: '#8D95B1',
+    WARNING_RED: '#d07b7b',
+    SUBTITLE: '#434863',
+    LIGHT_GREY_BORDER: '#ededed',
+    FOUNDATION_BLUE_2: '#CFD1DA',
+    FOUNDATION_BLUE_4: '#81879F',
+    FOUNDATION_BLUE_5: '#5B6282',
+    SUB_TEXT: '#81879F',
+    COLD_GREY_TEXT: '#A9ADBD',
+    COLD_GREY_TEXT_BLUE_1: '#EBECF0',
+    LIGHT_GREY_PILL: '#F7F7F7',
+    RED_LIGHT: '#F6D5D5',
+    RED_NORMAL: '#CC6C6C',
+    RED_ERROR: '#d23939',
+    RED_800: '#7D4242',
+    BODY_TEXT: '#5f6685',
+    GREEN_LIGHT: '#d5e9c9',
+    GREEN_NORMAL: '#5f9240',
+    GREEN_800: '#41652C',
+    TEXT_HEADING_SUB_LINK: '#323A5D',
+    DARK_DIVIDER: '#797F98',
+    DEPRECATION_RED: '#CD0D24',
+    DEPRECATION_RED_LIGHT: '#E37878',
+    BODY_TEXT_GREY: '#5F6685',
+    SECTION_BACKGROUND: '#F6F6F6',
+    LIGHT_TEXT_DARK_BACKGROUND: '#EEECFA',
+    GREY_500: '#6b7280',
+    GREY_300: '#8088A3',
+    YELLOW_500: '#f6cf6a',
+    YELLOW_200: '#fcf1d3',
+    YELLOW_600: '#f4c449',
+    YELLOW_700: '#cfa73e',
+    WARNING_YELLOW: '#866C28',
+    YELLOW_BACKGROUND: '#FCEDC7',
+    TOOLTIP_BACKGROUND: '#272D48',
+    ICON_ON_DARK: '#F9FAFC',
+    SILVER_GREY: '#E9EAEE',
+    GREY_100: '#C1C4D0',
+};
+
+export const SEARCH_COLORS = {
+    PLATFORM_TEXT: '#56668E',
+    MATCH_BACKGROUND_GREY: '#5A617110',
+    MATCH_TEXT_GREY: '#8894A9',
+    LINK_BLUE: '#5280E2',
+};
+
+export const ANTD_GRAY = {
+    1: '#FFFFFF',
+    2: '#FAFAFA',
+    2.5: '#F8F8F8',
+    3: '#F5F5F5',
+    4: '#F0F0F0',
+    4.5: '#E9E9E9',
+    5: '#D9D9D9',
+    5.5: '#CCCCCC',
+    6: '#BFBFBF',
+    7: '#8C8C8C',
+    8: '#595959',
+    9: '#434343',
+    10: '#272727',
+    11: '#262626',
+};
+
+export const EMPTY_MESSAGES = {
+    documentation: {
+        get title() {
+            return i18next.t('entity.shared.emptyStates:emptyMessages.documentation.title');
+        },
+    },
+    tags: {
+        get title() {
+            return i18next.t('entity.shared.emptyStates:emptyMessages.tags.title');
+        },
+        get description() {
+            return i18next.t('entity.shared.emptyStates:emptyMessages.tags.description');
+        },
+    },
+    terms: {
+        get title() {
+            return i18next.t('entity.shared.emptyStates:emptyMessages.terms.title');
+        },
+        get description() {
+            return i18next.t('entity.shared.emptyStates:emptyMessages.terms.description');
+        },
+    },
+    owners: {
+        get title() {
+            return i18next.t('entity.shared.emptyStates:emptyMessages.owners.title');
+        },
+        get description() {
+            return i18next.t('entity.shared.emptyStates:emptyMessages.owners.description');
+        },
+    },
+    properties: {
+        get title() {
+            return i18next.t('entity.shared.emptyStates:emptyMessages.properties.title');
+        },
+        get description() {
+            return i18next.t('entity.shared.emptyStates:emptyMessages.properties.description');
+        },
+    },
+    queries: {
+        get title() {
+            return i18next.t('entity.shared.emptyStates:emptyMessages.queries.title');
+        },
+        get description() {
+            return i18next.t('entity.shared.emptyStates:emptyMessages.queries.description');
+        },
+    },
+    domain: {
+        get title() {
+            return i18next.t('entity.shared.emptyStates:emptyMessages.domain.title');
+        },
+        get description() {
+            return i18next.t('entity.shared.emptyStates:emptyMessages.domain.description');
+        },
+    },
+    dataProduct: {
+        get title() {
+            return i18next.t('entity.shared.emptyStates:emptyMessages.dataProduct.title');
+        },
+        get description() {
+            return i18next.t('entity.shared.emptyStates:emptyMessages.dataProduct.description');
+        },
+    },
+    application: {
+        get title() {
+            return i18next.t('entity.shared.emptyStates:emptyMessages.application.title');
+        },
+        get description() {
+            return i18next.t('entity.shared.emptyStates:emptyMessages.application.description');
+        },
+    },
+    contains: {
+        get title() {
+            return i18next.t('entity.shared.emptyStates:emptyMessages.contains.title');
+        },
+        get description() {
+            return i18next.t('entity.shared.emptyStates:emptyMessages.contains.description');
+        },
+    },
+    inherits: {
+        get title() {
+            return i18next.t('entity.shared.emptyStates:emptyMessages.inherits.title');
+        },
+        get description() {
+            return i18next.t('entity.shared.emptyStates:emptyMessages.inherits.description');
+        },
+    },
+    'contained by': {
+        get title() {
+            return i18next.t('entity.shared.emptyStates:emptyMessages.containedBy.title');
+        },
+        get description() {
+            return i18next.t('entity.shared.emptyStates:emptyMessages.containedBy.description');
+        },
+    },
+    'inherited by': {
+        get title() {
+            return i18next.t('entity.shared.emptyStates:emptyMessages.inheritedBy.title');
+        },
+        get description() {
+            return i18next.t('entity.shared.emptyStates:emptyMessages.inheritedBy.description');
+        },
+    },
+    structuredProps: {
+        get title() {
+            return i18next.t('entity.shared.emptyStates:emptyMessages.structuredProps.title');
+        },
+    },
+};
+
+export const ENTITY_TYPES_WITH_MANUAL_LINEAGE = new Set([
+    EntityType.Dashboard,
+    EntityType.Chart,
+    EntityType.Dataset,
+    EntityType.DataJob,
+    EntityType.Metric,
+]);
+
+export const GLOSSARY_ENTITY_TYPES = [EntityType.GlossaryTerm, EntityType.GlossaryNode];
+
+export const VIEW_ENTITY_PAGE = 'VIEW_ENTITY_PAGE';
+
+// only values for Domain Entity for custom configurable default tab
+export enum EntityProfileTab {
+    DOMAIN_ENTITIES_TAB = 'DOMAIN_ENTITIES_TAB',
+    DOCUMENTATION_TAB = 'DOCUMENTATION_TAB',
+    DATA_PRODUCTS_TAB = 'DATA_PRODUCTS_TAB',
+    SUMMARY_TAB = 'SUMMARY_TAB',
+}
+
+/**
+ * Stable URL segments that identify entity profile tabs (`EntityTab.path`). Tab display names are
+ * translated, so always link to a tab by one of these values, never by its name.
+ */
+export enum EntityTabPath {
+    ACCESS = 'Access',
+    ASSETS = 'Assets',
+    COLUMNS = 'Columns',
+    CONTENTS = 'Contents',
+    DASHBOARDS = 'Dashboards',
+    DATASETS = 'Datasets',
+    DATA_PRODUCTS = 'Data Products',
+    DEFINITION = 'Definition',
+    DOCUMENTATION = 'Documentation',
+    FEATURES = 'Features',
+    FEATURE_TABLES = 'Feature Tables',
+    FIELDS = 'Fields',
+    GOVERNANCE = 'Governance',
+    GROUP = 'Group',
+    INCIDENTS = 'Incidents',
+    LINEAGE = 'Lineage',
+    MODELS = 'Models',
+    OUTPUT_PORTS = 'Output Ports',
+    PIPELINE = 'Pipeline',
+    PREVIEW = 'Preview',
+    PROPERTIES = 'Properties',
+    QUALITY = 'Quality',
+    QUERIES = 'Queries',
+    RELATED_ASSETS = 'Related Assets',
+    RELATED_ENTITIES = 'Related Entities',
+    RELATED_TERMS = 'Related Terms',
+    RUNS = 'Runs',
+    SCHEMA = 'Schema',
+    SIGNATURE = 'Signature',
+    SOURCES = 'Sources',
+    STATS = 'Stats',
+    SUMMARY = 'Summary',
+    TASKS = 'Tasks',
+    VIEW_DEFINITION = 'View Definition',
+}
+
+export const EDITING_DOCUMENTATION_URL_PARAM = 'editing';
+
+export const UNKNOWN_DATA_PLATFORM = 'urn:li:dataPlatform:unknown';
+
+export const RECOMMENDATION_MODULE_ID_RECENTLY_VIEWED_ENTITIES = 'RecentlyViewedEntities';
+export const RECOMMENDATION_MODULE_ID_RECENTLY_EDITED_ENTITIES = 'RecentlyEditedEntities';
+export const RECOMMENDATION_MODULE_ID_RECENT_SEARCHES = 'RecentSearches';
+
+/**
+ * Profiles that render the new Summary tab (and drop the Documentation tab) when
+ * `assetSummaryPageV1` is on. Datasets are separate — they follow `datasetSummaryPageV1`.
+ * Keep this aligned with each entity's `getProfileTabs`: the sidebar Documentation pencil
+ * routes through `useEntityHasSummaryTab`, and a route to a tab the profile does not render
+ * falls back to the default tab and drops the edit query param.
+ */
+export const ENTITY_TYPES_WITH_NEW_SUMMARY_TAB = [
+    EntityType.Application,
+    EntityType.Chart,
+    EntityType.Container,
+    EntityType.Dashboard,
+    EntityType.DataProduct,
+    EntityType.Domain,
+    EntityType.GlossaryNode,
+    EntityType.GlossaryTerm,
+];

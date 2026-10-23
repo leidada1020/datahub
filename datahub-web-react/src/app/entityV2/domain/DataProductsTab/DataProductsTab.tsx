@@ -1,0 +1,171 @@
+import { Button, EmptyState, Loader, Pagination } from '@components';
+import { Plus } from '@phosphor-icons/react/dist/csr/Plus';
+import * as QueryString from 'query-string';
+import React, { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useLocation } from 'react-router';
+import styled from 'styled-components';
+
+import { DomainsPaginationContainer } from '@app/domain/DomainsList';
+import { useEntityContext, useEntityData } from '@app/entity/shared/EntityContext';
+import CreateDataProductModal from '@app/entityV2/domain/DataProductsTab/CreateDataProductModal';
+import DataProductResult from '@app/entityV2/domain/DataProductsTab/DataProductResult';
+import TabToolbar from '@app/entityV2/shared/components/styled/TabToolbar';
+import { SearchBar } from '@app/search/SearchBar';
+import { DOMAINS_FILTER_NAME } from '@app/search/utils/constants';
+import { scrollToTop } from '@app/sharedV2/searchUtils';
+import { useEntityRegistry } from '@app/useEntityRegistry';
+
+import { useGetSearchResultsForMultipleQuery } from '@graphql/search.generated';
+import { DataProduct, Domain, EntityType } from '@types';
+
+const DataProductsPaginationWrapper = styled(DomainsPaginationContainer)`
+    justify-content: center;
+`;
+
+const ResultsWrapper = styled.div`
+    height: auto;
+    overflow: auto;
+    flex: 1;
+    position: relative;
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    padding: 16px;
+    gap: 12px;
+    background: ${(props) => props.theme.colors.bgSurface};
+`;
+
+const LoadingWrapper = styled.div`
+    display: flex;
+    justify-content: center;
+    margin-top: 25%;
+`;
+
+const DEFAULT_PAGE_SIZE = 10;
+
+export default function DataProductsTab() {
+    const { t } = useTranslation('entity.types');
+    const { refetch } = useEntityContext();
+    const { entityData } = useEntityData();
+    const entityRegistry = useEntityRegistry();
+    const location = useLocation();
+    const params = QueryString.parse(location.search, { arrayFormat: 'comma' });
+    const paramsQuery = (params?.query as string) || undefined;
+    const [query, setQuery] = useState<string | undefined>(paramsQuery);
+    const [page, setPage] = useState(1);
+    const [isCreateModalVisible, setIsCreateModalVisible] = useState(params.createModal === 'true');
+    const [createdDataProducts, setCreatedDataProducts] = useState<DataProduct[]>([]);
+    const [editedDataProducts, setEditedDataProducts] = useState<DataProduct[]>([]);
+    const [deletedDataProductUrns, setDeletedDataProductUrns] = useState<string[]>([]);
+
+    const start = (page - 1) * DEFAULT_PAGE_SIZE;
+    const domainUrn = entityData?.urn || '';
+
+    const { data, loading } = useGetSearchResultsForMultipleQuery({
+        skip: !domainUrn,
+        variables: {
+            input: {
+                types: [EntityType.DataProduct],
+                query: query || '',
+                start,
+                count: DEFAULT_PAGE_SIZE,
+                orFilters: [{ and: [{ field: DOMAINS_FILTER_NAME, values: [domainUrn] }] }],
+                searchFlags: { skipCache: true },
+            },
+        },
+        fetchPolicy: 'no-cache',
+    });
+    const totalResults = data?.searchAcrossEntities?.total || 0;
+    const searchResults = data?.searchAcrossEntities?.searchResults?.map((r) => r.entity) || [];
+    const dataProducts = [...createdDataProducts, ...searchResults];
+    const displayedDataProducts = dataProducts
+        .map(
+            (dataProduct) =>
+                editedDataProducts.find((editedDataProduct) => editedDataProduct.urn === dataProduct.urn) ||
+                dataProduct,
+        )
+        .filter((dataProduct) => !deletedDataProductUrns.includes(dataProduct.urn));
+
+    const onChangePage = (newPage: number) => {
+        scrollToTop();
+        setPage(newPage);
+    };
+
+    function onCreateDataProduct(dataProduct: DataProduct) {
+        setCreatedDataProducts([dataProduct, ...createdDataProducts]);
+        setTimeout(() => refetch(), 3000);
+    }
+
+    function onUpdateDataProduct(dataProduct: DataProduct) {
+        setEditedDataProducts([dataProduct, ...editedDataProducts]);
+    }
+
+    return (
+        <>
+            <TabToolbar>
+                <Button
+                    variant="text"
+                    icon={{ icon: Plus }}
+                    onClick={() => setIsCreateModalVisible(true)}
+                    data-testid="create-data-product-button"
+                >
+                    {t('dataProduct.newDataProduct')}
+                </Button>
+                <SearchBar
+                    initialQuery={query || ''}
+                    placeholderText={t('dataProduct.searchPlaceholder')}
+                    suggestions={[]}
+                    style={{
+                        maxWidth: 220,
+                        padding: 0,
+                    }}
+                    inputStyle={{
+                        height: 32,
+                        fontSize: 12,
+                    }}
+                    onSearch={() => null}
+                    onQueryChange={(q) => setQuery(q && q.length > 0 ? q : undefined)}
+                    entityRegistry={entityRegistry}
+                    hideRecommendations
+                />
+            </TabToolbar>
+            <ResultsWrapper>
+                {!loading && !displayedDataProducts.length && (
+                    <EmptyState title={t('dataProduct.noDataProductsEmpty')} size="sm" />
+                )}
+                {loading && (
+                    <LoadingWrapper>
+                        <Loader size="md" />
+                    </LoadingWrapper>
+                )}
+                {!loading &&
+                    displayedDataProducts.map((dataProduct) => (
+                        <DataProductResult
+                            key={dataProduct.urn}
+                            dataProduct={dataProduct as DataProduct}
+                            onUpdateDataProduct={onUpdateDataProduct}
+                            setDeletedDataProductUrns={setDeletedDataProductUrns}
+                        />
+                    ))}
+            </ResultsWrapper>
+            <DataProductsPaginationWrapper>
+                <Pagination
+                    currentPage={page}
+                    itemsPerPage={DEFAULT_PAGE_SIZE}
+                    total={totalResults}
+                    showLessItems
+                    onPageChange={onChangePage}
+                    showSizeChanger={false}
+                />
+            </DataProductsPaginationWrapper>
+            {isCreateModalVisible && (
+                <CreateDataProductModal
+                    domain={entityData as Domain}
+                    onCreateDataProduct={onCreateDataProduct}
+                    onClose={() => setIsCreateModalVisible(false)}
+                />
+            )}
+        </>
+    );
+}

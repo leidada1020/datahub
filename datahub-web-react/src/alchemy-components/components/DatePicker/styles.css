@@ -1,0 +1,16 @@
+.acryl-date-picker .ant-picker-cell-today > .ant-picker-cell-inner::before {
+    border: 1px solid var(--theme-iconBrand) !important;
+}
+
+.acryl-date-picker .ant-picker-cell-selected > .ant-picker-cell-inner {
+    background: var(--theme-iconBrand) !important;
+    color: var(--theme-textOnFillBrand);
+}
+
+.acryl-date-picker .ant-picker-today-btn {
+    color: var(--theme-iconBrand);
+}
+
+.acryl-date-picker .ant-picker-header-view button:hover {
+    color: var(--theme-iconBrand);
+}

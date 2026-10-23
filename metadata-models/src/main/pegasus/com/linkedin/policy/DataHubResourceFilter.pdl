@@ -1,0 +1,39 @@
+namespace com.linkedin.policy
+
+import com.linkedin.common.Urn
+
+/**
+ * Information used to filter DataHub resource.
+ */
+record DataHubResourceFilter {
+
+  /**
+   * The type of resource that the policy applies to. This will most often be a data asset entity name, for
+   * example 'dataset'. It is not strictly required because in the future we will want to support filtering a resource
+   * by domain, as well.
+   */
+  @deprecated
+  type: optional string
+
+  /**
+   * A specific set of resources to apply the policy to, e.g. asset urns
+   */
+  @deprecated
+  resources: optional array[string]
+
+  /**
+   * Whether the policy should be applied to all assets matching the filter.
+   */
+  @deprecated
+  allResources: boolean = false
+
+  /**
+   * Filter to apply privileges to
+   */
+  filter: optional PolicyMatchFilter
+
+  /**
+   * Constraints around what sub-resources operations are allowed to modify, i.e. NOT_EQUALS - cannot modify a particular defined tag, EQUALS - can only modify a particular defined tag, STARTS_WITH - can only modify a tag starting with xyz
+   */
+  privilegeConstraints: optional PolicyMatchFilter
+}

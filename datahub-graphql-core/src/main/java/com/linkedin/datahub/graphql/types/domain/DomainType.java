@@ -1,0 +1,132 @@
+package com.linkedin.datahub.graphql.types.domain;
+
+import com.google.common.collect.ImmutableSet;
+import com.linkedin.common.urn.Urn;
+import com.linkedin.datahub.graphql.QueryContext;
+import com.linkedin.datahub.graphql.generated.AutoCompleteResults;
+import com.linkedin.datahub.graphql.generated.Domain;
+import com.linkedin.datahub.graphql.generated.Entity;
+import com.linkedin.datahub.graphql.generated.EntityType;
+import com.linkedin.datahub.graphql.generated.FacetFilterInput;
+import com.linkedin.datahub.graphql.generated.SearchResults;
+import com.linkedin.datahub.graphql.types.SearchableEntityType;
+import com.linkedin.datahub.graphql.types.mappers.AutoCompleteResultsMapper;
+import com.linkedin.datahub.graphql.util.AspectUtils;
+import com.linkedin.entity.EntityResponse;
+import com.linkedin.entity.client.EntityClient;
+import com.linkedin.metadata.Constants;
+import com.linkedin.metadata.query.AutoCompleteResult;
+import com.linkedin.metadata.query.filter.Filter;
+import graphql.execution.DataFetcherResult;
+import java.net.URISyntaxException;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+import org.apache.commons.lang3.NotImplementedException;
+
+public class DomainType
+    implements SearchableEntityType<Domain, String>,
+        com.linkedin.datahub.graphql.types.EntityType<Domain, String> {
+
+  static final Set<String> ASPECTS_TO_FETCH =
+      ImmutableSet.of(
+          Constants.DOMAIN_KEY_ASPECT_NAME,
+          Constants.DOMAIN_PROPERTIES_ASPECT_NAME,
+          Constants.OWNERSHIP_ASPECT_NAME,
+          Constants.INSTITUTIONAL_MEMORY_ASPECT_NAME,
+          Constants.STRUCTURED_PROPERTIES_ASPECT_NAME,
+          Constants.FORMS_ASPECT_NAME,
+          Constants.DISPLAY_PROPERTIES_ASPECT_NAME,
+          Constants.DEPRECATION_ASPECT_NAME,
+          Constants.ASSET_SETTINGS_ASPECT_NAME);
+  private final EntityClient _entityClient;
+
+  public DomainType(final EntityClient entityClient) {
+    _entityClient = entityClient;
+  }
+
+  @Override
+  public EntityType type() {
+    return EntityType.DOMAIN;
+  }
+
+  @Override
+  public Function<Entity, String> getKeyProvider() {
+    return Entity::getUrn;
+  }
+
+  @Override
+  public Class<Domain> objectClass() {
+    return Domain.class;
+  }
+
+  @Override
+  public List<DataFetcherResult<Domain>> batchLoad(
+      @Nonnull List<String> urns, @Nonnull QueryContext context) throws Exception {
+    final List<Urn> domainUrns = urns.stream().map(this::getUrn).collect(Collectors.toList());
+
+    try {
+      // Determine optimal aspects to fetch based on GraphQL field selections
+      Set<String> aspectsToResolve =
+          AspectUtils.getOptimizedAspects(
+              context, name(), ASPECTS_TO_FETCH, Constants.DOMAIN_KEY_ASPECT_NAME);
+      final Map<Urn, EntityResponse> entities =
+          _entityClient.batchGetV2(
+              context.getOperationContext(),
+              Constants.DOMAIN_ENTITY_NAME,
+              new HashSet<>(domainUrns),
+              aspectsToResolve);
+
+      final List<DataFetcherResult<Domain>> results = new ArrayList<>(urns.size());
+      for (Urn urn : domainUrns) {
+        EntityResponse gmsResult = entities.get(urn);
+        Domain mapped = gmsResult == null ? null : DomainMapper.map(context, gmsResult);
+        results.add(
+            mapped == null ? null : DataFetcherResult.<Domain>newResult().data(mapped).build());
+      }
+      return results;
+    } catch (Exception e) {
+      throw new RuntimeException("Failed to batch load Domains", e);
+    }
+  }
+
+  @Override
+  public SearchResults search(
+      @Nonnull String query,
+      @Nullable List<FacetFilterInput> filters,
+      int start,
+      @Nullable Integer count,
+      @Nonnull final QueryContext context)
+      throws Exception {
+    throw new NotImplementedException(
+        "Searchable type (deprecated) not implemented on Domain entity type");
+  }
+
+  @Override
+  public AutoCompleteResults autoComplete(
+      @Nonnull String query,
+      @Nullable String field,
+      @Nullable Filter filters,
+      @Nullable Integer limit,
+      @Nonnull final QueryContext context)
+      throws Exception {
+    final AutoCompleteResult result =
+        _entityClient.autoComplete(
+            context.getOperationContext(), Constants.DOMAIN_ENTITY_NAME, query, filters, limit);
+    return AutoCompleteResultsMapper.map(context, result);
+  }
+
+  private Urn getUrn(final String urnStr) {
+    try {
+      return Urn.createFromString(urnStr);
+    } catch (URISyntaxException e) {
+      throw new RuntimeException(String.format("Failed to convert urn string %s into Urn", urnStr));
+    }
+  }
+}

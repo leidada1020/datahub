@@ -1,0 +1,152 @@
+import { Button, Text, Tooltip } from '@components';
+import { PencilSimpleLine } from '@phosphor-icons/react/dist/csr/PencilSimpleLine';
+import queryString from 'query-string';
+import React, { useEffect, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useHistory, useLocation } from 'react-router-dom';
+import styled from 'styled-components';
+
+import { Editor } from '@components/components/Editor';
+
+import DescriptionViewer from '@app/entityV2/summary/documentation/DescriptionViewer';
+import EditDescriptionModal from '@app/entityV2/summary/documentation/EditDescriptionModal';
+import { useDescriptionUtils } from '@app/entityV2/summary/documentation/useDescriptionUtils';
+import { useDocumentationPermission } from '@app/entityV2/summary/documentation/useDocumentationPermission';
+import RelatedSection from '@app/entityV2/summary/links/RelatedSection';
+
+const StyledEditor = styled(Editor)<{ $isEditing?: boolean }>`
+    border: none;
+    margin-top: 4px;
+    &&& {
+        .remirror-editor.ProseMirror,
+        .datahub-editor-content {
+            padding: 0;
+            color: ${(props) => props.theme.colors.text};
+        }
+        p:last-of-type {
+            margin-bottom: 0;
+        }
+    }
+`;
+
+const SectionHeaderWrapper = styled.div`
+    display: flex;
+    justify-content: space-between;
+`;
+
+const ButtonsWrapper = styled.div`
+    display: flex;
+    gap: 8px;
+`;
+
+const DescriptionContainer = styled.div`
+    max-width: 100%;
+`;
+
+interface Props {
+    hideLinksButton: boolean;
+    hideEditDescription?: boolean;
+}
+
+export default function AboutSection({ hideLinksButton, hideEditDescription }: Props) {
+    const { t } = useTranslation('entity.profile.summary');
+    const history = useHistory();
+    const { search, pathname } = useLocation();
+    const isEditingDescription =
+        !hideEditDescription && !!queryString.parse(search, { parseBooleans: true }).editingDescription;
+
+    const [showAddDescriptionModal, setShowDescriptionModal] = useState(isEditingDescription);
+
+    const canEditDescription = useDocumentationPermission() && !hideEditDescription;
+    const {
+        displayedDescription,
+        updatedDescription,
+        setUpdatedDescription,
+        handleDescriptionUpdate,
+        emptyDescriptionText,
+    } = useDescriptionUtils();
+
+    useEffect(() => {
+        setShowDescriptionModal(isEditingDescription);
+    }, [isEditingDescription]);
+
+    /**
+     * The editor only reads its `content` prop on mount. When the modal is opened straight from the URL
+     * (?editingDescription=true) it can mount before entityData resolves, leaving the editor stuck on the empty
+     * description it mounted with. Bump the key once the description first arrives to force a re-mount.
+     */
+    const [descriptionEditorKey, setDescriptionEditorKey] = useState(0);
+    const hasInitializedDescriptionRef = useRef(!!updatedDescription);
+    useEffect(() => {
+        if (hasInitializedDescriptionRef.current) return;
+        if (updatedDescription) {
+            hasInitializedDescriptionRef.current = true;
+        } else if (displayedDescription) {
+            setDescriptionEditorKey((prevKey) => prevKey + 1);
+            hasInitializedDescriptionRef.current = true;
+        }
+    }, [displayedDescription, updatedDescription]);
+
+    const removeEditingParam = () => {
+        const params = queryString.parse(search);
+        delete params.editingDescription;
+
+        const newSearch = queryString.stringify(params);
+        history.replace({
+            pathname,
+            search: newSearch,
+        });
+    };
+
+    const cancelUpdate = () => {
+        setShowDescriptionModal(false);
+        setUpdatedDescription(displayedDescription);
+        removeEditingParam();
+    };
+
+    return (
+        <div data-testid="about-section">
+            <SectionHeaderWrapper>
+                <Text weight="bold" color="text" size="sm">
+                    {t('documentation.aboutTitle')}
+                </Text>
+                <ButtonsWrapper>
+                    {canEditDescription && (
+                        <Tooltip title={t('documentation.editTooltip')}>
+                            <Button
+                                variant="text"
+                                color="gray"
+                                size="xs"
+                                icon={{ icon: PencilSimpleLine, size: 'lg' }}
+                                style={{ padding: '0 2px' }}
+                                onClick={() => setShowDescriptionModal(true)}
+                                data-testid="edit-description-button"
+                            />
+                        </Tooltip>
+                    )}
+                </ButtonsWrapper>
+            </SectionHeaderWrapper>
+            <DescriptionContainer>
+                <DescriptionViewer>
+                    <StyledEditor
+                        content={displayedDescription}
+                        placeholder={emptyDescriptionText}
+                        dataTestId="description-viewer"
+                        readOnly
+                    />
+                </DescriptionViewer>
+            </DescriptionContainer>
+            {!hideLinksButton && <RelatedSection hideLinksButton={hideLinksButton} />}
+            {showAddDescriptionModal && (
+                <EditDescriptionModal
+                    contentKey={descriptionEditorKey}
+                    updatedDescription={updatedDescription}
+                    setUpdatedDescription={setUpdatedDescription}
+                    handleDescriptionUpdate={handleDescriptionUpdate}
+                    emptyDescriptionText={emptyDescriptionText}
+                    closeModal={cancelUpdate}
+                />
+            )}
+        </div>
+    );
+}

@@ -1,0 +1,506 @@
+import concurrent.futures
+import contextlib
+import dataclasses
+import functools
+import logging
+import threading
+import uuid
+from datetime import timedelta
+from enum import auto
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+
+import pydantic
+import requests
+from pydantic import field_validator
+from requests.sessions import SessionRedirectMixin
+
+from datahub.cli.cli_utils import fixup_gms_url
+from datahub.cli.config_utils import get_url_from_env
+from datahub.configuration.common import (
+    ConfigEnum,
+    ConfigurationError,
+    OperationalError,
+)
+from datahub.configuration.env_vars import (
+    get_rest_sink_default_max_threads,
+    get_rest_sink_default_mode,
+)
+from datahub.emitter.mcp import MetadataChangeProposalWrapper
+from datahub.emitter.mcp_builder import mcps_from_mce
+from datahub.emitter.rest_emitter import (
+    _DEFAULT_EMIT_MODE,
+    BATCH_INGEST_MAX_PAYLOAD_LENGTH,
+    DEFAULT_REST_EMITTER_ENDPOINT,
+    DataHubRestEmitter,
+    EmitMode,
+    RestSinkEndpoint,
+)
+from datahub.emitter.token_provider import TokenProviderAuth
+from datahub.ingestion.api.common import RecordEnvelope, WorkUnit
+from datahub.ingestion.api.sink import (
+    NoopWriteCallback,
+    Sink,
+    SinkReport,
+    WriteCallback,
+)
+from datahub.ingestion.api.workunit import MetadataWorkUnit
+from datahub.ingestion.auth.env import build_auth_config_from_env
+from datahub.ingestion.auth.registry import build_token_provider
+from datahub.ingestion.graph.config import ClientMode, DatahubClientConfig
+from datahub.metadata.com.linkedin.pegasus2avro.mxe import (
+    MetadataChangeEvent,
+    MetadataChangeProposal,
+)
+from datahub.utilities.partition_executor import (
+    BatchPartitionExecutor,
+    PartitionExecutor,
+)
+from datahub.utilities.perf_timer import PerfTimer
+from datahub.utilities.server_config_util import set_gms_config
+
+if TYPE_CHECKING:
+    from datahub.ingestion.graph.client import DataHubGraph
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_REST_SINK_MAX_THREADS = get_rest_sink_default_max_threads()
+
+
+class RestSinkMode(ConfigEnum):
+    SYNC = auto()
+    ASYNC = auto()
+
+    # Uses the new ingestProposalBatch endpoint. Significantly more efficient than the other modes,
+    # but requires a server version that supports it. Added in
+    # https://github.com/datahub-project/datahub/pull/10706
+    ASYNC_BATCH = auto()
+
+
+_DEFAULT_REST_SINK_MODE = pydantic.TypeAdapter(RestSinkMode).validate_python(
+    get_rest_sink_default_mode() or RestSinkMode.ASYNC_BATCH
+)
+
+
+class DatahubRestSinkConfig(DatahubClientConfig):
+    mode: RestSinkMode = _DEFAULT_REST_SINK_MODE
+    endpoint: RestSinkEndpoint = DEFAULT_REST_EMITTER_ENDPOINT
+    server_config_refresh_interval: Optional[int] = None
+
+    # These only apply in async modes.
+    max_threads: pydantic.PositiveInt = _DEFAULT_REST_SINK_MAX_THREADS
+    max_pending_requests: pydantic.PositiveInt = 2000
+
+    # Only applies in async batch mode.
+    max_per_batch: pydantic.PositiveInt = 100
+    min_process_interval_seconds: pydantic.PositiveFloat = 30
+
+    @field_validator("max_per_batch", mode="before")
+    @classmethod
+    def validate_max_per_batch(cls, v: int) -> int:
+        if v > BATCH_INGEST_MAX_PAYLOAD_LENGTH:
+            raise ValueError(
+                f"max_per_batch must be less than or equal to {BATCH_INGEST_MAX_PAYLOAD_LENGTH}"
+            )
+        return v
+
+
+@dataclasses.dataclass
+class DataHubRestSinkReport(SinkReport):
+    mode: Optional[RestSinkMode] = None
+    endpoint: Optional[RestSinkEndpoint] = None
+    max_threads: Optional[int] = None
+    gms_version: Optional[str] = None
+    pending_requests: int = 0
+
+    async_batches_prepared: int = 0
+    async_batches_split: int = 0
+
+    main_thread_blocking_timer: PerfTimer = dataclasses.field(default_factory=PerfTimer)
+
+    def compute_stats(self) -> None:
+        super().compute_stats()
+
+
+def _get_urn(record_envelope: RecordEnvelope) -> Optional[str]:
+    metadata = record_envelope.record
+
+    if isinstance(metadata, MetadataChangeEvent):
+        return metadata.proposedSnapshot.urn
+    elif isinstance(metadata, (MetadataChangeProposalWrapper, MetadataChangeProposal)):
+        return metadata.entityUrn
+
+    return None
+
+
+def _get_partition_key(record_envelope: RecordEnvelope) -> str:
+    urn = _get_urn(record_envelope)
+    if urn:
+        return urn
+
+    # This shouldn't happen super frequently, but just adding a fallback of generating
+    # a UUID so that we don't do any partitioning.
+    return str(uuid.uuid4())
+
+
+def _resolve_gms_emit_mode(
+    rest_sink_mode: RestSinkMode, configured_gms_emit_mode: EmitMode
+) -> EmitMode:
+    """Pick an EmitMode compatible with the sink mode.
+
+    If the user-configured GMS emit mode (via DATAHUB_EMIT_MODE env var) belongs
+    to the same family as the sink mode, honour it.  Otherwise warn and fall back
+    to a safe default for that family.
+    """
+    if rest_sink_mode == RestSinkMode.SYNC:
+        if not configured_gms_emit_mode.is_async:
+            return configured_gms_emit_mode
+        logger.warning(
+            f"REST sink mode is SYNC but DATAHUB_EMIT_MODE is "
+            f"{configured_gms_emit_mode.value} (async family). "
+            f"Overriding GMS emit mode to SYNC_PRIMARY."
+        )
+        return EmitMode.SYNC_PRIMARY
+    else:  # ASYNC or ASYNC_BATCH
+        if configured_gms_emit_mode.is_async:
+            return configured_gms_emit_mode
+        logger.warning(
+            f"REST sink mode is {rest_sink_mode.value} but DATAHUB_EMIT_MODE is "
+            f"{configured_gms_emit_mode.value} (sync family). "
+            f"Overriding GMS emit mode to ASYNC."
+        )
+        return EmitMode.ASYNC
+
+
+class DatahubRestSink(Sink[DatahubRestSinkConfig, DataHubRestSinkReport]):
+    _emitter_thread_local: threading.local
+    _resolved_auth: Optional[requests.auth.AuthBase]
+    treat_errors_as_warnings: bool = False
+
+    def __post_init__(self) -> None:
+        # Must be resolved before the first `self.emitter` access below.
+        self._resolved_auth = DatahubRestSink._resolve_auth(self.config)
+        self._emitter_thread_local = threading.local()
+        self._gms_emit_mode = _resolve_gms_emit_mode(
+            self.config.mode, _DEFAULT_EMIT_MODE
+        )
+
+        try:
+            gms_config = self.emitter.server_config
+        except Exception as exc:
+            raise ConfigurationError(
+                f"💥 Failed to connect to DataHub with {repr(self.emitter)}"
+            ) from exc
+
+        self.report.gms_version = gms_config.service_version
+        self.report.mode = self.config.mode
+        self.report.endpoint = self.config.endpoint
+        self.report.max_threads = self.config.max_threads
+        logger.debug("Setting env variables to override config")
+        logger.debug("Setting gms config")
+        set_gms_config(gms_config)
+
+        logger.debug(
+            f"REST sink initialized: rest_sink_mode={self.config.mode.value}, "
+            f"gms_emit_mode={self._gms_emit_mode.value}, "
+            f"max_threads={self.config.max_threads}, "
+            f"max_per_batch={self.config.max_per_batch}"
+        )
+
+        self.executor: Union[PartitionExecutor, BatchPartitionExecutor]
+        if self.config.mode == RestSinkMode.ASYNC_BATCH:
+            self.executor = BatchPartitionExecutor(
+                max_workers=self.config.max_threads,
+                max_pending=self.config.max_pending_requests,
+                process_batch=self._emit_batch_wrapper,
+                max_per_batch=self.config.max_per_batch,
+                min_process_interval=timedelta(
+                    seconds=self.config.min_process_interval_seconds
+                ),
+            )
+        else:
+            self.executor = PartitionExecutor(
+                max_workers=self.config.max_threads,
+                max_pending=self.config.max_pending_requests,
+            )
+
+    @classmethod
+    def make_emitter(cls, config: DatahubRestSinkConfig) -> DataHubRestEmitter:
+        """Build a REST emitter from sink config.
+
+        Public so other sinks (e.g. the Kafka sink's REST fallback) can reuse the
+        exact emitter construction.
+        """
+        return cls._make_emitter(config, auth=cls._resolve_auth(config))
+
+    @classmethod
+    def _resolve_auth(
+        cls, config: DatahubRestSinkConfig
+    ) -> Optional[requests.auth.AuthBase]:
+        # Resolved ONCE per sink and shared across the worker-thread emitters:
+        # TokenProviderAuth is thread-safe (per-request state is thread-local,
+        # the provider cache is lock-guarded), while a provider per thread would
+        # each hit the IdP independently — max_threads token requests at startup
+        # and per refresh window, multiplied across concurrent pipelines.
+        auth_config = config.auth
+        if auth_config is None and not config.token:
+            # A recipe sink block that carries no credentials inherits env-based
+            # OAuth (DATAHUB_AUTH_TYPE) — without this, an explicit
+            # `sink: datahub-rest` block silently bypasses env auth and emits
+            # unauthenticated. Explicit credentials in the sink block always win
+            # over the environment.
+            env_auth = build_auth_config_from_env()
+            if env_auth is not None:
+                # Env OAuth applies only to the env-configured server: merging it
+                # into a sink pointing at a different origin would mint fresh
+                # bearer tokens and send them to that other host (audience
+                # scoping limits use, not disclosure). Delegates to requests'
+                # should_strip_auth — the same rule the 401-retry guard uses —
+                # so same-origin (and the benign http->https upgrade) inherit
+                # env auth, while any other origin change skips it, loudly.
+                env_url = get_url_from_env()
+                if env_url is not None and not SessionRedirectMixin().should_strip_auth(
+                    fixup_gms_url(env_url), fixup_gms_url(config.server)
+                ):
+                    auth_config = env_auth
+                    logger.info(
+                        "datahub-rest sink has no credentials configured; using "
+                        "OAuth auth from DATAHUB_AUTH_TYPE for %s.",
+                        config.server,
+                    )
+                elif env_url is None:
+                    logger.warning(
+                        "DATAHUB_AUTH_TYPE is set but DATAHUB_GMS_URL is not; "
+                        "not applying env OAuth to the explicit datahub-rest "
+                        "sink. Set DATAHUB_GMS_URL to the sink's server to "
+                        "inherit env auth."
+                    )
+                else:
+                    logger.warning(
+                        "Not applying env OAuth (DATAHUB_AUTH_TYPE) to the "
+                        "datahub-rest sink pointing at %s — it does not match "
+                        "the env-configured server %s.",
+                        config.server,
+                        env_url,
+                    )
+        if auth_config is None:
+            return None
+        return TokenProviderAuth(build_token_provider(auth_config))
+
+    @classmethod
+    def _make_emitter(
+        cls,
+        config: DatahubRestSinkConfig,
+        auth: Optional[requests.auth.AuthBase] = None,
+    ) -> DataHubRestEmitter:
+        return DataHubRestEmitter(
+            config.server,
+            config.token,
+            auth=auth,
+            connect_timeout_sec=config.timeout_sec,  # reuse timeout_sec for connect timeout
+            read_timeout_sec=config.timeout_sec,
+            retry_status_codes=config.retry_status_codes,
+            retry_max_times=config.retry_max_times,
+            pool_connections=config.pool_connections,
+            pool_maxsize=config.pool_maxsize,
+            extra_headers=config.extra_headers,
+            ca_certificate_path=config.ca_certificate_path,
+            client_certificate_path=config.client_certificate_path,
+            client_key_path=config.client_key_path,
+            disable_ssl_verification=config.disable_ssl_verification,
+            openapi_ingestion=config.endpoint == RestSinkEndpoint.OPENAPI,
+            # Marker-aware sync routing only ever upgrades a batch to sync, never
+            # downgrades it, so it is a no-op in SYNC mode (already synchronous)
+            # and safe to pass through unconditionally.
+            respect_mcp_sync_marker=config.respect_mcp_sync_marker,
+            client_mode=config.client_mode,
+            datahub_component=config.datahub_component,
+            tcp_keepalive=config.tcp_keepalive,
+        )
+
+    @property
+    def emitter(self) -> DataHubRestEmitter:
+        # While this is a property, it actually uses one emitter per thread.
+        # Since emitter is one-to-one with request sessions, using a separate
+        # emitter per thread should improve correctness and performance.
+        # https://github.com/psf/requests/issues/1871#issuecomment-32751346
+        thread_local = self._emitter_thread_local
+        if not hasattr(thread_local, "emitter"):
+            self.config.client_mode = ClientMode.INGESTION
+            thread_local.emitter = DatahubRestSink._make_emitter(
+                self.config, auth=self._resolved_auth
+            )
+        return thread_local.emitter
+
+    def to_graph(self) -> Optional["DataHubGraph"]:
+        return self.emitter.to_graph()
+
+    def handle_work_unit_start(self, workunit: WorkUnit) -> None:
+        if isinstance(workunit, MetadataWorkUnit):
+            self.treat_errors_as_warnings = workunit.treat_errors_as_warnings
+
+    def handle_work_unit_end(self, workunit: WorkUnit) -> None:
+        pass
+
+    def _write_done_callback(
+        self,
+        record_envelope: RecordEnvelope,
+        write_callback: WriteCallback,
+        future: concurrent.futures.Future,
+    ) -> None:
+        self.report.pending_requests -= 1
+        if future.cancelled():
+            self.report.report_failure({"error": "future was cancelled"})
+            write_callback.on_failure(
+                record_envelope, OperationalError("future was cancelled"), {}
+            )
+        elif future.done():
+            e = future.exception()
+            if not e:
+                self.report.report_record_written(record_envelope)
+                write_callback.on_success(record_envelope, {})
+            elif isinstance(e, OperationalError):
+                # only OperationalErrors should be ignored
+                # trim exception stacktraces in all cases when reporting
+                if "stackTrace" in e.info:
+                    with contextlib.suppress(Exception):
+                        e.info["stackTrace"] = "\n".join(
+                            e.info["stackTrace"].split("\n")[:3]
+                        )
+                        e.info["message"] = e.info.get("message", "").split("\n")[0][
+                            :200
+                        ]
+
+                # Include information about the entity that failed.
+                record_urn = _get_urn(record_envelope)
+                if record_urn:
+                    e.info["urn"] = record_urn
+                if workunit_id := record_envelope.metadata.get("workunit_id"):
+                    e.info["workunit_id"] = workunit_id
+
+                if not self.treat_errors_as_warnings:
+                    self.report.report_failure({"error": e.message, "info": e.info})
+                else:
+                    self.report.report_warning({"warning": e.message, "info": e.info})
+                write_callback.on_failure(record_envelope, e, e.info)
+            else:
+                logger.exception(f"Failure: {e}", exc_info=e)
+                self.report.report_failure({"e": e})
+                write_callback.on_failure(record_envelope, Exception(e), {})
+
+    def _emit_wrapper(
+        self,
+        record: Union[
+            MetadataChangeEvent,
+            MetadataChangeProposal,
+            MetadataChangeProposalWrapper,
+        ],
+        emit_mode: EmitMode,
+    ) -> None:
+        # TODO: Add timing metrics
+        self.emitter.emit(record, emit_mode=emit_mode)
+
+    def _emit_batch_wrapper(
+        self,
+        records: List[
+            Tuple[
+                Union[
+                    MetadataChangeEvent,
+                    MetadataChangeProposal,
+                    MetadataChangeProposalWrapper,
+                ],
+            ]
+        ],
+    ) -> None:
+        events: List[Union[MetadataChangeProposal, MetadataChangeProposalWrapper]] = []
+
+        for record in records:
+            event = record[0]
+
+            if isinstance(event, MetadataChangeEvent):
+                # Unpack MCEs into MCPs.
+                mcps = mcps_from_mce(event)
+                events.extend(mcps)
+            else:
+                events.append(event)
+
+        trace_data = self.emitter.emit_mcps(events, emit_mode=self._gms_emit_mode)
+        num_chunks = len(trace_data)
+        self.report.async_batches_prepared += 1
+        if num_chunks > 1:
+            self.report.async_batches_split += num_chunks
+            logger.info(
+                f"In async_batch mode, the payload was split into {num_chunks} batches. "
+                "If there's many of these issues, consider decreasing `max_per_batch`."
+            )
+
+    def write_record_async(
+        self,
+        record_envelope: RecordEnvelope[
+            Union[
+                MetadataChangeEvent,
+                MetadataChangeProposal,
+                MetadataChangeProposalWrapper,
+            ]
+        ],
+        write_callback: WriteCallback,
+    ) -> None:
+        # Because the default is async mode and most sources are slower than the sink, this
+        # should only have a high value if the sink is actually a bottleneck.
+        with self.report.main_thread_blocking_timer:
+            record = record_envelope.record
+            if self.config.mode == RestSinkMode.ASYNC:
+                assert isinstance(self.executor, PartitionExecutor)
+                partition_key = _get_partition_key(record_envelope)
+                self.executor.submit(
+                    partition_key,
+                    self._emit_wrapper,
+                    record,
+                    self._gms_emit_mode,
+                    done_callback=functools.partial(
+                        self._write_done_callback, record_envelope, write_callback
+                    ),
+                )
+                self.report.pending_requests += 1
+            elif self.config.mode == RestSinkMode.ASYNC_BATCH:
+                assert isinstance(self.executor, BatchPartitionExecutor)
+                partition_key = _get_partition_key(record_envelope)
+                self.executor.submit(
+                    partition_key,
+                    record,
+                    self._gms_emit_mode,
+                    done_callback=functools.partial(
+                        self._write_done_callback, record_envelope, write_callback
+                    ),
+                )
+                self.report.pending_requests += 1
+            else:
+                # execute synchronously
+                try:
+                    self._emit_wrapper(record, emit_mode=self._gms_emit_mode)
+                    write_callback.on_success(record_envelope, success_metadata={})
+                except Exception as e:
+                    write_callback.on_failure(record_envelope, e, failure_metadata={})
+
+    def emit_async(
+        self,
+        item: Union[
+            MetadataChangeEvent, MetadataChangeProposal, MetadataChangeProposalWrapper
+        ],
+    ) -> None:
+        return self.write_record_async(
+            RecordEnvelope(item, metadata={}), NoopWriteCallback()
+        )
+
+    def close(self):
+        # Execute pre-shutdown callbacks first (handled by parent class)
+        super().close()
+
+        # Then perform sink-specific shutdown
+        with self.report.main_thread_blocking_timer:
+            self.executor.shutdown()
+
+    def __repr__(self) -> str:
+        return self.emitter.__repr__()
+
+    def configured(self) -> str:
+        return repr(self)

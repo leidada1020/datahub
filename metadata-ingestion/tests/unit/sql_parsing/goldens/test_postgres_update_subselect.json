@@ -1,0 +1,62 @@
+{
+    "query_type": "UPDATE",
+    "query_type_props": {},
+    "query_fingerprint": "c4b756bd9eceebd04abaa0c273b12898f88fc2a9d1f4c7ae03faa7c4e096fa21",
+    "in_tables": [
+        "urn:li:dataset:(urn:li:dataPlatform:postgres,my_db.my_schema.accounts,PROD)",
+        "urn:li:dataset:(urn:li:dataPlatform:postgres,my_db.my_schema.employees,PROD)"
+    ],
+    "out_tables": [
+        "urn:li:dataset:(urn:li:dataPlatform:postgres,my_db.my_schema.accounts,PROD)"
+    ],
+    "column_lineage": [
+        {
+            "downstream": {
+                "table": "urn:li:dataset:(urn:li:dataPlatform:postgres,my_db.my_schema.accounts,PROD)",
+                "column": "sales_person_name",
+                "column_type": {
+                    "type": {
+                        "com.linkedin.pegasus2avro.schema.StringType": {}
+                    }
+                },
+                "native_column_type": "VARCHAR(16777216)"
+            },
+            "upstreams": [
+                {
+                    "table": "urn:li:dataset:(urn:li:dataPlatform:postgres,my_db.my_schema.employees,PROD)",
+                    "column": "name"
+                }
+            ],
+            "logic": {
+                "is_direct_copy": false,
+                "column_logic": "MAX(\"employees\".\"name\") AS \"name\""
+            }
+        }
+    ],
+    "joins": [
+        {
+            "join_type": "LEFT JOIN",
+            "left_tables": [
+                "urn:li:dataset:(urn:li:dataPlatform:postgres,my_db.my_schema.accounts,PROD)"
+            ],
+            "right_tables": [
+                "urn:li:dataset:(urn:li:dataPlatform:postgres,my_db.my_schema.employees,PROD)"
+            ],
+            "on_clause": "\"_u_0\".\"_u_1\" = \"accounts\".\"sales_person_id\"",
+            "columns_involved": [
+                {
+                    "table": "urn:li:dataset:(urn:li:dataPlatform:postgres,my_db.my_schema.accounts,PROD)",
+                    "column": "sales_person_id"
+                },
+                {
+                    "table": "urn:li:dataset:(urn:li:dataPlatform:postgres,my_db.my_schema.employees,PROD)",
+                    "column": "id"
+                }
+            ]
+        }
+    ],
+    "debug_info": {
+        "confidence": 0.9,
+        "generalized_statement": "UPDATE accounts SET sales_person_name = (SELECT name FROM employees WHERE employees.id = accounts.sales_person_id)"
+    }
+}

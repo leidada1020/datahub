@@ -1,0 +1,59 @@
+import { Modal } from 'antd';
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { Text } from '@components/components/Text';
+import { typography } from '@components/theme';
+
+const StyledModal = styled(Modal)`
+    font-family: ${typography.fonts.body};
+
+    &&& .ant-modal-content {
+        box-shadow: ${(props) => props.theme.colors.shadowMd};
+        border-radius: 12px;
+    }
+
+    .ant-modal-header {
+        border-bottom: 0;
+        padding-bottom: 0;
+        border-radius: 12px !important;
+    }
+
+    .ant-modal-body {
+        padding: 8px 24px 24px 24px;
+    }
+
+    .ant-modal-close-x {
+        svg {
+            font-size: 18px;
+        }
+    }
+`;
+
+interface Props {
+    showModal: boolean;
+    handleClose: () => void;
+    modalContent: React.ReactNode;
+}
+
+const MoreInfoModal = ({ showModal, handleClose, modalContent }: Props) => {
+    const { t } = useTranslation('alchemy');
+    return (
+        <StyledModal
+            open={showModal}
+            onCancel={handleClose}
+            centered
+            footer={null}
+            title={
+                <Text size="xl" weight="bold">
+                    {t('noData')}
+                </Text>
+            }
+        >
+            {modalContent}
+        </StyledModal>
+    );
+};
+
+export default MoreInfoModal;

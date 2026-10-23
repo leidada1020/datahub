@@ -1,0 +1,132 @@
+# This image has two variants: full and slim.
+ARG APP_ENV=full
+ARG PYTHON_VERSION=3.11
+
+# INLINE-BEGIN @/docker/snippets/ingestion_base
+# This is the "base" image workflow.
+# While it has a bunch of intermediate stages, it "exports" a couple
+# stages for consumption.
+# - python-base: A basic stage, with basic deps, Python, and a venv.
+# - ingestion-base-slim: Currently the same as base-empty.
+# - ingestion-base-full: Adds a JRE and Oracle client.
+
+FROM ubuntu:24.04 AS python-base
+
+# TODO: This may not work on Ubuntu 24.04 due to the new deb822 package format.
+ARG UBUNTU_REPO_URL=http://ports.ubuntu.com/ubuntu-ports
+RUN if [ "${UBUNTU_REPO_URL}" != "http://ports.ubuntu.com/ubuntu-ports" ] ; then sed -i "s#http.*://ports.ubuntu.com/ubuntu-ports#${UBUNTU_REPO_URL}#g" /etc/apt/sources.list ; fi
+
+ENV HOME=/home/datahub
+RUN existing_group=$(getent group 1000 | cut -d: -f1) && \
+    if [ -n "$existing_group" ] && [ "$existing_group" != "datahub" ]; then \
+        echo "Renaming existing group $existing_group to datahub"; \
+        groupmod -n datahub "$existing_group"; \
+    elif [ -z "$existing_group" ]; then \
+        echo "Creating new group datahub with GID 1000"; \
+        addgroup --gid 1000 datahub; \
+    fi && \
+    existing_user=$(id -nu 1000 2>/dev/null || echo "") && \
+    if [ -n "$existing_user" ] && [ "$existing_user" != "datahub" ]; then \
+        echo "Renaming existing user $existing_user to datahub"; \
+        usermod -l datahub -d $HOME "$existing_user"; \
+        usermod -g datahub datahub; \
+    elif [ -z "$existing_user" ]; then \
+        echo "Creating new user datahub with UID 1000"; \
+        adduser --disabled-password --uid 1000 --gid 1000 --home $HOME datahub; \
+    fi && \
+    # Create and set proper permissions for datahub directories \
+    mkdir -p $HOME && \
+    chown -R datahub:datahub $HOME && \
+    chmod g-s $HOME
+
+ARG PYTHON_VERSION
+RUN test -n "${PYTHON_VERSION}"  # PYTHON_VERSION must be set
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install -y \
+    ca-certificates \
+    git \
+    wget \
+    curl \
+    zip \
+    unzip \
+    nano
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# Install Python via uv (python-build-standalone) instead of deadsnakes PPA.
+# Avoids PPA availability issues and missing distutils on Noble (Ubuntu 24.04).
+# UV_NO_CACHE=1 prevents root-owned cache files that cause permission errors
+# when subsequent steps run as the datahub user.
+ENV UV_PYTHON_INSTALL_DIR=/opt/python
+ENV UV_NO_CACHE=1
+RUN uv python install ${PYTHON_VERSION}
+
+ARG PIP_MIRROR_URL=https://pypi.python.org/simple
+RUN if [ "${PIP_MIRROR_URL}" != "https://pypi.python.org/simple" ] ; then uvx --no-cache pip config set global.index-url ${PIP_MIRROR_URL} ; fi
+ENV UV_DEFAULT_INDEX=${PIP_MIRROR_URL}
+
+USER datahub
+WORKDIR $HOME
+RUN uv venv --python "$PYTHON_VERSION"
+# Pre-create as datahub so BuildKit cache mounts at $HOME/.cache/uv do not leave
+# the parent root-owned (siblings like puccinialin then hit PermissionError).
+RUN mkdir -p $HOME/.cache
+ENV VIRTUAL_ENV=$HOME/.venv
+ENV PATH="${VIRTUAL_ENV}/bin:$PATH"
+
+# We always want to use the system CA bundle.
+# Requests comes with it's own CA bundle, which we need to override.
+ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+# uv uses a different mechanism. See https://github.com/astral-sh/uv/issues/1474.
+ENV SSL_CERT_FILE="/etc/ssl/certs/ca-certificates.crt"
+
+
+FROM python-base AS ingestion-base-slim
+
+USER 0
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install -y \
+    python3-ldap \
+    libldap2-dev \
+    libsasl2-dev \
+    libsasl2-modules \
+    libaio-dev \
+    libaio1t64 \
+    libsasl2-modules-gssapi-mit \
+    krb5-user \
+    krb5-config \
+    libkrb5-dev \
+    librdkafka-dev \
+    ldap-utils \
+    unixodbc \
+    libodbc2
+USER datahub
+
+FROM ingestion-base-slim AS ingestion-base-full
+
+USER 0
+# We need to install build-essential in order to build some Python packages (e.g. python-ldap)
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install --no-install-recommends -y -qq \
+    openjdk-25-jre-headless \
+    build-essential
+
+RUN --mount=type=bind,source=./docker/snippets/oracle_instantclient.sh,target=/oracle_instantclient.sh \
+    /oracle_instantclient.sh
+
+RUN --mount=type=bind,source=./docker/snippets/mssql_odbc.sh,target=/mssql_odbc.sh \
+    /mssql_odbc.sh
+
+USER datahub
+# INLINE-END
+
+FROM ingestion-base-${APP_ENV} AS final
+
+COPY docker/snippets/wait_for_deps.sh /usr/local/lib/datahub/wait_for_deps.sh
+COPY ./docker/datahub-ingestion-base/entrypoint.sh /entrypoint.sh
+ENTRYPOINT [ "/entrypoint.sh" ]
+ENV PATH="/datahub-ingestion/.local/bin:$PATH"

@@ -1,0 +1,217 @@
+import { useApolloClient } from '@apollo/client';
+import { Form, message } from 'antd';
+import omit from 'lodash/omit';
+import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+
+import { useEntityData } from '@app/entity/shared/EntityContext';
+import { IncidentAction } from '@app/entityV2/shared/tabs/Incident/constant';
+import { PAGE_SIZE, updateActiveIncidentInCache } from '@app/entityV2/shared/tabs/Incident/incidentUtils';
+import analytics, { EntityActionType, EventType } from '@src/app/analytics';
+import handleGraphQLError from '@src/app/sharedV2/handleGraphQLError';
+import { useRaiseIncidentMutation, useUpsertIncidentMutation } from '@src/graphql/mutations.generated';
+import { EntityType, IncidentSourceType, IncidentState } from '@src/types.generated';
+
+import { IncidentResultFieldsFragment } from '@graphql/incident.generated';
+
+const getCacheIncident = ({
+    values,
+    responseData,
+    user,
+    incidentUrn,
+}: {
+    values: any;
+    responseData?: any;
+    user?: any;
+    incidentUrn?: string;
+}): IncidentResultFieldsFragment['incidents'][number] => {
+    const firstLinkedAsset = values.linkedAssets?.[0] || {};
+    const newIncident: IncidentResultFieldsFragment['incidents'][number] = {
+        __typename: 'Incident',
+        urn: incidentUrn ?? responseData?.data?.raiseIncident,
+        type: EntityType.Incident,
+        incidentType: values.type,
+        customType: values.customType || null,
+        title: values.title,
+        description: values.description,
+        startedAt: null,
+        tags: null,
+        status: {
+            __typename: 'IncidentStatus',
+            state: values?.state,
+            stage: values?.stage,
+            message: values?.message || null,
+            lastUpdated: {
+                __typename: 'AuditStamp',
+                time: Date.now(),
+                actor: user?.urn,
+            },
+        },
+        incidentStatus: {
+            __typename: 'IncidentStatus',
+            state: values?.state,
+            stage: values?.stage,
+            message: values?.message || null,
+            lastUpdated: {
+                __typename: 'AuditStamp',
+                time: Date.now(),
+                actor: user?.urn,
+            },
+        },
+        source: {
+            __typename: 'IncidentSource',
+            type: IncidentSourceType.Manual,
+            source: null,
+        },
+        linkedAssets: {
+            __typename: 'EntityRelationshipsResult',
+            relationships: values.linkedAssets?.map((linkedAsset) => ({
+                entity: {
+                    ...linkedAsset,
+                },
+            })),
+        },
+
+        priority: values.priority,
+        created: {
+            __typename: 'AuditStamp',
+            time: values.created || Date.now(),
+            actor: user?.urn,
+        },
+        assignees: values.assignees,
+        entity: {
+            __typename: firstLinkedAsset.type,
+            ...firstLinkedAsset,
+        },
+    };
+    return newIncident;
+};
+
+export const useIncidentHandler = ({ mode, onSubmit, incidentUrn, user, assignees, linkedAssets, entity }) => {
+    const { t } = useTranslation('entity.profile.incident');
+    // Important: Here we are trying to fetch the URN of the sibling whose "profile" we are currently viewing.
+    // We then insert any new incidents into this cache as well so that it immediately updates the page for the asset.
+    const { urn: maybeCacheEntityUrn } = useEntityData();
+    const [raiseIncidentMutation] = useRaiseIncidentMutation();
+    const [upsertIncidentMutation] = useUpsertIncidentMutation();
+    const [form] = Form.useForm();
+    const client = useApolloClient();
+    const isAddIncidentMode = mode === IncidentAction.CREATE;
+
+    const handleAddIncident = async (input: any) => {
+        return raiseIncidentMutation({
+            variables: {
+                input: {
+                    ...input,
+                    priority: input.priority || undefined,
+                    status: {
+                        ...input.status,
+                        stage: input.status.stage || undefined,
+                    },
+                },
+            },
+        });
+    };
+
+    const handleUpdateIncident = async (input: any, incidentUpdateUrn: string) => {
+        return upsertIncidentMutation({
+            variables: {
+                input: {
+                    title: input.title || null,
+                    description: input.description || null,
+                    priority: input.priority || null,
+                    status: {
+                        ...input.status,
+                        stage: input.status.stage || null,
+                    },
+                    resourceUrns: input.resourceUrns || [],
+                    assigneeUrns: input.assigneeUrns || [],
+                },
+                urn: incidentUpdateUrn,
+            },
+        });
+    };
+
+    const showMessage = (content: string) => {
+        message.success({
+            content,
+            duration: 2,
+        });
+    };
+
+    const finalizeSubmission = () => {
+        onSubmit?.();
+    };
+
+    const handleSubmissionError = (error: any) => {
+        handleGraphQLError({
+            error,
+            defaultMessage: isAddIncidentMode ? t('toast.raiseFailed') : t('toast.updateFailed'),
+            permissionMessage: isAddIncidentMode ? t('toast.raiseUnauthorized') : t('toast.updateUnauthorized'),
+        });
+    };
+
+    const [isLoading, setIsLoading] = useState(false);
+    const handleSubmit = async () => {
+        try {
+            setIsLoading(true);
+
+            const values = form.getFieldsValue();
+            const baseInput = {
+                ...values,
+                status: {
+                    stage: values.status,
+                    state: values.state || IncidentState.Active,
+                    message: values.message,
+                },
+            };
+            const newInput = omit(baseInput, ['state', 'message']);
+            const input = newInput;
+
+            if (isAddIncidentMode) {
+                const responseData: any = await handleAddIncident(input);
+                if (responseData) {
+                    showMessage(t('toast.incidentAdded'));
+                }
+                const newIncident = getCacheIncident({
+                    values: {
+                        ...values,
+                        state: baseInput.status.state,
+                        stage: baseInput.status.stage || '',
+                        message: baseInput.status.message,
+                        priority: values.priority || null,
+                        assignees,
+                        linkedAssets,
+                    },
+                    incidentUrn: responseData?.data?.raiseIncident,
+                    user,
+                });
+                // Add new incident to core entity's cache.
+                if (!entity) return;
+                updateActiveIncidentInCache(client, entity.urn, newIncident, PAGE_SIZE);
+
+                if (maybeCacheEntityUrn) {
+                    // Optional: Also add into the cache of the sibling whose page we are viewing.
+                    updateActiveIncidentInCache(client, maybeCacheEntityUrn, newIncident, PAGE_SIZE);
+                }
+                analytics.event({
+                    type: EventType.EntityActionEvent,
+                    entityType: entity?.entityType,
+                    entityUrn: entity.urn,
+                    actionType: EntityActionType.AddIncident,
+                });
+            } else if (incidentUrn) {
+                await handleUpdateIncident(input, incidentUrn);
+                showMessage(t('toast.incidentUpdated'));
+            }
+
+            finalizeSubmission();
+        } catch (error: any) {
+            console.log('error>>>>>', error);
+            handleSubmissionError(error);
+        } finally {
+            setIsLoading(false); // Stop loading
+        }
+    };
+    return { handleSubmit, form, isLoading };
+};

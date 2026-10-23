@@ -1,0 +1,2598 @@
+import pathlib
+
+import pytest
+
+from datahub.sql_parsing.schema_resolver import SchemaResolver
+from datahub.sql_parsing.sqlglot_lineage import (
+    _CLICKHOUSE_DICTIONARY_FUNCTIONS,
+    sqlglot_lineage,
+)
+from datahub.testing.check_sql_parser_result import assert_sql_result
+
+RESOURCE_DIR = pathlib.Path(__file__).parent / "goldens"
+
+
+@pytest.fixture(scope="function", autouse=True)
+def _disable_cooperative_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    # When interactively debugging tests with breakpoint(), this gets annoying.
+    monkeypatch.setattr(
+        "datahub.sql_parsing.sqlglot_lineage.SQL_LINEAGE_TIMEOUT_ENABLED", False
+    )
+
+
+def test_invalid_sql() -> None:
+    assert_sql_result(
+        """
+SELECT as '
+FROM snowflake_sample_data.tpch_sf1.orders o
+""",
+        dialect="snowflake",
+        expected_file=RESOURCE_DIR / "test_invalid_sql.json",
+        allow_table_error=True,
+    )
+
+
+def test_select_max() -> None:
+    # The COL2 should get normalized to col2.
+    assert_sql_result(
+        """
+SELECT max(col1, COL2) as max_col
+FROM mytable
+""",
+        dialect="mysql",
+        expected_file=RESOURCE_DIR / "test_select_max.json",
+    )
+
+
+def test_select_max_with_schema() -> None:
+    # Note that `this_will_not_resolve` will be dropped from the result because it's not in the schema.
+
+    # With sqlglot v27: When it sees MAX(DECIMAL, DECIMAL, UNKNOWN), it was "smart" enough to infer the result as DECIMAL
+    # With sqlglot v28: Same input → returns UNKNOWN (more conservative behavior)
+    # Sqlglot confirmed this is intentional - v28 is more conservative with type inference when any argument is UNKNOWN.
+    # See https://github.com/tobymao/sqlglot/issues/6983
+    # The impact is that we miss type information for the max_col column when queries reference unresolved columns.
+    # That doesn't happen with the test_select_max_with_schema_all_resolved test because all columns are resolved.
+
+    assert_sql_result(
+        """
+SELECT max(`col1`, COL2, `this_will_not_resolve`) as max_col
+FROM mytable
+""",
+        dialect="mysql",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:mysql,mytable,PROD)": {
+                "col1": "NUMBER",
+                "col2": "NUMBER",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_select_max_with_schema.json",
+    )
+
+
+def test_select_max_with_schema_all_resolved() -> None:
+    assert_sql_result(
+        """
+SELECT max(`col1`, COL2) as max_col
+FROM mytable
+""",
+        dialect="mysql",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:mysql,mytable,PROD)": {
+                "col1": "NUMBER",
+                "col2": "NUMBER",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_select_max_with_schema_all_resolved.json",
+    )
+
+
+def test_select_count() -> None:
+    assert_sql_result(
+        """
+SELECT
+  COUNT(etl_data_dt_id)
+FROM something_prd.fact_complaint_snapshot
+WHERE
+  etl_data_dt_id = 20230317
+""",
+        dialect="mysql",
+        expected_file=RESOURCE_DIR / "test_select_count.json",
+    )
+
+
+def test_select_with_ctes() -> None:
+    assert_sql_result(
+        """
+WITH cte1 AS (
+    SELECT col1, col2
+    FROM table1
+    WHERE col1 = 'value1'
+), cte2 AS (
+    SELECT col3, col4
+    FROM table2
+    WHERE col2 = 'value2'
+)
+SELECT cte1.col1, cte2.col3
+FROM cte1
+JOIN cte2 ON cte1.col2 = cte2.col4
+""",
+        dialect="oracle",
+        expected_file=RESOURCE_DIR / "test_select_with_ctes.json",
+    )
+
+
+def test_select_with_complex_ctes() -> None:
+    # This one has group bys in the CTEs, which means they can't be collapsed into the main query.
+    assert_sql_result(
+        """
+WITH cte1 AS (
+    SELECT col1, col2
+    FROM table1
+    WHERE col1 = 'value1'
+    GROUP BY 1, 2
+), cte2 AS (
+    SELECT col3, col4
+    FROM table2
+    WHERE col2 = 'value2'
+    GROUP BY col3, col4
+)
+SELECT cte1.col1, cte2.col3
+FROM cte1
+JOIN cte2 ON cte1.col2 = cte2.col4
+""",
+        dialect="oracle",
+        expected_file=RESOURCE_DIR / "test_select_with_complex_ctes.json",
+    )
+
+
+def test_multiple_select_subqueries() -> None:
+    assert_sql_result(
+        """
+SELECT SUM((SELECT max(a) a from x) + (SELECT min(b) b from x) + c) AS y FROM x
+""",
+        dialect="mysql",
+        expected_file=RESOURCE_DIR / "test_multiple_select_subqueries.json",
+    )
+
+
+def test_create_view_as_select() -> None:
+    assert_sql_result(
+        """
+CREATE VIEW vsal
+AS
+  SELECT a.deptno                  "Department",
+         a.num_emp / b.total_count "Employees",
+         a.sal_sum / b.total_sal   "Salary"
+  FROM   (SELECT deptno,
+                 Count()  num_emp,
+                 SUM(sal) sal_sum
+          FROM   scott.emp
+          WHERE  city = 'NYC'
+          GROUP  BY deptno) a,
+         (SELECT Count()  total_count,
+                 SUM(sal) total_sal
+          FROM   scott.emp
+          WHERE  city = 'NYC') b
+;
+""",
+        dialect="mysql",
+        expected_file=RESOURCE_DIR / "test_create_view_as_select.json",
+    )
+
+
+def test_snowflake_create_view_with_tag() -> None:
+    assert_sql_result(
+        """
+CREATE OR REPLACE VIEW my_db.my_schema.my_view
+WITH TAG (cost_center = 'engineering', classification = 'internal')
+AS
+SELECT id, name FROM my_db.my_schema.my_table
+""",
+        dialect="snowflake",
+        expected_file=RESOURCE_DIR / "test_snowflake_create_view_with_tag.json",
+    )
+
+
+def test_snowflake_create_view_copy_grants_with_casts() -> None:
+    assert_sql_result(
+        """
+CREATE OR REPLACE VIEW my_view
+COPY GRANTS
+                (
+    "COL_STR",
+    "COL_NUM",
+    "COL_TS",
+    "COL_BOOL"
+)
+AS SELECT
+    "COL_STR"::VARCHAR(134217728) AS "COL_STR",
+    "COL_NUM"::NUMBER(19,0) AS "COL_NUM",
+    "COL_TS"::TIMESTAMP_NTZ(6) AS "COL_TS",
+    "COL_BOOL"::BOOLEAN AS "COL_BOOL"
+FROM my_db.my_schema.my_source_table
+WHERE _FIVETRAN_DELETED != TRUE
+""",
+        dialect="snowflake",
+        expected_file=RESOURCE_DIR
+        / "test_snowflake_create_view_copy_grants_with_casts.json",
+    )
+
+
+def test_create_view_block_semicolon_with_comment() -> None:
+    """Block([Create, Semicolon]) from a trailing semicolon with attached comment.
+
+    A semicolon followed by a comment (e.g. "; -- comment") causes sqlglot to
+    produce Block([Create, Semicolon]). Without filtering the Semicolon node,
+    parse_statement raises "Block contains 2 statements" and lineage is lost.
+
+    This is the pattern behind ~2,600 view parse failures observed in a
+    Snowflake ingestion run.
+    """
+    assert_sql_result(
+        """
+CREATE VIEW my_view AS SELECT id, name FROM my_db.my_schema.my_table
+WHERE active = TRUE; -- end of view
+""",
+        dialect="snowflake",
+        expected_file=RESOURCE_DIR
+        / "test_create_view_block_semicolon_with_comment.json",
+    )
+
+
+def test_create_view_as_block_statement() -> None:
+    """Test Block with multiple statements where only 1 is not None.
+
+    Sqlglot v29 parses SQL with double semicolons (e.g., "CREATE VIEW ...;\n;") as
+    Block([Create, None]), where None represents the empty statement between semicolons.
+
+    This pattern was observed in Redshift integration tests where view definitions had
+    double semicolons, causing column lineage extraction to fail.
+
+    This test ensures we correctly filter out None expressions and extract column lineage.
+    Regression test for sqlglot v29 upgrade.
+    """
+    # Double semicolon pattern that creates Block([Create, None])
+    assert_sql_result(
+        """
+CREATE VIEW my_view AS (SELECT id, name, age FROM base_table);
+        ;
+""",
+        dialect="redshift",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:redshift,dev.public.base_table,PROD)": {
+                "id": "INTEGER",
+                "name": "VARCHAR",
+                "age": "INTEGER",
+            }
+        },
+        default_db="dev",
+        default_schema="public",
+        expected_file=RESOURCE_DIR / "test_create_view_as_block_statement.json",
+    )
+
+
+def test_block_with_all_none_expressions() -> None:
+    """Test Block with all None expressions returns error in SqlParsingResult.
+
+    Sqlglot raises ParseError when parsing SQL with only semicolons
+    since there's no valid SQL statement.
+    """
+    result = sqlglot_lineage(
+        ";\n;",
+        schema_resolver=SchemaResolver(
+            platform="redshift",
+            platform_instance=None,
+            env="PROD",
+        ),
+    )
+    assert result.debug_info.table_error is not None
+    assert "No expression was parsed" in str(result.debug_info.table_error)
+
+
+def test_block_with_multiple_statements() -> None:
+    """Test Block with multiple non-None statements returns error.
+
+    parse_statement expects a single statement. Multiple statements should use
+    parse_statements_and_pick() instead.
+    """
+    result = sqlglot_lineage(
+        "CREATE VIEW v1 AS SELECT * FROM t1; CREATE VIEW v2 AS SELECT * FROM t2;",
+        schema_resolver=SchemaResolver(
+            platform="redshift",
+            platform_instance=None,
+            env="PROD",
+        ),
+    )
+    assert result.debug_info.table_error is not None
+    assert "Block contains 2 statements" in str(result.debug_info.table_error)
+    assert "Use parse_statements_and_pick" in str(result.debug_info.table_error)
+
+
+def test_identifier_dynamic_arg_skips_only_that_table() -> None:
+    """A non-literal IDENTIFIER(...) can't be resolved, but it must not drop lineage for the
+    real tables in the same query."""
+    result = sqlglot_lineage(
+        "SELECT r.x FROM db.schema.real_table r "
+        "JOIN IDENTIFIER('prefix_' || r.col) d ON r.id = d.id",
+        schema_resolver=SchemaResolver(
+            platform="snowflake",
+            platform_instance=None,
+            env="PROD",
+        ),
+    )
+    assert result.debug_info.table_error is None
+    assert len(result.in_tables) == 1
+    assert any("real_table" in urn for urn in result.in_tables)
+
+
+def test_snowflake_create_table_as_select_with_tag() -> None:
+    assert_sql_result(
+        """
+CREATE OR REPLACE TABLE my_db.my_schema.target_table
+WITH TAG (cost_center = 'engineering')
+AS
+SELECT id, name FROM my_db.my_schema.source_table
+""",
+        dialect="snowflake",
+        expected_file=RESOURCE_DIR
+        / "test_snowflake_create_table_as_select_with_tag.json",
+    )
+
+
+def test_insert_as_select() -> None:
+    # Note: this also tests lineage with case statements.
+    # The join extraction on this is going to be poor quality because
+    # we're not providing schemas.
+
+    assert_sql_result(
+        """
+insert into query72
+select i_item_desc
+     , w_warehouse_name
+     , d1.d_week_seq
+     , sum(case when promotion.p_promo_sk is null then 1 else 0 end)     no_promo
+     , sum(case when promotion.p_promo_sk is not null then 1 else 0 end) promo
+     , count(*)                                                          total_cnt
+from catalog_sales
+         join inventory on (cs_item_sk = inv_item_sk)
+         join warehouse on (w_warehouse_sk = inv_warehouse_sk)
+         join item on (i_item_sk = cs_item_sk)
+         join customer_demographics on (cs_bill_cdemo_sk = cd_demo_sk)
+         join household_demographics on (cs_bill_hdemo_sk = hd_demo_sk)
+         join date_dim d1 on (cs_sold_date_sk = d1.d_date_sk)
+         join date_dim d2 on (inv_date_sk = d2.d_date_sk)
+         join date_dim d3 on (cs_ship_date_sk = d3.d_date_sk)
+         left outer join promotion on (cs_promo_sk = p_promo_sk)
+         left outer join catalog_returns on (cr_item_sk = cs_item_sk and cr_order_number = cs_order_number)
+where d1.d_week_seq = d2.d_week_seq
+  and inv_quantity_on_hand < cs_quantity
+  and hd_buy_potential = '>10000'
+  and cd_marital_status = 'D'
+group by i_item_desc, w_warehouse_name, d1.d_week_seq
+order by total_cnt desc, i_item_desc, w_warehouse_name, d_week_seq
+limit 100;
+""",
+        dialect="hive",
+        expected_file=RESOURCE_DIR / "test_insert_as_select.json",
+    )
+
+
+def test_insert_with_column_list() -> None:
+    assert_sql_result(
+        """\
+insert into downstream (a, c) select a, c from upstream2
+""",
+        dialect="redshift",
+        expected_file=RESOURCE_DIR / "test_insert_with_column_list.json",
+    )
+
+
+def test_insert_with_cte() -> None:
+    assert_sql_result(
+        """
+WITH temp_cte AS (
+    SELECT id, name, value
+    FROM db.schema.source_table
+)
+INSERT INTO db.schema.target_table (id, name, value)
+SELECT id, name, value FROM temp_cte
+""",
+        dialect="tsql",
+        expected_file=RESOURCE_DIR / "test_insert_with_cte.json",
+    )
+
+
+def test_mssql_insert_column_name_mapping() -> None:
+    # MSSQL-specific: INSERT column names differ from SELECT column names
+    # Tests that column mapping works correctly (INSERT cols != SELECT cols)
+    assert_sql_result(
+        """
+INSERT INTO target_db.dbo.target_table (target_col_a, target_col_b)
+SELECT source_col_x, source_col_y
+FROM source_db.dbo.source_table
+""",
+        dialect="tsql",
+        expected_file=RESOURCE_DIR / "test_mssql_insert_column_name_mapping.json",
+    )
+
+
+def test_select_with_full_col_name() -> None:
+    # In this case, `widget` is a struct column.
+    # This also tests the `default_db` functionality.
+    assert_sql_result(
+        """
+SELECT distinct post_id , widget.asset.id
+FROM data_reporting.abcde_transformed
+WHERE post_id LIKE '%268662%'
+""",
+        dialect="bigquery",
+        default_db="my-bq-ProjectName",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:bigquery,my-bq-ProjectName.data_reporting.abcde_transformed,PROD)": {
+                "post_id": "NUMBER",
+                "widget": "struct",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_select_with_full_col_name.json",
+    )
+
+
+def test_select_from_struct_subfields() -> None:
+    # In this case, `widget` is a column name.
+    assert_sql_result(
+        """
+SELECT distinct post_id ,
+    widget.asset.id,
+    min(widget.metric.metricA, widget.metric.metric_b) as min_metric
+FROM data_reporting.abcde_transformed
+WHERE post_id LIKE '%12345%'
+""",
+        dialect="bigquery",
+        default_db="my-bq-proj",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:bigquery,my-bq-proj.data_reporting.abcde_transformed,PROD)": {
+                "post_id": "NUMBER",
+                "widget": "struct",
+                "widget.asset.id": "int",
+                "widget.metric.metricA": "int",
+                "widget.metric.metric_b": "int",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_select_from_struct_subfields.json",
+    )
+
+
+def test_select_struct_subfields_from_cte() -> None:
+    # The struct subfield access happens inside the CTE, so the leaf's immediate
+    # parent is the CTE's select expression -- the outer select doesn't mention
+    # `widget` at all. This guards subfield reconstruction across nesting levels.
+    assert_sql_result(
+        """
+WITH cte AS (
+    SELECT
+        post_id,
+        widget.asset.id AS asset_id,
+        min(widget.metric.metricA, widget.metric.metric_b) AS min_metric
+    FROM data_reporting.abcde_transformed
+)
+SELECT post_id, asset_id, min_metric
+FROM cte
+""",
+        dialect="bigquery",
+        default_db="my-bq-proj",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:bigquery,my-bq-proj.data_reporting.abcde_transformed,PROD)": {
+                "post_id": "NUMBER",
+                "widget": "struct",
+                "widget.asset.id": "int",
+                "widget.metric.metricA": "int",
+                "widget.metric.metric_b": "int",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_select_struct_subfields_from_cte.json",
+    )
+
+
+def test_select_struct_subfield_through_cte_passthrough() -> None:
+    # Here the CTE selects the bare `widget` struct and the subfield access
+    # (`widget.asset.id`) happens in the *outer* query. The leaf's immediate
+    # parent is the CTE projection `widget AS widget`, which no longer carries
+    # the subfield, so reconstruction can only recover the base column. Lineage
+    # correctly coarsens to `widget` rather than inventing a subfield. This is a
+    # known limitation: subfield access does not propagate across scope boundaries.
+    assert_sql_result(
+        """
+WITH cte AS (
+    SELECT post_id, widget
+    FROM data_reporting.abcde_transformed
+)
+SELECT post_id, widget.asset.id AS asset_id
+FROM cte
+""",
+        dialect="bigquery",
+        default_db="my-bq-proj",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:bigquery,my-bq-proj.data_reporting.abcde_transformed,PROD)": {
+                "post_id": "NUMBER",
+                "widget": "struct",
+                "widget.asset.id": "int",
+            },
+        },
+        expected_file=RESOURCE_DIR
+        / "test_select_struct_subfield_through_cte_passthrough.json",
+    )
+
+
+def test_join_struct_subfields_shared_base_name() -> None:
+    # Two joined tables both expose a struct column named `widget`, each accessed
+    # with a different subfield. sqlglot inserts an intermediate projection per
+    # joined table (`widget AS widget`), so the subfield access in the root select
+    # is one scope above each leaf and lineage coarsens to the base column. The
+    # important guarantee: each base column still resolves to the *correct* table
+    # (a_color -> table_a.widget, b_size -> table_b.widget) -- the shared base name
+    # never causes a subfield to attach to the wrong table.
+    assert_sql_result(
+        """
+SELECT
+    a.widget.color AS a_color,
+    b.widget.size AS b_size
+FROM my_schema.table_a a
+JOIN my_schema.table_b b ON a.id = b.a_id
+""",
+        dialect="bigquery",
+        default_db="my-bq-proj",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:bigquery,my-bq-proj.my_schema.table_a,PROD)": {
+                "id": "int",
+                "widget": "struct",
+                "widget.color": "string",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:bigquery,my-bq-proj.my_schema.table_b,PROD)": {
+                "a_id": "int",
+                "widget": "struct",
+                "widget.size": "int",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_join_struct_subfields_shared_base_name.json",
+    )
+
+
+def test_select_from_union() -> None:
+    assert_sql_result(
+        """
+SELECT
+    'orders_10' as label,
+    SUM(totalprice) as total_agg
+FROM snowflake_sample_data.tpch_sf10.orders
+UNION ALL
+SELECT
+    'orders_100' as label,
+    SUM(totalprice) as total_agg,
+FROM snowflake_sample_data.tpch_sf100.orders
+""",
+        dialect="snowflake",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,snowflake_sample_data.tpch_sf10.orders,PROD)": {
+                "orderkey": "NUMBER",
+                "totalprice": "FLOAT",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,snowflake_sample_data.tpch_sf100.orders,PROD)": {
+                "orderkey": "NUMBER",
+                "totalprice": "FLOAT",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_select_from_union.json",
+    )
+
+
+def test_select_ambiguous_column_no_schema() -> None:
+    assert_sql_result(
+        """
+        select A, B, C from t1 inner join t2 on t1.id = t2.id
+        """,
+        dialect="hive",
+        expected_file=RESOURCE_DIR / "test_select_ambiguous_column_no_schema.json",
+    )
+
+
+def test_merge_from_union() -> None:
+    # TODO: We don't support merge statements yet, but the union should still get handled.
+
+    assert_sql_result(
+        """
+    merge into `demo-pipelines-stg`.`referrer`.`base_union` as DBT_INTERNAL_DEST
+        using (
+SELECT * FROM `demo-pipelines-stg`.`referrer`.`prep_from_ios` WHERE partition_time = "2018-03-03"
+UNION ALL
+SELECT * FROM `demo-pipelines-stg`.`referrer`.`prep_from_web` WHERE partition_time = "2018-03-03"
+        ) as DBT_INTERNAL_SOURCE
+        on FALSE
+
+    when not matched by source
+         and timestamp_trunc(DBT_INTERNAL_DEST.partition_time, day) in (
+              timestamp('2018-03-03')
+          )
+        then delete
+
+    when not matched then insert
+        (`platform`, `pageview_id`, `query`, `referrer`, `partition_time`)
+    values
+        (`platform`, `pageview_id`, `query`, `referrer`, `partition_time`)
+""",
+        dialect="bigquery",
+        expected_file=RESOURCE_DIR / "test_merge_from_union.json",
+    )
+
+
+def test_expand_select_star_basic() -> None:
+    assert_sql_result(
+        """
+SELECT
+    SUM(totalprice) as total_agg,
+    *
+FROM snowflake_sample_data.tpch_sf1.orders
+WHERE orderdate = '1992-01-01'
+""",
+        dialect="snowflake",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,snowflake_sample_data.tpch_sf1.orders,PROD)": {
+                "orderkey": "NUMBER",
+                "custkey": "NUMBER",
+                "orderstatus": "TEXT",
+                "totalprice": "FLOAT",
+                "orderdate": "DATE",
+                "orderpriority": "TEXT",
+                "clerk": "TEXT",
+                "shippriority": "NUMBER",
+                "comment": "TEXT",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_expand_select_star_basic.json",
+    )
+
+
+def test_create_table_ddl() -> None:
+    assert_sql_result(
+        """
+CREATE TABLE IF NOT EXISTS costs (
+    id INTEGER PRIMARY KEY,
+    month TEXT NOT NULL,
+    total_cost REAL NOT NULL,
+    area REAL NOT NULL
+)
+""",
+        dialect="sqlite",
+        expected_file=RESOURCE_DIR / "test_create_table_ddl.json",
+    )
+
+
+def test_snowflake_column_normalization() -> None:
+    # Technically speaking this is incorrect since the column names are different and both quoted.
+
+    assert_sql_result(
+        """
+SELECT
+    SUM(o."totalprice") as total_agg,
+    AVG("TotalPrice") as total_avg,
+    MIN("TOTALPRICE") as total_min,
+    MAX(TotalPrice)   as total_max
+FROM snowflake_sample_data.tpch_sf1.orders o
+""",
+        dialect="snowflake",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,snowflake_sample_data.tpch_sf1.orders,PROD)": {
+                "orderkey": "NUMBER",
+                "TotalPrice": "FLOAT",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_snowflake_column_normalization.json",
+    )
+
+
+def test_snowflake_ctas_column_normalization() -> None:
+    # For CTAS statements, we also should try to match the output table's
+    # column name casing. This is technically incorrect since we have the
+    # exact column names from the query, but necessary to match our column
+    # name normalization behavior in the Snowflake source.
+
+    assert_sql_result(
+        """
+CREATE TABLE snowflake_sample_data.tpch_sf1.orders_normalized
+AS
+SELECT
+    SUM(o."totalprice") as Total_Agg,
+    AVG("TotalPrice") as TOTAL_AVG,
+    MIN("TOTALPRICE") as TOTAL_MIN,
+    MAX(TotalPrice)   as Total_Max
+FROM snowflake_sample_data.tpch_sf1.orders o
+""",
+        dialect="snowflake",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,snowflake_sample_data.tpch_sf1.orders,PROD)": {
+                "orderkey": "NUMBER",
+                "TotalPrice": "FLOAT",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,snowflake_sample_data.tpch_sf1.orders_normalized,PROD)": {
+                "Total_Agg": "FLOAT",
+                "total_avg": "FLOAT",
+                "TOTAL_MIN": "FLOAT",
+                # Purposely excluding total_max to test out the fallback behavior.
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_snowflake_ctas_column_normalization.json",
+    )
+
+
+def test_snowflake_case_sensitive_quoted_column_lineage() -> None:
+    # Regression guard for the case-sensitive column lineage fix.
+    #
+    # The output column is handed to sqlglot.lineage.lineage() with its identifier
+    # marked case_sensitive so sqlglot's normalize_identifiers leaves the casing
+    # alone. If that marker is dropped, Snowflake (UPPERCASE strategy) case-folds
+    # "CustomerName" to CUSTOMERNAME, the column can no longer be found in the query,
+    # and the upstream edge is silently dropped -- i.e. this assertion would see an
+    # empty column_lineage. See https://github.com/tobymao/sqlglot/issues/7733.
+    assert_sql_result(
+        """
+SELECT "CustomerName" AS "FullName"
+FROM db.sch.tbl
+""",
+        dialect="snowflake",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,db.sch.tbl,PROD)": {
+                "CustomerName": "VARCHAR",
+            },
+        },
+        expected_file=RESOURCE_DIR
+        / "test_snowflake_case_sensitive_quoted_column_lineage.json",
+    )
+
+
+def test_snowflake_case_sensitive_column_through_cte() -> None:
+    # Regression guard for the case-sensitive column lineage fix, this time with
+    # the quoted column "CustomerName" flowing through a CTE, exercising scope
+    # resolution across the CTE -> outer SELECT hop. As with the non-CTE case,
+    # dropping the case_sensitive marker lets Snowflake case-fold the projection
+    # lookup so the upstream edge is silently dropped.
+    # See https://github.com/tobymao/sqlglot/issues/7733.
+    assert_sql_result(
+        """
+WITH staged AS (
+    SELECT "CustomerName" FROM db.sch.tbl
+)
+SELECT "CustomerName" AS "FullName"
+FROM staged
+""",
+        dialect="snowflake",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,db.sch.tbl,PROD)": {
+                "CustomerName": "VARCHAR",
+            },
+        },
+        expected_file=RESOURCE_DIR
+        / "test_snowflake_case_sensitive_column_through_cte.json",
+    )
+
+
+def test_hive_select_star_mixed_case_column_lineage() -> None:
+    # Regression guard for dialects that fold identifiers *even when quoted*
+    # (Spark/Hive/Redshift/Trino/...) and aren't in DIALECTS_WITH_CASE_INSENSITIVE_COLS,
+    # so their schema keeps its mixed case. A SELECT * expands to the columns' real
+    # casing (eventId), so the lineage lookup must not be re-folded. Passing the
+    # lookup column as quoted=True alone is not enough here -- it case-folds
+    # "eventId" to "eventid", the column is no longer found, and the upstream edge
+    # is silently dropped. Marking the identifier case_sensitive keeps it verbatim.
+    # See https://github.com/tobymao/sqlglot/issues/7733.
+    assert_sql_result(
+        "SELECT * FROM my_schema.events",
+        dialect="hive",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:hive,my_schema.events,PROD)": {
+                "eventId": "BIGINT",
+                "userId": "BIGINT",
+            },
+        },
+        expected_file=RESOURCE_DIR
+        / "test_hive_select_star_mixed_case_column_lineage.json",
+    )
+
+
+def test_databricks_case_sensitive_column_lineage() -> None:
+    # Databricks matches columns case-insensitively, so the schema is folded before
+    # the SELECT * expansion. With no output table, the output columns still take
+    # their upstream column's declared casing (betStatusId). This mirrors the Unity
+    # Catalog view-lineage path and a dbt model compiled to a bare SELECT.
+    assert_sql_result(
+        "SELECT * FROM hive_metastore.bronze_kambi.bet",
+        dialect="databricks",
+        default_db="hive_metastore",
+        default_schema="bronze_kambi",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:databricks,hive_metastore.bronze_kambi.bet,PROD)": {
+                "betStatusId": "BIGINT",
+                "channelId": "BIGINT",
+            },
+        },
+        expected_file=RESOURCE_DIR
+        / "test_databricks_case_sensitive_column_lineage.json",
+    )
+
+
+def test_databricks_explicit_mixed_case_columns() -> None:
+    # Databricks folds every query column to lowercase, even backticked ones. Unlike
+    # SELECT *, which expands from the schema, named columns only resolve to the
+    # schema's mixed-case fields through the case-insensitive lookup.
+    assert_sql_result(
+        """
+SELECT o.orderId, `customerId`, amountUsd
+FROM my_catalog.my_schema.orders o
+JOIN my_catalog.my_schema.payments p ON o.orderId = p.orderId
+""",
+        dialect="databricks",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:databricks,my_catalog.my_schema.orders,PROD)": {
+                "orderId": "BIGINT",
+                "customerId": "BIGINT",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:databricks,my_catalog.my_schema.payments,PROD)": {
+                "orderId": "BIGINT",
+                "amountUsd": "DOUBLE",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_databricks_explicit_mixed_case_columns.json",
+    )
+
+
+def test_databricks_multi_upstream_mixed_case_columns() -> None:
+    # A column fed by several upstream columns of the same name (UNION, COALESCE)
+    # takes their casing when they agree, as a single upstream column does.
+    assert_sql_result(
+        """
+SELECT COALESCE(o.orderId, p.orderId) AS orderId, o.customerId
+FROM my_catalog.my_schema.orders o
+JOIN my_catalog.my_schema.payments p ON o.orderId = p.orderId
+UNION ALL
+SELECT orderId, customerId
+FROM my_catalog.my_schema.orders_archive
+""",
+        dialect="databricks",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:databricks,my_catalog.my_schema.orders,PROD)": {
+                "orderId": "BIGINT",
+                "customerId": "BIGINT",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:databricks,my_catalog.my_schema.payments,PROD)": {
+                "orderId": "BIGINT",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:databricks,my_catalog.my_schema.orders_archive,PROD)": {
+                "orderId": "BIGINT",
+                "customerId": "BIGINT",
+            },
+        },
+        expected_file=RESOURCE_DIR
+        / "test_databricks_multi_upstream_mixed_case_columns.json",
+    )
+
+
+def test_snowflake_case_statement() -> None:
+    assert_sql_result(
+        """
+SELECT
+    CASE
+        WHEN o."totalprice" > 1000 THEN 'high'
+        WHEN o."totalprice" > 100 THEN 'medium'
+        ELSE 'low'
+    END as total_price_category,
+    -- Also add a case where the column is in the THEN clause.
+    CASE
+        WHEN o."is_payment_successful" THEN o."totalprice"
+        ELSE 0
+    END as total_price_success
+FROM snowflake_sample_data.tpch_sf1.orders o
+""",
+        dialect="snowflake",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,snowflake_sample_data.tpch_sf1.orders,PROD)": {
+                "orderkey": "NUMBER",
+                "totalprice": "FLOAT",
+                "is_payment_successful": "BOOLEAN",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_snowflake_case_statement.json",
+    )
+
+
+@pytest.mark.skip(reason="We don't handle the unnest lineage correctly")
+def test_bigquery_unnest_columns() -> None:
+    assert_sql_result(
+        """
+SELECT
+  DATE(reporting_day) AS day,
+  CASE
+    WHEN p.product_code IN ('A', 'B', 'C')
+    THEN pr.other_field
+    ELSE 'Other'
+  END AS product,
+  pr.other_field AS other_field,
+  SUM(p.product_code_dau) AS daily_active_users
+FROM `bq-proj`.dataset.table1
+LEFT JOIN UNNEST(by_product) AS p
+LEFT JOIN (
+  SELECT DISTINCT
+    product_code,
+    other_field
+  FROM `bq-proj`.dataset.table2
+) AS pr
+--  USING (product_code)
+ON p.product_code = pr.product_code
+""",
+        dialect="bigquery",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:bigquery,bq-proj.dataset.table1,PROD)": {
+                "reporting_day": "DATE",
+                "by_product": "ARRAY<STRUCT<product_code STRING, product_code_dau INT64>>",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:bigquery,bq-proj.dataset.table2,PROD)": {
+                "product_code": "STRING",
+                "other_field": "STRING",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_bigquery_unnest_columns.json",
+    )
+
+
+def test_bigquery_create_view_with_cte() -> None:
+    assert_sql_result(
+        """
+CREATE VIEW `my-proj-2`.dataset.my_view AS
+WITH cte1 AS (
+    SELECT *
+    FROM dataset.table1
+    WHERE col1 = 'value1'
+), cte2 AS (
+    SELECT col3, col4 as join_key
+    FROM dataset.table2
+    WHERE col3 = 'value2'
+)
+SELECT col5, cte1.*, col3
+FROM dataset.table3
+JOIN cte1 ON table3.col5 = cte1.col2
+JOIN cte2 USING (join_key)
+""",
+        dialect="bigquery",
+        default_db="my-proj-1",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:bigquery,my-proj-1.dataset.table1,PROD)": {
+                "col1": "STRING",
+                "col2": "STRING",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:bigquery,my-proj-1.dataset.table2,PROD)": {
+                "col3": "STRING",
+                "col4": "STRING",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:bigquery,my-proj-1.dataset.table3,PROD)": {
+                "col5": "STRING",
+                "join_key": "STRING",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_bigquery_create_view_with_cte.json",
+    )
+
+
+def test_bigquery_nested_subqueries() -> None:
+    assert_sql_result(
+        """
+SELECT *
+FROM (
+    SELECT *
+    FROM (
+        SELECT *
+        FROM `bq-proj`.dataset.table1
+    )
+)
+""",
+        dialect="bigquery",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:bigquery,bq-proj.dataset.table1,PROD)": {
+                "col1": "STRING",
+                "col2": "STRING",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_bigquery_nested_subqueries.json",
+    )
+
+
+def test_bigquery_sharded_table_normalization() -> None:
+    assert_sql_result(
+        """
+SELECT *
+FROM `bq-proj.dataset.table_20230101`
+""",
+        dialect="bigquery",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:bigquery,bq-proj.dataset.table_yyyymmdd,PROD)": {
+                "col1": "STRING",
+                "col2": "STRING",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_bigquery_sharded_table_normalization.json",
+    )
+
+
+def test_bigquery_from_sharded_table_wildcard() -> None:
+    assert_sql_result(
+        """
+SELECT *
+FROM `bq-proj.dataset.table_2023*`
+""",
+        dialect="bigquery",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:bigquery,bq-proj.dataset.table_yyyymmdd,PROD)": {
+                "col1": "STRING",
+                "col2": "STRING",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_bigquery_from_sharded_table_wildcard.json",
+    )
+
+
+def test_bigquery_partitioned_table_insert() -> None:
+    assert_sql_result(
+        """
+SELECT *
+FROM `bq-proj.dataset.my-table$__UNPARTITIONED__`
+""",
+        dialect="bigquery",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:bigquery,bq-proj.dataset.my-table,PROD)": {
+                "col1": "STRING",
+                "col2": "STRING",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_bigquery_partitioned_table_insert.json",
+    )
+
+
+def test_bigquery_star_with_replace() -> None:
+    assert_sql_result(
+        """
+CREATE VIEW `my-project.my-dataset.test_table` AS
+SELECT
+  * REPLACE(
+    LOWER(something) AS something)
+FROM
+  `my-project2.my-dataset2.test_physical_table`;
+""",
+        dialect="bigquery",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:bigquery,my-project2.my-dataset2.test_physical_table,PROD)": {
+                "col1": "STRING",
+                "col2": "STRING",
+                "something": "STRING",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_bigquery_star_with_replace.json",
+    )
+
+
+def test_bigquery_view_from_union() -> None:
+    assert_sql_result(
+        """
+CREATE VIEW my_view as
+select * from my_project_2.my_dataset_2.sometable
+union all
+select * from my_project_2.my_dataset_2.sometable2 as a
+""",
+        dialect="bigquery",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:bigquery,my_project_2.my_dataset_2.sometable,PROD)": {
+                "col1": "STRING",
+                "col2": "STRING",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:bigquery,my_project_2.my_dataset_2.sometable2,PROD)": {
+                "col1": "STRING",
+                "col2": "STRING",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_bigquery_view_from_union.json",
+    )
+
+
+def test_snowflake_default_normalization() -> None:
+    assert_sql_result(
+        """
+create table active_customer_ltv as (
+
+with active_customers as (
+  select * from customer_last_purchase_date
+  where
+    last_purchase_date >= current_date - interval '90 days'
+)
+
+, purchases as (
+  select * from ecommerce.purchases
+)
+
+select
+  active_customers.user_fk
+  , active_customers.email
+  , active_customers.last_purchase_date
+  , sum(purchases.purchase_amount) as lifetime_purchase_amount
+  , count(distinct(purchases.pk)) as lifetime_purchase_count
+  , sum(purchases.purchase_amount) / count(distinct(purchases.pk)) as average_purchase_amount
+from
+  active_customers
+join
+  purchases
+  on active_customers.user_fk = purchases.user_fk
+group by 1,2,3
+
+)
+""",
+        dialect="snowflake",
+        default_db="long_tail_companions",
+        default_schema="analytics",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,long_tail_companions.ecommerce.purchases,PROD)": {
+                "pk": "NUMBER(38,0)",
+                "USER_FK": "NUMBER(38,0)",
+                "status": "VARCHAR(16777216)",
+                "purchase_amount": "NUMBER(10,2)",
+                "tax_AMOUNT": "NUMBER(10,2)",
+                "TOTAL_AMOUNT": "NUMBER(10,2)",
+                "CREATED_AT": "TIMESTAMP_NTZ",
+                "UPDATED_AT": "TIMESTAMP_NTZ",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,long_tail_companions.analytics.customer_last_purchase_date,PROD)": {
+                "USER_FK": "NUMBER(38,0)",
+                "EMAIL": "VARCHAR(16777216)",
+                "LAST_PURCHASE_DATE": "DATE",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_snowflake_default_normalization.json",
+    )
+
+
+def test_snowflake_column_cast() -> None:
+    assert_sql_result(
+        """
+SELECT
+    o.o_orderkey::NUMBER(20,0) as orderkey,
+    CAST(o.o_totalprice AS INT) as total_cast_int,
+    CAST(o.o_totalprice AS NUMBER(16,4)) as total_cast_float
+FROM snowflake_sample_data.tpch_sf1.orders o
+LIMIT 10
+""",
+        dialect="snowflake",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,snowflake_sample_data.tpch_sf1.orders,PROD)": {
+                "orderkey": "NUMBER(38,0)",
+                "totalprice": "NUMBER(12,2)",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_snowflake_column_cast.json",
+    )
+
+
+def test_snowflake_unused_cte() -> None:
+    # For this, we expect table level lineage to include table1, but CLL/joins should not.
+    assert_sql_result(
+        """
+WITH cte1 AS (
+    SELECT col1, col2
+    FROM table1
+    WHERE col1 = 'value1'
+), cte2 AS (
+    SELECT col3, col4
+    FROM table2
+    WHERE col2 = 'value2'
+)
+SELECT cte1.col1, table3.col6
+FROM cte1
+JOIN table3 ON table3.col5 = cte1.col2
+""",
+        dialect="snowflake",
+        expected_file=RESOURCE_DIR / "test_snowflake_unused_cte.json",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,table1,PROD)": {
+                "col1": "VARCHAR(16777216)",
+                "col2": "NUMBER(38,0)",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,table2,PROD)": {
+                "col3": "NUMBER(38,0)",
+                "col4": "VARCHAR(16777216)",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,table3,PROD)": {
+                "col5": "NUMBER(38,0)",
+                "col6": "VARCHAR(16777216)",
+            },
+        },
+    )
+
+
+def test_snowflake_cte_name_collision() -> None:
+    # In this example, output col1 should come from table3 and not table1, since the cte is unused.
+    # We'll still generate table-level lineage that includes table1.
+    assert_sql_result(
+        """
+WITH cte_alias AS (
+    SELECT col1, col2
+    FROM table1
+)
+SELECT table2.col2, cte_alias.col1
+FROM table2
+JOIN table3 AS cte_alias ON table2.col2 = cte_alias.col2
+""",
+        dialect="snowflake",
+        default_db="my_db",
+        default_schema="my_schema",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.table1,PROD)": {
+                "col1": "NUMBER(38,0)",
+                "col2": "VARCHAR(16777216)",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.table2,PROD)": {
+                "col2": "VARCHAR(16777216)",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.table3,PROD)": {
+                "col1": "VARCHAR(16777216)",
+                "col2": "VARCHAR(16777216)",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_snowflake_cte_name_collision.json",
+    )
+
+
+def test_snowflake_join_with_cte_involved_tables() -> None:
+    # The main thing we're checking here is that the second extracted join
+    # does not include table2, and is purely between table1.user_id and users.id.
+    assert_sql_result(
+        """
+WITH cte_alias AS (
+    SELECT t1.id as t1_id_alias, t1.user_id, t2.other_col
+    FROM my_db.my_schema.table1 t1
+    JOIN my_db.my_schema.table2 t2 ON t1.id = t2.id
+)
+SELECT users.name, cte_alias.user_id, cte_alias.other_col
+FROM my_db.my_schema.users_table users
+JOIN cte_alias ON users.id = cte_alias.user_id
+""",
+        dialect="snowflake",
+        default_db="my_db",
+        default_schema="my_schema",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.table1,PROD)": {
+                "ID": "NUMBER",
+                "USER_ID": "NUMBER",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.table2,PROD)": {
+                "ID": "NUMBER",
+                "OTHER_COL": "VARCHAR",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.users_table,PROD)": {
+                "ID": "NUMBER",
+                "NAME": "VARCHAR",
+            },
+        },
+        expected_file=RESOURCE_DIR
+        / "test_snowflake_join_with_cte_involved_tables.json",
+    )
+
+
+def test_snowflake_cte_chain_join_tables() -> None:
+    # When CTE2 references CTE1, and the outer query joins on a column that
+    # traces through the CTE chain, the join metadata should correctly resolve
+    # the physical tables involved. This validates that scope-based table
+    # resolution follows CTE-to-CTE references (not just direct table sources).
+    assert_sql_result(
+        """
+WITH cte1 AS (
+    SELECT t1.id, t1.name
+    FROM my_db.my_schema.t1
+),
+cte2 AS (
+    SELECT cte1.id, t2.value
+    FROM cte1
+    JOIN my_db.my_schema.t2 ON cte1.id = t2.id
+)
+SELECT users.col, cte2.value
+FROM my_db.my_schema.users
+JOIN cte2 ON users.id = cte2.id
+""",
+        dialect="snowflake",
+        default_db="my_db",
+        default_schema="my_schema",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.t1,PROD)": {
+                "ID": "NUMBER",
+                "NAME": "VARCHAR",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.t2,PROD)": {
+                "ID": "NUMBER",
+                "VALUE": "VARCHAR",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.users,PROD)": {
+                "ID": "NUMBER",
+                "COL": "VARCHAR",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_snowflake_cte_chain_join_tables.json",
+    )
+
+
+def test_snowflake_full_table_name_col_reference() -> None:
+    assert_sql_result(
+        """
+SELECT
+    my_db.my_schema.my_table.id,
+    case when my_db.my_schema.my_table.id > 100 then 1 else 0 end as id_gt_100,
+    my_db.my_schema.my_table.struct_field.field1 as struct_field1,
+FROM my_db.my_schema.my_table
+""",
+        dialect="snowflake",
+        default_db="my_db",
+        default_schema="my_schema",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.my_db.my_schema.my_table,PROD)": {
+                "id": "NUMBER(38,0)",
+                "struct_field": "struct",
+            },
+        },
+        expected_file=RESOURCE_DIR
+        / "test_snowflake_full_table_name_col_reference.json",
+    )
+
+
+# TODO: Add a test for setting platform_instance or env
+
+
+def test_default_schema_normalization() -> None:
+    assert_sql_result(
+        """
+create table demo_user.test_lineage2 as
+ (
+    select
+        ppd.PatientId,
+        ppf.bmi
+    from
+        demo_user.pima_patient_features ppf
+    join demo_user.pima_patient_diagnoses ppd on
+        ppd.PatientId = ppf.PatientId
+ ) with data;
+""",
+        dialect="teradata",
+        default_schema="dbc",
+        platform_instance="myteradata",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:teradata,myteradata.demo_user.pima_patient_diagnoses,PROD)": {
+                "HasDiabetes": "INTEGER()",
+                "PatientId": "INTEGER()",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:teradata,myteradata.demo_user.pima_patient_features,PROD)": {
+                "Age": "INTEGER()",
+                "BMI": "FLOAT()",
+                "BloodP": "INTEGER()",
+                "DiPedFunc": "FLOAT()",
+                "NumTimesPrg": "INTEGER()",
+                "PatientId": "INTEGER()",
+                "PlGlcConc": "INTEGER()",
+                "SkinThick": "INTEGER()",
+                "TwoHourSerIns": "INTEGER()",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:teradata,myteradata.demo_user.test_lineage2,PROD)": {
+                "BMI": "FLOAT()",
+                "PatientId": "INTEGER()",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_default_schema_normalization.json",
+    )
+
+
+def test_dialect_specific_operators() -> None:
+    # This is a test for the following Teradata-specific operators:
+    # - `SEL` (select)
+    # - `EQ` (equals)
+    # - `MINUS` (except)
+    assert_sql_result(
+        """
+sel col1, col2 from dbc.table1
+where col1 eq 'value1'
+minus
+select col1, col2 from dbc.table2
+""",
+        dialect="teradata",
+        default_schema="dbc",
+        expected_file=RESOURCE_DIR / "test_dialect_specific_operators.json",
+    )
+
+
+@pytest.mark.skip("sqlglot doesn't support this cast syntax yet")
+def test_teradata_cast_syntax() -> None:
+    assert_sql_result(
+        """
+SELECT my_table.date_col MONTH(4) AS month_col
+FROM my_table
+""",
+        dialect="teradata",
+        default_schema="dbc",
+        expected_file=RESOURCE_DIR / "test_teradata_cast_syntax.json",
+    )
+
+
+def test_snowflake_update_hardcoded() -> None:
+    assert_sql_result(
+        """
+UPDATE snowflake_sample_data.tpch_sf1.orders
+SET orderkey = 1, totalprice = 2
+WHERE orderkey = 3
+""",
+        dialect="snowflake",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,snowflake_sample_data.tpch_sf1.orders,PROD)": {
+                "orderkey": "NUMBER(38,0)",
+                "totalprice": "NUMBER(12,2)",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_snowflake_update_hardcoded.json",
+    )
+
+
+def test_snowflake_update_from_table() -> None:
+    # Can create these tables with the following SQL:
+    """
+    -- Create or replace my_table
+    CREATE OR REPLACE TABLE my_table (
+        id INT IDENTITY PRIMARY KEY,
+        col1 VARCHAR(50),
+        col2 VARCHAR(50)
+    );
+
+    -- Create or replace table1
+    CREATE OR REPLACE TABLE table1 (
+        id INT IDENTITY PRIMARY KEY,
+        col1 VARCHAR(50),
+        col2 VARCHAR(50)
+    );
+
+    -- Create or replace table2
+    CREATE OR REPLACE TABLE table2 (
+        id INT IDENTITY PRIMARY KEY,
+        col2 VARCHAR(50)
+    );
+
+    -- Insert data into my_table
+    INSERT INTO my_table (col1, col2)
+    VALUES ('foo', 'bar'),
+           ('baz', 'qux');
+
+    -- Insert data into table1
+    INSERT INTO table1 (col1, col2)
+    VALUES ('foo', 'bar'),
+           ('baz', 'qux');
+
+    -- Insert data into table2
+    INSERT INTO table2 (col2)
+    VALUES ('bar'),
+           ('qux');
+    """
+
+    assert_sql_result(
+        """
+UPDATE my_table
+SET
+    col1 = t1.col1 || t1.col2,
+    col2 = t1.col1 || t2.col2
+FROM table1 t1
+JOIN table2 t2 ON t1.id = t2.id
+WHERE my_table.id = t1.id;
+""",
+        dialect="snowflake",
+        default_db="my_db",
+        default_schema="my_schema",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.my_table,PROD)": {
+                "id": "NUMBER(38,0)",
+                "col1": "VARCHAR(16777216)",
+                "col2": "VARCHAR(16777216)",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.table1,PROD)": {
+                "id": "NUMBER(38,0)",
+                "col1": "VARCHAR(16777216)",
+                "col2": "VARCHAR(16777216)",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.table2,PROD)": {
+                "id": "NUMBER(38,0)",
+                "col1": "VARCHAR(16777216)",
+                "col2": "VARCHAR(16777216)",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_snowflake_update_from_table.json",
+    )
+
+
+def test_snowflake_update_self() -> None:
+    assert_sql_result(
+        """
+UPDATE snowflake_sample_data.tpch_sf1.orders
+SET orderkey = orderkey + 1
+""",
+        dialect="snowflake",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,snowflake_sample_data.tpch_sf1.orders,PROD)": {
+                "orderkey": "NUMBER(38,0)",
+                "totalprice": "NUMBER(12,2)",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_snowflake_update_self.json",
+    )
+
+
+def test_postgres_select_subquery() -> None:
+    assert_sql_result(
+        """
+SELECT
+    a,
+    b,
+    (SELECT c FROM table2 WHERE table2.id = table1.id) as c
+FROM table1
+""",
+        dialect="postgres",
+        default_db="my_db",
+        default_schema="my_schema",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:postgres,my_db.my_schema.table1,PROD)": {
+                "id": "INTEGER",
+                "a": "INTEGER",
+                "b": "INTEGER",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:postgres,my_db.my_schema.table2,PROD)": {
+                "id": "INTEGER",
+                "c": "INTEGER",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_postgres_select_subquery.json",
+    )
+
+
+def test_postgres_update_subselect() -> None:
+    assert_sql_result(
+        """
+UPDATE accounts SET sales_person_name =
+    (SELECT name FROM employees
+     WHERE employees.id = accounts.sales_person_id)
+""",
+        dialect="postgres",
+        default_db="my_db",
+        default_schema="my_schema",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:postgres,my_db.my_schema.accounts,PROD)": {
+                "id": "INTEGER",
+                "sales_person_id": "INTEGER",
+                "sales_person_name": "VARCHAR(16777216)",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:postgres,my_db.my_schema.employees,PROD)": {
+                "id": "INTEGER",
+                "name": "VARCHAR(16777216)",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_postgres_update_subselect.json",
+    )
+
+
+@pytest.mark.skip(reason="We can't parse column-list syntax with sub-selects yet")
+def test_postgres_complex_update() -> None:
+    # Example query from the postgres docs:
+    # https://www.postgresql.org/docs/current/sql-update.html
+    assert_sql_result(
+        """
+UPDATE accounts SET (contact_first_name, contact_last_name) =
+    (SELECT first_name, last_name FROM employees
+     WHERE employees.id = accounts.sales_person);
+""",
+        dialect="postgres",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:postgres,my_db.my_schema.accounts,PROD)": {
+                "id": "INTEGER",
+                "contact_first_name": "VARCHAR(16777216)",
+                "contact_last_name": "VARCHAR(16777216)",
+                "sales_person": "INTEGER",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:postgres,my_db.my_schema.employees,PROD)": {
+                "id": "INTEGER",
+                "first_name": "VARCHAR(16777216)",
+                "last_name": "VARCHAR(16777216)",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_postgres_complex_update.json",
+    )
+
+
+def test_redshift_materialized_view_auto_refresh() -> None:
+    # Example query from the redshift docs: https://docs.aws.amazon.com/prescriptive-guidance/latest/materialized-views-redshift/refreshing-materialized-views.html
+    assert_sql_result(
+        """
+CREATE MATERIALIZED VIEW mv_total_orders
+AUTO REFRESH YES -- Add this clause to auto refresh the MV
+AS
+ SELECT c.cust_id,
+        c.first_name,
+        sum(o.amount) as total_amount
+ FROM orders o
+ JOIN customer c
+    ON c.cust_id = o.customer_id
+ GROUP BY c.cust_id,
+          c.first_name;
+""",
+        dialect="redshift",
+        expected_file=RESOURCE_DIR
+        / "test_redshift_materialized_view_auto_refresh.json",
+    )
+
+
+def test_redshift_temp_table_shortcut() -> None:
+    # On redshift, tables starting with # are temporary tables.
+    assert_sql_result(
+        """
+CREATE TABLE #my_custom_name
+distkey (1)
+sortkey (1,2)
+AS
+WITH cte AS (
+SELECT *
+FROM other_schema.table1
+)
+SELECT * FROM cte
+""",
+        dialect="redshift",
+        default_db="my_db",
+        default_schema="my_schema",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:redshift,my_db.other_schema.table1,PROD)": {
+                "col1": "INTEGER",
+                "col2": "INTEGER",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_redshift_temp_table_shortcut.json",
+    )
+
+
+def test_redshift_union_view() -> None:
+    # TODO: This currently fails to generate CLL. Need to debug further.
+    assert_sql_result(
+        """
+CREATE VIEW sales_vw AS SELECT * FROM public.sales UNION ALL SELECT * FROM spectrum.sales WITH NO SCHEMA BINDING
+""",
+        dialect="redshift",
+        default_db="my_db",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:redshift,my_db.public.sales,PROD)": {
+                "col1": "INTEGER",
+                "col2": "INTEGER",
+            },
+            # Testing a case where we only have one schema available.
+        },
+        expected_file=RESOURCE_DIR / "test_redshift_union_view.json",
+    )
+
+
+def test_redshift_system_automove() -> None:
+    # Came across this in the Redshift query log, but it seems to be a system-generated query.
+    assert_sql_result(
+        """
+CREATE TABLE "pg_automv"."mv_tbl__auto_mv_12708107__0_recomputed"
+BACKUP YES
+DISTSTYLE KEY
+DISTKEY(2)
+AS (
+    SELECT
+        COUNT(CAST(1 AS INT4)) AS "aggvar_3",
+        COUNT(CAST(1 AS INT4)) AS "num_rec"
+    FROM
+        "public"."permanent_1" AS "permanent_1"
+    WHERE (
+        (CAST("permanent_1"."insertxid" AS INT8) <= 41990135)
+        AND (CAST("permanent_1"."deletexid" AS INT8) > 41990135)
+    )
+    OR (
+        CAST(FALSE AS BOOL)
+        AND (CAST("permanent_1"."insertxid" AS INT8) = 0)
+        AND (CAST("permanent_1"."deletexid" AS INT8) <> 0)
+    )
+)
+""",
+        dialect="redshift",
+        default_db="my_db",
+        expected_file=RESOURCE_DIR / "test_redshift_system_automove.json",
+    )
+
+
+def test_snowflake_with_unnamed_column_from_udf_call() -> None:
+    assert_sql_result(
+        """SELECT
+  A.ID,
+  B.NAME,
+  PARSE_JSON(B.MY_JSON) AS :userInfo,
+  B.ADDRESS
+FROM my_db.my_schema.my_table AS A
+LEFT JOIN my_db.my_schema.my_table_B AS B
+  ON A.ID = B.ID
+""",
+        dialect="snowflake",
+        default_db="my_db",
+        expected_file=RESOURCE_DIR / "test_snowflake_unnamed_column_udf.json",
+    )
+
+
+def test_sqlite_insert_into_values() -> None:
+    assert_sql_result(
+        """\
+INSERT INTO my_table (id, month, total_cost, area)
+    VALUES
+        (1, '2021-01', 100, 10),
+        (2, '2021-02', 200, 20),
+        (3, '2021-03', 300, 30)
+""",
+        dialect="sqlite",
+        expected_file=RESOURCE_DIR / "test_sqlite_insert_into_values.json",
+    )
+
+
+def test_teradata_insert_into_values() -> None:
+    # Test INSERT VALUES with complex values including strings and timestamps
+    assert_sql_result(
+        """\
+INSERT INTO operations_temp.loss_backup (val_name, amount_type, field_number, amount_status, col_status, duration, time_code) 
+VALUES (9, '2011-04-17', 42, 42.34, '1980-12-29 15:11:17', '1994-08-19 21:28:09', 'garden')""",
+        dialect="teradata",
+        expected_file=RESOURCE_DIR / "test_insert_into_values.json",
+    )
+
+
+def test_bigquery_information_schema_query() -> None:
+    # Special case - the BigQuery INFORMATION_SCHEMA views are prefixed with a
+    # project + possibly a dataset/region, so sometimes are 4 parts instead of 3.
+    # https://cloud.google.com/bigquery/docs/information-schema-intro#syntax
+
+    assert_sql_result(
+        """\
+select
+  c.table_catalog as table_catalog,
+  c.table_schema as table_schema,
+  c.table_name as table_name,
+  c.column_name as column_name,
+  c.ordinal_position as ordinal_position,
+  cfp.field_path as field_path,
+  c.is_nullable as is_nullable,
+  CASE WHEN CONTAINS_SUBSTR(cfp.field_path, ".") THEN NULL ELSE c.data_type END as data_type,
+  description as comment,
+  c.is_hidden as is_hidden,
+  c.is_partitioning_column as is_partitioning_column,
+  c.clustering_ordinal_position as clustering_ordinal_position,
+from
+  `acryl-staging-2`.`smoke_test_db_4`.INFORMATION_SCHEMA.COLUMNS c
+  join `acryl-staging-2`.`smoke_test_db_4`.INFORMATION_SCHEMA.COLUMN_FIELD_PATHS as cfp on cfp.table_name = c.table_name
+  and cfp.column_name = c.column_name
+ORDER BY
+  table_catalog, table_schema, table_name, ordinal_position ASC, data_type DESC""",
+        dialect="bigquery",
+        expected_file=RESOURCE_DIR / "test_bigquery_information_schema_query.json",
+    )
+
+
+def test_bigquery_alter_table_column() -> None:
+    assert_sql_result(
+        """\
+ALTER TABLE `my-bq-project.covid_data.covid_deaths` drop COLUMN patient_name
+    """,
+        dialect="bigquery",
+        expected_file=RESOURCE_DIR / "test_bigquery_alter_table_column.json",
+    )
+
+
+def test_sqlite_drop_table() -> None:
+    assert_sql_result(
+        """\
+DROP TABLE my_schema.my_table
+""",
+        dialect="sqlite",
+        expected_file=RESOURCE_DIR / "test_sqlite_drop_table.json",
+    )
+
+
+def test_sqlite_drop_view() -> None:
+    assert_sql_result(
+        """\
+DROP VIEW my_schema.my_view
+""",
+        dialect="sqlite",
+        expected_file=RESOURCE_DIR / "test_sqlite_drop_view.json",
+    )
+
+
+def test_snowflake_drop_schema() -> None:
+    assert_sql_result(
+        """\
+DROP SCHEMA my_schema
+""",
+        dialect="snowflake",
+        expected_file=RESOURCE_DIR / "test_snowflake_drop_schema.json",
+    )
+
+
+def test_bigquery_subquery_column_inference() -> None:
+    assert_sql_result(
+        """\
+SELECT user_id, source, user_source
+FROM (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY __partition_day DESC) AS rank_
+    FROM invent_dw.UserDetail
+) source_user
+WHERE rank_ = 1
+""",
+        dialect="bigquery",
+        expected_file=RESOURCE_DIR / "test_bigquery_subquery_column_inference.json",
+    )
+
+
+def test_sqlite_attach_database() -> None:
+    assert_sql_result(
+        """\
+ATTACH DATABASE ':memory:' AS aux1
+""",
+        dialect="sqlite",
+        expected_file=RESOURCE_DIR / "test_sqlite_attach_database.json",
+        allow_table_error=True,
+    )
+
+
+def test_mssql_casing_resolver() -> None:
+    assert_sql_result(
+        """\
+SELECT Age, name, UPPERCASED_COL, COUNT(*) as Count
+FROM Foo.Persons
+GROUP BY Age
+""",
+        dialect="mssql",
+        default_db="NewData",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:mssql,newdata.foo.persons,PROD)": {
+                "Age": "INTEGER",
+                "Name": "VARCHAR(16777216)",
+                "Uppercased_Col": "VARCHAR(16777216)",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_mssql_casing_resolver.json",
+    )
+
+
+def test_mssql_select_into() -> None:
+    assert_sql_result(
+        """\
+SELECT age as AGE, COUNT(*) as Count
+INTO Foo.age_dist
+FROM Foo.Persons
+GROUP BY Age
+""",
+        dialect="mssql",
+        default_db="NewData",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:mssql,newdata.foo.persons,PROD)": {
+                "Age": "INTEGER",
+                "Name": "VARCHAR(16777216)",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:mssql,newdata.foo.age_dist,PROD)": {
+                "AGE": "INTEGER",
+                "Count": "INTEGER",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_mssql_select_into.json",
+    )
+
+
+def test_bigquery_indirect_references() -> None:
+    # We don't currently support the `IF` construct's variable reference and hence this test
+    # only detects `constant1` and `constant2` as columns. So this test is more of a
+    # placeholder that we can revisit if we add support.
+
+    assert_sql_result(
+        """\
+-- Merge users from the main_users and external_users tables.
+SELECT
+    1 as constant1,
+    IF (main.id is not null, main, extras).* REPLACE (
+        least(main.created_at, extras.created_at) as created_at
+    ),
+    2 as constant2
+FROM my_schema.main_users main
+FULL JOIN my_schema.external_users extras
+    USING (id)
+""",
+        dialect="bigquery",
+        expected_file=RESOURCE_DIR / "test_bigquery_indirect_references.json",
+        default_db="playground-1",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:bigquery,playground-1.my_schema.main_users,PROD)": {
+                "id": "INTEGER",
+                "name": "STRING",
+                "created_at": "TIMESTAMP",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:bigquery,playground-1.my_schema.external_users,PROD)": {
+                "id": "INTEGER",
+                "name": "STRING",
+                "created_at": "TIMESTAMP",
+            },
+        },
+    )
+
+
+def test_oracle_case_insensitive_cols() -> None:
+    assert_sql_result(
+        """\
+SELECT
+CASE WHEN (employee_TYPE = 'Manager')
+     THEN (CASE
+             WHEN job_title in ('Engineer') THEN '12'
+             ELSE '11'
+           END)
+     ELSE (CASE
+             WHEN job_title in ('Engineer') THEN '02'
+             ELSE '01'
+           END)
+END AS employee_type_number
+FROM ABC.employees ;
+""",
+        dialect="oracle",
+        expected_file=RESOURCE_DIR / "test_oracle_case_insensitive_cols.json",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:oracle,abc.employees,PROD)": {
+                "employee_type": "VARCHAR2(100)",
+                "job_title": "VARCHAR2(100)",
+            },
+        },
+    )
+
+
+def test_self_join_with_cte() -> None:
+    assert_sql_result(
+        """\
+WITH table_1_day_ago AS (
+    SELECT * FROM my_table
+    WHERE ts < CURRENT_TIMESTAMP() - INTERVAL '1 DAY'
+)
+SELECT
+    my_table.id,
+    LAST_VALUE(my_table.value) OVER (PARTITION BY my_table.id ORDER BY my_table.ts) as current_value,
+    LAST_VALUE(table_1_day_ago.value) OVER (PARTITION BY table_1_day_ago.id ORDER BY table_1_day_ago.ts) as value_1_day_ago 
+FROM my_table
+JOIN table_1_day_ago ON my_table.id = table_1_day_ago.id
+""",
+        dialect="snowflake",
+        expected_file=RESOURCE_DIR / "test_self_join_with_cte.json",
+        default_db="my_db",
+        default_schema="my_schema",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.my_table,PROD)": {
+                "id": "INTEGER",
+                "value": "VARIANT",
+                "ts": "TIMESTAMP",
+            },
+        },
+    )
+
+
+def test_cross_join() -> None:
+    assert_sql_result(
+        """\
+SELECT * FROM my_table1
+CROSS JOIN my_table2
+""",
+        dialect="snowflake",
+        expected_file=RESOURCE_DIR / "test_cross_join.json",
+        default_db="my_db",
+        default_schema="my_schema",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.my_table1,PROD)": {
+                "id": "INTEGER",
+                "value": "VARCHAR",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:snowflake,my_db.my_schema.my_table2,PROD)": {
+                "id": "INTEGER",
+                "name": "VARCHAR",
+            },
+        },
+    )
+
+
+def test_lateral_join() -> None:
+    # We don't fully support extracting the columns involved in a lateral join.
+    assert_sql_result(
+        """\
+SELECT t1.id, t1.name, t2.value
+FROM my_table1 t1,
+LATERAL (SELECT value FROM my_table2 WHERE t1.id = my_table2.id LIMIT 1) t2
+""",
+        dialect="postgres",
+        default_db="my_db",
+        default_schema="my_schema",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:postgres,my_db.my_schema.my_table1,PROD)": {
+                "id": "INTEGER",
+                "name": "VARCHAR",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:postgres,my_db.my_schema.my_table2,PROD)": {
+                "id": "INTEGER",
+                "value": "VARCHAR",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_lateral_join.json",
+    )
+
+
+def test_right_join() -> None:
+    assert_sql_result(
+        """\
+SELECT t1.id, t1.name, t2.value
+FROM my_table1 t1
+RIGHT JOIN my_table2 t2 ON t1.id = t2.id
+""",
+        dialect="postgres",
+        default_db="my_db",
+        default_schema="my_schema",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:postgres,my_db.my_schema.my_table1,PROD)": {
+                "id": "INTEGER",
+                "name": "VARCHAR",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:postgres,my_db.my_schema.my_table2,PROD)": {
+                "id": "INTEGER",
+                "value": "VARCHAR",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_right_join.json",
+    )
+
+
+def test_natural_join() -> None:
+    assert_sql_result(
+        """\
+SELECT t1.id, t1.name, t2.value
+FROM my_table1 t1
+NATURAL JOIN my_table2 t2
+""",
+        dialect="postgres",
+        default_db="my_db",
+        default_schema="my_schema",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:postgres,my_db.my_schema.my_table1,PROD)": {
+                "id": "INTEGER",
+                "name": "VARCHAR",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:postgres,my_db.my_schema.my_table2,PROD)": {
+                "id": "INTEGER",
+                "value": "VARCHAR",
+            },
+        },
+        expected_file=RESOURCE_DIR / "test_natural_join.json",
+    )
+
+
+def test_dremio_quoted_identifiers() -> None:
+    # Test that Dremio SQL with quoted identifiers parses correctly.
+    # This is a regression test for the issue where Dremio was mapped to the
+    # "drill" dialect, which didn't support quoted identifiers properly.
+    assert_sql_result(
+        """\
+WITH "cte_orders" AS (
+    SELECT * FROM "MySource"."sales"."orders"
+    WHERE "status" = 'completed'
+)
+SELECT "cte_orders"."order_id", "customers"."customer_name"
+FROM "cte_orders"
+JOIN "MySource"."sales"."customers" ON "cte_orders"."customer_id" = "customers"."customer_id"
+""",
+        dialect="dremio",
+        expected_file=RESOURCE_DIR / "test_dremio_quoted_identifiers.json",
+    )
+
+
+def test_snowflake_semantic_view_query() -> None:
+    # Regression test: a dbt model that queries a Snowflake semantic view using
+    # semantic_view(...) table function. Sqlglot has an infinite loop parsing this
+    # (https://github.com/tobymao/sqlglot/issues/6287).
+    assert_sql_result(
+        """SELECT a FROM SEMANTIC_VIEW(b FACTS c)""",
+        dialect="snowflake",
+        expected_file=RESOURCE_DIR / "test_snowflake_semantic_view_query.json",
+    )
+
+
+def test_snowflake_semantic_view_query_with_metrics() -> None:
+    # Reported by user as causing an infinite loop in sqlglot v27.
+    # Fixed in v28, but v28 could not parse aliases in dimensions clause.
+    # Fixed in v29.0.1 (https://github.com/tobymao/sqlglot/issues/6993).
+    assert_sql_result(
+        """\
+select
+    organization_id,
+    month,
+    active_users
+from semantic_view(
+    product_metrics.semantic.sv_board_opens
+    metrics active_users
+    dimensions organization_id, date_trunc('month', time) as month
+)
+order by organization_id, month desc
+""",
+        dialect="snowflake",
+        expected_file=RESOURCE_DIR
+        / "test_snowflake_semantic_view_query_with_metrics.json",
+    )
+
+
+def test_snowflake_semantic_view_qualified_table() -> None:
+    # Test semantic view with fully qualified table name (db.schema.table)
+    assert_sql_result(
+        """SELECT col1, col2 FROM SEMANTIC_VIEW(mydb.myschema.mytable FACTS fact_col)""",
+        dialect="snowflake",
+        expected_file=RESOURCE_DIR
+        / "test_snowflake_semantic_view_qualified_table.json",
+    )
+
+
+def test_snowflake_semantic_view_with_metrics_only() -> None:
+    # Test semantic view with metrics clause only (no dimensions)
+    assert_sql_result(
+        """SELECT total_revenue FROM SEMANTIC_VIEW(sales_data METRICS total_revenue)""",
+        dialect="snowflake",
+        expected_file=RESOURCE_DIR
+        / "test_snowflake_semantic_view_with_metrics_only.json",
+    )
+
+
+def test_snowflake_semantic_view_with_dimensions_only() -> None:
+    # Test semantic view with dimensions clause only (no metrics)
+    assert_sql_result(
+        """SELECT region, product FROM SEMANTIC_VIEW(sales_data DIMENSIONS region, product)""",
+        dialect="snowflake",
+        expected_file=RESOURCE_DIR
+        / "test_snowflake_semantic_view_with_dimensions_only.json",
+    )
+
+
+def test_snowflake_semantic_view_with_where() -> None:
+    # Test semantic view with WHERE clause in the outer query
+    assert_sql_result(
+        """SELECT user_id, activity FROM SEMANTIC_VIEW(events FACTS activity) WHERE user_id > 100""",
+        dialect="snowflake",
+        expected_file=RESOURCE_DIR / "test_snowflake_semantic_view_with_where.json",
+    )
+
+
+def test_clickhouse_dictget_lineage() -> None:
+    """dictGet dictionary references should appear in upstream lineage.
+
+    Expected lineage:
+        db1.events    default.my_dict
+                \\           /
+                 \\         /
+                  v       v
+                  [output]
+    """
+    assert_sql_result(
+        """\
+SELECT
+    col_id,
+    DICTGET(default.my_dict, 'type', col_id) AS dict_type,
+    DICTGET(default.my_dict, 'domain', col_id) AS dict_domain
+FROM db1.events
+""",
+        dialect="clickhouse",
+        expected_file=RESOURCE_DIR / "test_clickhouse_dictget.json",
+    )
+
+
+def test_clickhouse_dictget_with_multiple_tables() -> None:
+    """dictGet references are included alongside real table joins.
+
+    Expected lineage:
+        db1.events    db1.users    default.my_dict
+                \\         |          /
+                 \\        |         /
+                  v       v        v
+                      [output]
+    """
+    assert_sql_result(
+        """\
+SELECT
+    e.event_id,
+    u.user_name,
+    DICTGETORDEFAULT(default.my_dict, 'name', e.category_id, 'Unknown') AS dict_name
+FROM db1.events e
+JOIN db1.users u ON e.user_id = u.id
+""",
+        dialect="clickhouse",
+        expected_file=RESOURCE_DIR / "test_clickhouse_dictget_with_joins.json",
+    )
+
+
+def test_clickhouse_dictget_string_literal() -> None:
+    """Test dictGet with string literal dictionary name.
+
+    dictGet('schema.dict_name', ...) is parsed as a Literal node, not a Column.
+    The extraction should handle both forms.
+    """
+    assert_sql_result(
+        """\
+SELECT
+    col_id,
+    DICTGET('default.my_dict', 'type', col_id) AS dict_type
+FROM db1.events
+""",
+        dialect="clickhouse",
+        expected_file=RESOURCE_DIR / "test_clickhouse_dictget_string_literal.json",
+    )
+
+
+def test_clickhouse_dictget_unqualified() -> None:
+    # dictGet with bare dictionary name (no database prefix).
+    assert_sql_result(
+        """\
+SELECT
+    col_id,
+    DICTGET(my_dict, 'type', col_id) AS dict_type
+FROM db1.events
+""",
+        dialect="clickhouse",
+        expected_file=RESOURCE_DIR / "test_clickhouse_dictget_unqualified.json",
+    )
+
+
+def test_clickhouse_typed_dictget_lineage() -> None:
+    assert_sql_result(
+        """\
+SELECT
+    dictGetString('db.string_dict', 'value', id) AS string_value,
+    dictGetUInt64OrDefault('db.default_dict', 'value', id, 0) AS default_value
+FROM db.src
+""",
+        dialect="clickhouse",
+        default_schema="db",
+        expected_file=RESOURCE_DIR / "test_clickhouse_typed_dictget.json",
+    )
+
+
+@pytest.mark.parametrize("function_name", sorted(_CLICKHOUSE_DICTIONARY_FUNCTIONS))
+@pytest.mark.parametrize("dictionary_arg", ["'db.my_dict'", "my_dict"])
+def test_clickhouse_dictionary_function_adds_dictionary_upstream(
+    function_name: str, dictionary_arg: str
+) -> None:
+    # Guards against a sqlglot upgrade parsing a dict* function into a typed node
+    # instead of exp.Anonymous, which would silently drop the dictionary upstream.
+    result = sqlglot_lineage(
+        f"SELECT {function_name}({dictionary_arg}, 'value', id) AS v FROM db.src",
+        schema_resolver=SchemaResolver(platform="clickhouse"),
+        default_schema="db",
+    )
+    assert (
+        "urn:li:dataset:(urn:li:dataPlatform:clickhouse,db.my_dict,PROD)"
+        in result.in_tables
+    )
+
+
+def test_clickhouse_dict_prefixed_function_is_not_a_dictionary() -> None:
+    assert_sql_result(
+        """\
+SELECT dictLookup(t.payload, 'k') AS v
+FROM db.src t
+""",
+        dialect="clickhouse",
+        default_schema="db",
+        expected_file=RESOURCE_DIR
+        / "test_clickhouse_dict_prefixed_non_dictionary.json",
+    )
+
+
+def test_clickhouse_table_function_is_not_a_table() -> None:
+    assert_sql_result(
+        """\
+INSERT INTO target
+SELECT e.id, r.name
+FROM db1.events e
+JOIN mysql('host:3306', 'remote_db', 'remote_table', 'user', 'pass') r ON e.id = r.id
+""",
+        dialect="clickhouse",
+        default_schema="db1",
+        expected_file=RESOURCE_DIR / "test_clickhouse_table_function.json",
+    )
+
+
+def test_postgres_table_function_without_default_schema() -> None:
+    assert_sql_result(
+        """\
+INSERT INTO s.target
+SELECT a.id, g.n FROM s.a CROSS JOIN generate_series(1, 10) AS g(n)
+""",
+        dialect="postgres",
+        expected_file=RESOURCE_DIR / "test_postgres_table_function.json",
+    )
+
+
+def test_postgres_qualified_table_function() -> None:
+    assert_sql_result(
+        """\
+INSERT INTO public.target
+SELECT a.id, f.v FROM public.a a JOIN public.my_fn(1) f ON a.id = f.id
+""",
+        dialect="postgres",
+        default_db="db1",
+        default_schema="public",
+        expected_file=RESOURCE_DIR / "test_postgres_qualified_table_function.json",
+    )
+
+
+def test_postgres_join_through_subquery_with_table_function() -> None:
+    assert_sql_result(
+        """\
+SELECT a.id FROM s.a a
+JOIN (SELECT b.id, b.v, g.x FROM s.b b CROSS JOIN generate_series(1, 3) g(x)) s2
+  ON a.id = s2.id AND a.n = s2.x
+""",
+        dialect="postgres",
+        default_db="db1",
+        default_schema="s",
+        expected_file=RESOURCE_DIR
+        / "test_postgres_join_through_subquery_with_table_function.json",
+    )
+
+
+def test_postgres_cross_join_table_function_is_not_a_self_join() -> None:
+    assert_sql_result(
+        """\
+SELECT 1
+FROM (SELECT b.id, g.x FROM s.b b CROSS JOIN generate_series(1, 3) g(x)) t
+CROSS JOIN s.b
+""",
+        dialect="postgres",
+        default_db="db1",
+        default_schema="s",
+        expected_file=RESOURCE_DIR
+        / "test_postgres_cross_join_table_function_is_not_a_self_join.json",
+    )
+
+
+def test_postgres_lateral_table_function_is_not_a_self_join() -> None:
+    assert_sql_result(
+        """\
+SELECT a.id, l.n FROM s.a a, LATERAL (SELECT n FROM generate_series(1, 3) AS g(n)) l
+""",
+        dialect="postgres",
+        default_db="db1",
+        default_schema="s",
+        expected_file=RESOURCE_DIR
+        / "test_postgres_lateral_table_function_is_not_a_self_join.json",
+    )
+
+
+def test_bigquery_table_inside_table_function() -> None:
+    assert_sql_result(
+        """\
+SELECT * FROM ML.PREDICT(MODEL `p.d.model`, TABLE `p.d.features`)
+""",
+        dialect="bigquery",
+        default_db="p",
+        default_schema="d",
+        expected_file=RESOURCE_DIR / "test_bigquery_table_inside_table_function.json",
+    )
+
+
+def test_clickhouse_dictget_in_materialized_view() -> None:
+    # dictGet table in in_tables, TO table in out_tables (not in_tables).
+    # Guards against operator precedence bug where `- modified` doesn't
+    # subtract from the full union including dictGet tables.
+    assert_sql_result(
+        """\
+CREATE MATERIALIZED VIEW db1.mv_enriched TO db1.events_enriched
+AS SELECT
+    event_id,
+    DICTGET(default.my_dict, 'name', category_id) AS category_name
+FROM db1.raw_events
+""",
+        dialect="clickhouse",
+        expected_file=RESOURCE_DIR
+        / "test_clickhouse_dictget_in_materialized_view.json",
+    )
+
+
+def test_clickhouse_bare_dictget_resolves_global_xml_dictionary() -> None:
+    assert_sql_result(
+        """\
+INSERT INTO target
+SELECT dictGet('My_Dict', 'v', id) AS v
+FROM src
+""",
+        dialect="clickhouse",
+        default_schema="db",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:clickhouse,db.src,PROD)": {
+                "id": "UInt64",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:clickhouse,db.target,PROD)": {
+                "v": "String",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:clickhouse,My_Dict,PROD)": {
+                "id": "UInt64",
+                "v": "String",
+            },
+        },
+        expected_file=RESOURCE_DIR
+        / "test_clickhouse_bare_dictget_resolves_global_xml_dictionary.json",
+    )
+
+
+def test_clickhouse_bare_dictget_does_not_replace_same_named_table() -> None:
+    """Pins precedence: a global dictionary beats the same name in the current database."""
+    assert_sql_result(
+        """\
+INSERT INTO target (v, w)
+SELECT dictGet('My_Dict', 'v', id) AS v, w
+FROM db.My_Dict
+""",
+        dialect="clickhouse",
+        default_schema="db",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:clickhouse,db.My_Dict,PROD)": {
+                "id": "UInt64",
+                "w": "String",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:clickhouse,My_Dict,PROD)": {
+                "id": "UInt64",
+                "v": "String",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:clickhouse,db.target,PROD)": {
+                "v": "String",
+                "w": "String",
+            },
+        },
+        expected_file=RESOURCE_DIR
+        / "test_clickhouse_bare_dictget_same_named_table.json",
+    )
+
+
+def test_clickhouse_bare_dictget_falls_back_to_current_database() -> None:
+    assert_sql_result(
+        """\
+INSERT INTO target
+SELECT dictGet('Ddl_Dict', 'v', id) AS v
+FROM src
+""",
+        dialect="clickhouse",
+        default_schema="db",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:clickhouse,db.src,PROD)": {
+                "id": "UInt64",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:clickhouse,db.target,PROD)": {
+                "v": "String",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:clickhouse,db.Ddl_Dict,PROD)": {
+                "id": "UInt64",
+                "v": "String",
+            },
+        },
+        expected_file=RESOURCE_DIR
+        / "test_clickhouse_bare_dictget_falls_back_to_current_database.json",
+    )
+
+
+def test_clickhouse_bare_dictget_ignores_case_folded_global() -> None:
+    assert_sql_result(
+        """\
+INSERT INTO target
+SELECT dictGet('My_Dict', 'v', id) AS v
+FROM src
+""",
+        dialect="clickhouse",
+        default_schema="db",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:clickhouse,db.src,PROD)": {
+                "id": "UInt64",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:clickhouse,db.target,PROD)": {
+                "v": "String",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:clickhouse,my_dict,PROD)": {
+                "id": "UInt64",
+                "v": "String",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:clickhouse,db.My_Dict,PROD)": {
+                "id": "UInt64",
+                "v": "String",
+            },
+        },
+        expected_file=RESOURCE_DIR
+        / "test_clickhouse_bare_dictget_ignores_case_folded_global.json",
+    )
+
+
+def test_clickhouse_bare_dictget_unqualified_target_keeps_db_urn() -> None:
+    assert_sql_result(
+        """\
+INSERT INTO My_Dict
+SELECT dictGet('My_Dict', 'v', id) AS v
+FROM src
+""",
+        dialect="clickhouse",
+        default_schema="db",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:clickhouse,db.src,PROD)": {
+                "id": "UInt64",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:clickhouse,db.My_Dict,PROD)": {
+                "v": "String",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:clickhouse,My_Dict,PROD)": {
+                "id": "UInt64",
+                "v": "String",
+            },
+        },
+        expected_file=RESOURCE_DIR
+        / "test_clickhouse_bare_dictget_unqualified_target_keeps_db_urn.json",
+    )
+
+
+def test_clickhouse_bare_dictget_unqualified_source_keeps_db_urn() -> None:
+    assert_sql_result(
+        """\
+INSERT INTO target (v, w)
+SELECT dictGet('My_Dict', 'v', id) AS v, w
+FROM My_Dict
+""",
+        dialect="clickhouse",
+        default_schema="db",
+        schemas={
+            "urn:li:dataset:(urn:li:dataPlatform:clickhouse,db.My_Dict,PROD)": {
+                "id": "UInt64",
+                "w": "String",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:clickhouse,My_Dict,PROD)": {
+                "id": "UInt64",
+                "v": "String",
+            },
+            "urn:li:dataset:(urn:li:dataPlatform:clickhouse,db.target,PROD)": {
+                "v": "String",
+                "w": "String",
+            },
+        },
+        expected_file=RESOURCE_DIR
+        / "test_clickhouse_bare_dictget_unqualified_source_keeps_db_urn.json",
+    )
+
+
+def test_clickhouse_materialized_view_to_table() -> None:
+    """Test ClickHouse CREATE MATERIALIZED VIEW ... TO target_table syntax.
+
+    The TO table is the storage target (downstream), not a data source (upstream).
+    The MV acts as a trigger that inserts into the target table.
+
+    Expected lineage:
+        analytics.events
+              |
+              v
+        analytics.agg_daily_stats  (target table from TO clause)
+
+    The MV name (analytics.mv_daily_stats) is NOT the downstream - the TO table is.
+    """
+    assert_sql_result(
+        """\
+CREATE MATERIALIZED VIEW analytics.mv_daily_stats TO analytics.agg_daily_stats
+(date Date, total_events UInt64)
+AS SELECT
+    toDate(timestamp) AS date,
+    count(*) AS total_events
+FROM analytics.events
+GROUP BY date
+""",
+        dialect="clickhouse",
+        expected_file=RESOURCE_DIR / "test_clickhouse_materialized_view_to.json",
+    )

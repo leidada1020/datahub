@@ -1,0 +1,244 @@
+import { Modal, Text } from '@components';
+import { Warning } from '@phosphor-icons/react/dist/csr/Warning';
+import { Input, notification } from 'antd';
+import React, { useContext, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useLocation } from 'react-router';
+import styled, { useTheme } from 'styled-components';
+
+import analytics, { EventType } from '@app/analytics';
+import { useEntityData } from '@app/entity/shared/EntityContext';
+import {
+    getSearchCsvDownloadHeader,
+    transformResultsToCsvRow,
+} from '@app/entityV2/shared/components/styled/search/downloadAsCsvUtil';
+import { LineageTabContext } from '@app/entityV2/shared/tabs/Lineage/LineageTabContext';
+import { downloadRowsAsCsv } from '@app/search/utils/csvUtils';
+import { DownloadSearchResults, DownloadSearchResultsInput } from '@app/search/utils/types';
+import { useEntityRegistry } from '@app/useEntityRegistry';
+import { StyledSpinner } from '@src/alchemy-components/components/Loader/components';
+
+import { AndFilterInput, LineageSearchPath } from '@types';
+
+const ImpactAnalysisWarning = styled.div`
+    gap: 8px;
+    padding: 8px;
+    display: flex;
+    align-items: center;
+    color: ${(props) => props.theme.colors.textWarning};
+    background-color: ${(props) => props.theme.colors.bgSurfaceWarning};
+    margin-bottom: 16px;
+    border-radius: 8px;
+`;
+
+const SubText = styled.div`
+    display: flex;
+    align-items: center;
+    gap: 6px;
+`;
+
+type Props = {
+    downloadSearchResults: (input: DownloadSearchResultsInput) => Promise<DownloadSearchResults | null | undefined>;
+    filters: AndFilterInput[];
+    query: string;
+    viewUrn?: string;
+    totalResults?: number;
+    setIsDownloadingCsv: (isDownloadingCsv: boolean) => any;
+    showDownloadAsCsvModal: boolean;
+    setShowDownloadAsCsvModal: (showDownloadAsCsvModal: boolean) => any;
+};
+
+const SEARCH_PAGE_SIZE_FOR_DOWNLOAD = 100;
+const DOWNLOAD_NOTIFICATION_KEY = 'download-csv-notification';
+const FILENAME_PLACEHOLDER = 'datahub.csv';
+const formatTime = (seconds: number) => {
+    if (seconds < 60) return `${Math.round(seconds)}s`;
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = Math.round(seconds % 60);
+    return `${minutes}m ${remainingSeconds}s`;
+};
+
+export default function DownloadAsCsvModal({
+    downloadSearchResults,
+    filters,
+    query,
+    viewUrn,
+    totalResults,
+    setIsDownloadingCsv,
+    showDownloadAsCsvModal,
+    setShowDownloadAsCsvModal,
+}: Props) {
+    const { t } = useTranslation('entity.shared.components');
+    const { t: tc } = useTranslation('common.actions');
+    const { lineageSearchPath } = useContext(LineageTabContext);
+    const theme = useTheme();
+    const { entityData: entitySearchIsEmbeddedWithin } = useEntityData();
+    const location = useLocation();
+
+    const [saveAsTitle, setSaveAsTitle] = useState(
+        entitySearchIsEmbeddedWithin ? `${entitySearchIsEmbeddedWithin.name}_impact.csv` : 'results.csv',
+    );
+    const entityRegistry = useEntityRegistry();
+    const openNotification = (currentCount = 0, estimatedTimeRemaining?: number) => {
+        // Scroll Across Entities gives max 10k as total but results can go further than that
+        const hasMoreThanLimit = totalResults === 10000;
+        const total = hasMoreThanLimit ? '10,000+' : totalResults;
+        let description = totalResults
+            ? t('download.progress', { count: currentCount, total })
+            : t('download.creating');
+
+        if (estimatedTimeRemaining !== undefined) {
+            // Show estimate only if the count is less than 10k entities
+            if (!hasMoreThanLimit) {
+                description += t('download.timeRemaining', { time: formatTime(estimatedTimeRemaining) });
+            }
+        }
+
+        notification.info({
+            key: DOWNLOAD_NOTIFICATION_KEY,
+            message: t('download.preparing'),
+            description,
+            placement: 'bottomRight',
+            duration: null,
+            icon: <StyledSpinner $height={24} />,
+        });
+    };
+
+    const closeNotification = () => {
+        setTimeout(() => {
+            notification.destroy();
+        }, 3000);
+    };
+
+    const showFailedDownloadNotification = () => {
+        notification.destroy();
+        notification.error({
+            message: t('download.failed'),
+            description: t('download.failedDescription'),
+            placement: 'bottomRight',
+            duration: 3,
+        });
+    };
+
+    const triggerCsvDownload = (filename) => {
+        setIsDownloadingCsv(true);
+        openNotification();
+
+        let nextScrollId: string | null = null;
+        let accumulatedResults: string[][] = [];
+
+        analytics.event({
+            type: EventType.DownloadAsCsvEvent,
+            query,
+            entityUrn: entitySearchIsEmbeddedWithin?.urn,
+            path: location.pathname,
+        });
+
+        let sizeForDownload = SEARCH_PAGE_SIZE_FOR_DOWNLOAD;
+        let accumulatedTime = 0;
+        let batchesProcessed = 0;
+
+        function fetchNextPage() {
+            const startTime = new Date().getTime();
+            downloadSearchResults({
+                scrollId: nextScrollId,
+                query,
+                count: sizeForDownload,
+                orFilters: filters,
+                viewUrn,
+            })
+                .then((refetchData) => {
+                    const endTime = new Date().getTime();
+                    const batchTime = endTime - startTime;
+                    accumulatedTime += batchTime;
+                    batchesProcessed++;
+
+                    accumulatedResults = [
+                        ...accumulatedResults,
+                        ...transformResultsToCsvRow(refetchData?.searchResults || [], entityRegistry),
+                    ];
+                    // Scroll Across Entities gives max 10k as total but results can go further than that
+                    if (totalResults && batchesProcessed > 0 && totalResults - accumulatedResults.length > 0) {
+                        const averageTimePerBatch = accumulatedTime / batchesProcessed;
+                        const remainingItems = totalResults - accumulatedResults.length;
+                        const remainingBatches = Math.ceil(remainingItems / sizeForDownload);
+                        const estimatedTimeRemaining = (averageTimePerBatch * remainingBatches) / 1000;
+                        openNotification(accumulatedResults.length, estimatedTimeRemaining);
+                    } else {
+                        openNotification(accumulatedResults.length);
+                    }
+                    // If we have a "next offset", then we continue.
+                    // Otherwise, we terminate fetching.
+                    if (refetchData?.nextScrollId) {
+                        nextScrollId = refetchData?.nextScrollId;
+                        fetchNextPage();
+                    } else {
+                        setIsDownloadingCsv(false);
+                        closeNotification();
+                        downloadRowsAsCsv(
+                            getSearchCsvDownloadHeader(refetchData?.searchResults[0]),
+                            accumulatedResults,
+                            filename,
+                        );
+                    }
+                })
+                .catch((_) => {
+                    if (sizeForDownload > 10) {
+                        sizeForDownload = Math.floor(sizeForDownload / 2);
+                        console.log(`Failed to download, retrying with smaller page size of ${sizeForDownload}`);
+                        fetchNextPage();
+                    } else {
+                        setIsDownloadingCsv(false);
+                        showFailedDownloadNotification();
+                    }
+                });
+        }
+        fetchNextPage();
+    };
+
+    return (
+        <Modal
+            centered
+            onCancel={() => setShowDownloadAsCsvModal(false)}
+            title={t('download.title')}
+            open={showDownloadAsCsvModal}
+            buttons={[
+                {
+                    text: tc('close'),
+                    variant: 'text',
+                    onClick: () => setShowDownloadAsCsvModal(false),
+                },
+                {
+                    text: tc('download'),
+                    onClick: () => {
+                        setShowDownloadAsCsvModal(false);
+                        triggerCsvDownload(saveAsTitle);
+                    },
+                    variant: 'filled',
+                    disabled: saveAsTitle.length === 0,
+                    buttonDataTestId: 'csv-modal-download-button',
+                },
+            ]}
+        >
+            {lineageSearchPath === LineageSearchPath.Lightning && (
+                <ImpactAnalysisWarning data-testid="lightning-cache-warning">
+                    <Warning weight="fill" style={{ color: theme.colors.iconWarning, fontSize: 16 }} />
+                    <div>
+                        <Text weight="bold" style={{ lineHeight: 'normal' }}>
+                            {t('download.resultsMayVaryTitle')}
+                        </Text>
+                        <SubText>{t('download.resultsMayVaryText')}</SubText>
+                    </div>
+                </ImpactAnalysisWarning>
+            )}
+            <Input
+                data-testid="download-as-csv-input"
+                placeholder={FILENAME_PLACEHOLDER}
+                value={saveAsTitle}
+                onChange={(e) => {
+                    setSaveAsTitle(e.target.value);
+                }}
+            />
+        </Modal>
+    );
+}

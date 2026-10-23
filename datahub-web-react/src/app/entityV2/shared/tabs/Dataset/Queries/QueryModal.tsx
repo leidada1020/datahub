@@ -1,0 +1,112 @@
+import { Typography } from 'antd';
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { CodeBlock } from '@components/components/CodeBlock';
+import { Editor } from '@components/components/Editor';
+
+import { SQL_LANGUAGE } from '@app/entityV2/shared/tabs/Dataset/Queries/utils/constants';
+import { Modal } from '@src/alchemy-components';
+
+const StyledModal = styled(Modal)`
+    top: 4vh;
+    max-width: 1200px;
+`;
+
+const MODAL_WIDTH = '80vw';
+
+const MODAL_BODY_STYLE = {
+    maxHeight: '84vh',
+    padding: 0,
+    overflow: 'auto',
+};
+
+const QueryDetails = styled.div`
+    padding: 28px 28px 28px 28px;
+`;
+
+const QueryTitle = styled(Typography.Title)<{ secondary?: boolean }>`
+    && {
+        margin-bottom: 16px;
+        color: ${(props) => (props.secondary && props.theme.colors.textSecondary) || undefined};
+    }
+`;
+
+const StyledViewer = styled(Editor)<{ secondary?: boolean }>`
+    .remirror-editor.ProseMirror,
+    .datahub-editor-content {
+        padding: 0;
+        color: ${(props) => (props.secondary && props.theme.colors.textSecondary) || undefined};
+    }
+`;
+
+const QueryContainer = styled.div`
+    min-height: 50vh;
+    max-height: 80vh;
+    overflow-y: scroll;
+    background-color: ${(props) => props.theme.colors.bgSurface};
+    border-radius: 4px;
+`;
+
+const NestedCode = styled(CodeBlock)`
+    height: 100%;
+
+    pre {
+        padding: 12px !important;
+    }
+`;
+
+type Props = {
+    query: string;
+    title?: string;
+    description?: string;
+    onClose: () => void;
+    showDetails?: boolean;
+};
+
+export default function QueryModal({ query, title, description, showDetails = true, onClose }: Props) {
+    const { t } = useTranslation('entity.profile.queries');
+    const { t: tc } = useTranslation('common.actions');
+    return (
+        <StyledModal
+            open
+            width={MODAL_WIDTH}
+            title={t('queryBuilderModal.formLabelQuery')}
+            closable={false}
+            onCancel={() => onClose?.()}
+            bodyStyle={MODAL_BODY_STYLE}
+            dataTestId="query-modal"
+            buttons={[
+                {
+                    text: tc('close'),
+                    onClick: onClose,
+                    variant: 'text',
+                    buttonDataTestId: 'query-modal-close-button',
+                },
+            ]}
+        >
+            <QueryContainer>
+                <NestedCode
+                    data-testid="query-modal-query"
+                    code={query}
+                    language={SQL_LANGUAGE}
+                    variant="embedded"
+                    showHeader={false}
+                    showCopy
+                    showFormat={false}
+                    showLineNumbers
+                    languageLabel={false}
+                />
+            </QueryContainer>
+            {showDetails && (
+                <QueryDetails>
+                    <QueryTitle level={4} secondary={!title}>
+                        {title || t('queryCard.noTitle')}
+                    </QueryTitle>
+                    <StyledViewer readOnly secondary={!title} content={description || t('queryCard.noDescription')} />
+                </QueryDetails>
+            )}
+        </StyledModal>
+    );
+}

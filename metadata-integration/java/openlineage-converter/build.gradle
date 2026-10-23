@@ -1,0 +1,57 @@
+apply plugin: 'java-library'
+apply plugin: 'com.gradleup.shadow'
+apply plugin: 'signing'
+apply plugin: 'maven-publish'
+apply from: '../../../gradle/coverage/java-coverage.gradle'
+apply from: '../versioning.gradle'
+
+// Pin Java 17 bytecode: bundled into the acryl-spark-lineage agent shadow jar, which must run on
+// managed Spark whose default JVM is Java 17 (Amazon EMR 7.x, Databricks Runtime 16-17).
+ext.javaClassVersionOverride = 17
+
+dependencies {
+    implementation project(path: ':entity-registry')
+    implementation project(path: ':metadata-integration:java:datahub-event')
+    implementation project(path: ':metadata-models')
+    implementation project(path: ':metadata-models', configuration: "dataTemplate")
+    compileOnly "io.openlineage:openlineage-java:$openLineageVersion"
+
+    implementation externalDependency.slf4jApi
+    compileOnly externalDependency.lombok
+    annotationProcessor externalDependency.lombok
+
+    implementation externalDependency.json
+
+    testImplementation externalDependency.testng
+    testImplementation "io.openlineage:openlineage-java:$openLineageVersion"
+}
+
+test {
+    forkEvery = 1
+    useJUnit()
+}
+
+test {
+    useJUnit()
+    useTestNG()
+}
+
+shadowJar {
+    zip64 = true
+    archiveClassifier = ''
+    exclude('log4j2.*', 'log4j.*')
+}
+
+jar {
+    archiveClassifier = 'lib'
+}
+
+//task sourcesJar(type: Jar) {
+//    classifier 'sources'
+//    from sourceSets.main.allJava
+//}
+
+//task javadocJar(type: Jar, dependsOn: javadoc) {
+//    classifier 'javadoc'
+//    from javadoc.destinationDir
+//}

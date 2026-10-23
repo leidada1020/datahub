@@ -1,0 +1,141 @@
+import { Popover } from '@components';
+import { AxisBottom } from '@visx/axis';
+import { GlyphCircle } from '@visx/glyph';
+import { GridColumns } from '@visx/grid';
+import { Group } from '@visx/group';
+import { scaleUtc } from '@visx/scale';
+import { LinePath } from '@visx/shape';
+import React, { useMemo } from 'react';
+import { useTheme } from 'styled-components';
+
+import { AssertionResultPopoverContent } from '@app/entityV2/shared/tabs/Dataset/Validations/assertion/profile/shared/result/AssertionResultPopoverContent';
+import {
+    AssertionResultChartData,
+    TimeRange,
+} from '@app/entityV2/shared/tabs/Dataset/Validations/assertion/profile/summary/result/timeline/charts/types';
+import {
+    generateTimeScaleTickValues,
+    getCustomTimeScaleTickValue,
+    getFillColor,
+} from '@app/entityV2/shared/tabs/Dataset/Validations/assertion/profile/summary/result/timeline/charts/utils';
+import { getTimeRangeDisplay } from '@app/entityV2/shared/tabs/Dataset/Validations/assertion/profile/summary/result/timeline/utils';
+import { LinkWrapper } from '@app/sharedV2/LinkWrapper';
+
+type Props = {
+    data: AssertionResultChartData;
+    timeRange: TimeRange;
+    chartDimensions: {
+        width: number;
+        height: number;
+    };
+    renderHeader?: (title?: string) => JSX.Element;
+};
+
+const STROKE_DASHARRAY = '1 4';
+const CHART_HORIZ_MARGIN = 36;
+const CHART_AXIS_BOTTOM_HEIGHT = 40;
+
+/**
+ * Assertion run result status displayed on a horizontal timeline.
+ * TODO(jayacryl) refactor to a pretty timeline line-view
+ */
+export const StatusOverTimeAssertionResultChart = ({ data, timeRange, chartDimensions, renderHeader }: Props) => {
+    const theme = useTheme();
+    const chartInnerHeight = chartDimensions.height - CHART_AXIS_BOTTOM_HEIGHT;
+    const chartInnerWidth = chartDimensions.width - CHART_HORIZ_MARGIN;
+    const ACCENT_COLOR_HEX = theme.colors.text;
+
+    const xScale = useMemo(
+        () =>
+            scaleUtc({
+                domain: [new Date(timeRange.startMs), new Date(timeRange.endMs)],
+                range: [0, chartInnerWidth],
+            }),
+        [timeRange, chartInnerWidth],
+    );
+
+    const timeScaleTicks = generateTimeScaleTickValues(timeRange.startMs, timeRange.endMs);
+    return (
+        <>
+            {renderHeader?.(getTimeRangeDisplay(timeRange))}
+            <svg width={chartDimensions.width} height={chartDimensions.height}>
+                <Group left={CHART_HORIZ_MARGIN / 2}>
+                    {/* Axis */}
+                    <AxisBottom
+                        top={chartInnerHeight}
+                        scale={xScale}
+                        stroke={theme.colors.bgSurface}
+                        tickValues={timeScaleTicks}
+                        tickFormat={(v) => getCustomTimeScaleTickValue(v, timeRange)}
+                        tickStroke={theme.colors.text}
+                        tickLength={4}
+                        tickLabelProps={{
+                            fontSize: 11,
+                            angle: 0,
+                            textAnchor: 'middle',
+                        }}
+                    />
+
+                    {/* Grid */}
+                    <GridColumns
+                        scale={xScale}
+                        tickValues={timeScaleTicks}
+                        height={chartInnerHeight}
+                        lineStyle={{
+                            stroke: theme.colors.border,
+                            strokeLinecap: 'round',
+                            strokeWidth: 1,
+                            strokeDasharray: STROKE_DASHARRAY,
+                        }}
+                    />
+
+                    {/* Line */}
+                    <LinePath
+                        // Full across the entire timeline
+                        data={[0, chartInnerWidth]}
+                        x={(x) => x}
+                        y={chartDimensions.height / 3}
+                        stroke={ACCENT_COLOR_HEX}
+                        strokeWidth={0.5}
+                    />
+
+                    {/* Circular data points */}
+                    {data.dataPoints.map((dataPoint) => {
+                        const xOffset = xScale(new Date(dataPoint.time));
+                        const yOffset = chartDimensions.height / 3;
+                        const fillColor = getFillColor(dataPoint.result.type, theme);
+                        return (
+                            <LinkWrapper key={dataPoint.time} to={dataPoint.result.resultUrl} target="_blank">
+                                <Popover
+                                    key={dataPoint.time}
+                                    title={undefined}
+                                    overlayStyle={{
+                                        maxWidth: 440,
+                                        wordWrap: 'break-word',
+                                    }}
+                                    content={
+                                        <AssertionResultPopoverContent
+                                            assertion={data.context.assertion}
+                                            run={dataPoint.relatedRunEvent}
+                                        />
+                                    }
+                                    showArrow={false}
+                                >
+                                    <GlyphCircle
+                                        left={xOffset}
+                                        top={yOffset}
+                                        fill={fillColor}
+                                        stroke={theme.colors.bg}
+                                        strokeWidth={2}
+                                        size={100}
+                                        filter={`drop-shadow(0px 1px 2.5px ${theme.colors.overlayLight})`}
+                                    />
+                                </Popover>
+                            </LinkWrapper>
+                        );
+                    })}
+                </Group>
+            </svg>
+        </>
+    );
+};

@@ -1,0 +1,28 @@
+import i18next from 'i18next';
+
+import { SortOrder } from '@types';
+
+export const RELEVANCE = 'relevance';
+const ENTITY_NAME_FIELD = '_entityName';
+const LAST_MODIFIED_TIME_FIELD = 'lastModifiedAt';
+
+export function getSortOptions() {
+    return {
+        [RELEVANCE]: { label: i18next.t('search:sort.relevance'), field: RELEVANCE, sortOrder: SortOrder.Descending },
+        [`${ENTITY_NAME_FIELD}_${SortOrder.Ascending}`]: {
+            label: i18next.t('search:sort.nameAtoZ'),
+            field: ENTITY_NAME_FIELD,
+            sortOrder: SortOrder.Ascending,
+        },
+        [`${ENTITY_NAME_FIELD}_${SortOrder.Descending}`]: {
+            label: i18next.t('search:sort.nameZtoA'),
+            field: ENTITY_NAME_FIELD,
+            sortOrder: SortOrder.Descending,
+        },
+        [`${LAST_MODIFIED_TIME_FIELD}_${SortOrder.Descending}`]: {
+            label: i18next.t('search:sort.lastModifiedInSource'),
+            field: LAST_MODIFIED_TIME_FIELD,
+            sortOrder: SortOrder.Descending,
+        },
+    };
+}

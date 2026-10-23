@@ -1,0 +1,73 @@
+namespace com.linkedin.post
+
+import com.linkedin.common.Urn
+import com.linkedin.common.AuditStamp
+
+/**
+ * Information about a DataHub Post.
+ */
+@Aspect = {
+  "name": "postInfo",
+  "schemaVersion": 2
+}
+record PostInfo {
+  /**
+   * Type of the Post.
+   */
+  @Searchable = { }
+  type: PostType
+
+  /**
+   * Content stored in the post.
+   */
+  content: PostContent
+
+  /**
+   * The time at which the post was initially created.
+   * Search V3 does not index this time. The write is systemMetadata.aspectCreated,
+   * copied to _system.created.time.
+   */
+  @deprecated = "Use systemMetadata.aspectCreated instead."
+  @Searchable = {
+    "fieldType": "COUNT",
+    "v3": { "enabled": false }
+  }
+  created: long
+
+  /**
+   * The time at which the post was last modified.
+   * Search V3 does not index this time. The write is systemMetadata.aspectModified,
+   * copied to _system.modified.time.
+   */
+  @deprecated = "Use systemMetadata.aspectModified instead."
+  @Searchable = {
+    "fieldType": "COUNT",
+    "v3": { "enabled": false }
+  }
+  lastModified: long
+
+  /**
+   * Audit stamp for who created the post and when. Updates change lastModified, not this stamp.
+   * Search V3 does not index this stamp. The write is systemMetadata.aspectCreated,
+   * copied to _system.created.time and _system.created.actor.
+   */
+  @deprecated = "Use systemMetadata.aspectCreated instead."
+  @Searchable = {
+    "/time": {
+        "fieldName": "created",
+        "fieldType": "COUNT",
+        "v3": { "enabled": false }
+      }
+  }
+  auditStamp: optional AuditStamp
+
+  /**
+   * Optional Entity URN that the post is associated with.
+   */
+  @Relationship = {
+    "name": "PostTarget",
+    "entityTypes": [ "dataset", "schemaField", "chart", "container", "dashboard", "dataFlow", "dataJob", "dataProduct", "glossaryTerm", "glossaryNode", "mlModel", "mlFeature", "notebook", "mlFeatureTable", "mlPrimaryKey", "mlModelGroup", "domain", "dataProduct" ]
+  }
+  @Searchable = {}
+  target: optional Urn
+}

@@ -1,0 +1,384 @@
+package com.linkedin.datahub.graphql.resolvers.mutate;
+
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+import static org.testng.Assert.*;
+
+import com.datahub.authentication.Actor;
+import com.datahub.authentication.ActorType;
+import com.datahub.authentication.Authentication;
+import com.datahub.authorization.AuthorizationResult;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.linkedin.datahub.graphql.QueryContext;
+import com.linkedin.datahub.graphql.generated.PatchEntityInput;
+import com.linkedin.datahub.graphql.generated.PatchEntityResult;
+import com.linkedin.datahub.graphql.generated.PatchOperationInput;
+import com.linkedin.datahub.graphql.generated.PatchOperationType;
+import com.linkedin.entity.client.EntityClient;
+import com.linkedin.metadata.entity.EntityService;
+import com.linkedin.metadata.entity.IngestResult;
+import com.linkedin.metadata.models.AspectSpec;
+import com.linkedin.metadata.models.registry.EntityRegistry;
+import graphql.schema.DataFetchingEnvironment;
+import io.datahubproject.metadata.context.OperationContext;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import org.testng.annotations.BeforeMethod;
+import org.testng.annotations.Test;
+
+public class PatchEntityResolverTest {
+
+  private EntityService _entityService;
+  private EntityClient _entityClient;
+  private EntityRegistry _entityRegistry;
+  private ObjectMapper _objectMapper;
+  private PatchEntityResolver _resolver;
+  private DataFetchingEnvironment _environment;
+  private QueryContext _context;
+  private Authentication _authentication;
+  private OperationContext _operationContext;
+
+  @BeforeMethod
+  public void setup() {
+    _entityService = mock(EntityService.class);
+    _entityClient = mock(EntityClient.class);
+    _entityRegistry = mock(EntityRegistry.class);
+    _objectMapper = new ObjectMapper();
+    _resolver = new PatchEntityResolver(_entityService, _entityClient, _entityRegistry);
+
+    _environment = mock(DataFetchingEnvironment.class);
+    _context = mock(QueryContext.class);
+    _authentication = mock(Authentication.class);
+    _operationContext = mock(OperationContext.class);
+
+    when(_environment.getContext()).thenReturn(_context);
+    when(_context.getAuthentication()).thenReturn(_authentication);
+    when(_context.getOperationContext()).thenReturn(_operationContext);
+    when(_operationContext.getObjectMapper()).thenReturn(_objectMapper);
+    when(_authentication.getActor()).thenReturn(new Actor(ActorType.USER, "test-user"));
+    // Existing tests authorize an update of an entity that is already there.
+    when(_entityService.exists(any(), any(com.linkedin.common.urn.Urn.class), eq(true)))
+        .thenReturn(true);
+  }
+
+  @Test
+  public void testPatchEntitySuccess() throws Exception {
+    // Arrange
+    PatchEntityInput input = new PatchEntityInput();
+    input.setUrn("urn:li:glossaryTerm:test-term");
+    input.setAspectName("glossaryTermInfo");
+    input.setPatch(
+        List.of(createPatchOperation(PatchOperationType.REPLACE, "/name", "\"Updated Name\"")));
+
+    when(_environment.getArgument("input")).thenReturn(input);
+
+    IngestResult mockResult = mock(IngestResult.class);
+    when(_entityService.ingestProposal(any(), any(), any(), eq(false))).thenReturn(mockResult);
+
+    // Mock entity registry
+    com.linkedin.metadata.models.EntitySpec mockEntitySpec =
+        mock(com.linkedin.metadata.models.EntitySpec.class);
+    AspectSpec mockAspectSpec = mock(AspectSpec.class);
+    when(_entityRegistry.getEntitySpec("glossaryTerm")).thenReturn(mockEntitySpec);
+    when(mockEntitySpec.getAspectSpec("glossaryTermInfo")).thenReturn(mockAspectSpec);
+
+    // Mock authorization result
+    AuthorizationResult mockAuthResult = mock(AuthorizationResult.class);
+    when(mockAuthResult.getType()).thenReturn(AuthorizationResult.Type.ALLOW);
+    when(_operationContext.authorize(any(), any(), any())).thenReturn(mockAuthResult);
+
+    // Act
+    CompletableFuture<PatchEntityResult> future = _resolver.get(_environment);
+    PatchEntityResult result = future.get();
+
+    // Debug output
+    System.out.println("Result: " + result);
+    System.out.println("Success: " + result.getSuccess());
+    System.out.println("Error: " + result.getError());
+    System.out.println("Input URN: " + input.getUrn());
+    System.out.println("Input aspectName: " + input.getAspectName());
+
+    // Assert
+    assertNotNull(result);
+    assertEquals(result.getUrn(), "urn:li:glossaryTerm:test-term");
+    assertTrue(
+        result.getSuccess(),
+        "Expected success=true but got success="
+            + result.getSuccess()
+            + ", error="
+            + result.getError());
+    assertNull(result.getError());
+  }
+
+  @Test
+  public void testPatchEntityFailure() throws Exception {
+    // Arrange
+    PatchEntityInput input = new PatchEntityInput();
+    input.setUrn("urn:li:glossaryTerm:test-term");
+    input.setAspectName("glossaryTermInfo");
+    input.setPatch(
+        List.of(createPatchOperation(PatchOperationType.REPLACE, "/name", "\"Updated Name\"")));
+
+    when(_environment.getArgument("input")).thenReturn(input);
+
+    when(_entityService.ingestProposal(any(), any(), any(), eq(false))).thenReturn(null);
+
+    // Mock entity registry
+    com.linkedin.metadata.models.EntitySpec mockEntitySpec =
+        mock(com.linkedin.metadata.models.EntitySpec.class);
+    AspectSpec mockAspectSpec = mock(AspectSpec.class);
+    when(_entityRegistry.getEntitySpec("glossaryTerm")).thenReturn(mockEntitySpec);
+    when(mockEntitySpec.getAspectSpec("glossaryTermInfo")).thenReturn(mockAspectSpec);
+
+    // Mock authorization result
+    AuthorizationResult mockAuthResult = mock(AuthorizationResult.class);
+    when(mockAuthResult.getType()).thenReturn(AuthorizationResult.Type.ALLOW);
+    when(_operationContext.authorize(any(), any(), any())).thenReturn(mockAuthResult);
+
+    // Act
+    CompletableFuture<PatchEntityResult> future = _resolver.get(_environment);
+    PatchEntityResult result = future.get();
+
+    // Assert
+    assertNotNull(result);
+    assertEquals(result.getUrn(), "urn:li:glossaryTerm:test-term");
+    assertFalse(result.getSuccess());
+    assertNotNull(result.getError());
+  }
+
+  /**
+   * The resource type used for authorization must come from the URN. A client claiming a different
+   * entityType must be rejected even when the authorizer would allow the write.
+   */
+  @Test
+  public void testPatchDeniedWhenClientEntityTypeDisagreesWithUrn() throws Exception {
+    PatchEntityInput input = new PatchEntityInput();
+    input.setUrn("urn:li:glossaryTerm:test-term");
+    input.setEntityType("dataset");
+    input.setAspectName("glossaryTermInfo");
+    input.setPatch(
+        List.of(createPatchOperation(PatchOperationType.REPLACE, "/name", "\"Updated Name\"")));
+    when(_environment.getArgument("input")).thenReturn(input);
+    allowAll();
+
+    PatchEntityResult result = _resolver.get(_environment).get();
+
+    assertFalse(result.getSuccess());
+    assertNotNull(result.getError());
+    assertTrue(result.getError().contains("unauthorized"));
+    verify(_entityService, never()).ingestProposal(any(), any(), any(), eq(false));
+  }
+
+  @Test
+  public void testPatchDeniedWhenUrnIsUnparseable() throws Exception {
+    PatchEntityInput input = new PatchEntityInput();
+    input.setUrn("not-a-urn");
+    input.setAspectName("glossaryTermInfo");
+    input.setPatch(
+        List.of(createPatchOperation(PatchOperationType.REPLACE, "/name", "\"Updated Name\"")));
+    when(_environment.getArgument("input")).thenReturn(input);
+    allowAll();
+
+    PatchEntityResult result = _resolver.get(_environment).get();
+
+    assertFalse(result.getSuccess());
+    verify(_entityService, never()).ingestProposal(any(), any(), any(), eq(false));
+  }
+
+  /** The type's own management privilege is enough, matching the dedicated policy mutations. */
+  @Test
+  public void testPatchPolicyAllowedWithManagePoliciesOnly() throws Exception {
+    PatchEntityInput input = createPolicyInput();
+    when(_environment.getArgument("input")).thenReturn(input);
+    setupRegistryMock("dataHubPolicy", "dataHubPolicyInfo");
+    grantOnly(Set.of("MANAGE_POLICIES"));
+    when(_entityService.ingestProposal(any(), any(), any(), eq(false)))
+        .thenReturn(mock(IngestResult.class));
+
+    PatchEntityResult result = _resolver.get(_environment).get();
+
+    assertTrue(result.getSuccess(), "error=" + result.getError());
+  }
+
+  /** Edit Entity on the target remains sufficient for every entity type, policies included. */
+  @Test
+  public void testPatchPolicyAllowedWithEditEntityOnly() throws Exception {
+    PatchEntityInput input = createPolicyInput();
+    when(_environment.getArgument("input")).thenReturn(input);
+    setupRegistryMock("dataHubPolicy", "dataHubPolicyInfo");
+    grantOnly(Set.of("EDIT_ENTITY"));
+    when(_entityService.ingestProposal(any(), any(), any(), eq(false)))
+        .thenReturn(mock(IngestResult.class));
+
+    PatchEntityResult result = _resolver.get(_environment).get();
+
+    assertTrue(result.getSuccess(), "error=" + result.getError());
+  }
+
+  /** Creating an entity that does not exist is authorized as CREATE, not UPDATE. */
+  @Test
+  public void testPatchMissingEntityAllowedWithCreatePrivilege() throws Exception {
+    PatchEntityInput input = new PatchEntityInput();
+    input.setUrn("urn:li:glossaryTerm:new-term");
+    input.setAspectName("glossaryTermInfo");
+    input.setPatch(List.of(createPatchOperation(PatchOperationType.ADD, "/name", "\"New Term\"")));
+    when(_environment.getArgument("input")).thenReturn(input);
+    setupRegistryMock("glossaryTerm", "glossaryTermInfo");
+    when(_entityService.exists(any(), any(com.linkedin.common.urn.Urn.class), eq(true)))
+        .thenReturn(false);
+    grantOnly(Set.of("CREATE_ENTITY"));
+    when(_entityService.ingestProposal(any(), any(), any(), eq(false)))
+        .thenReturn(mock(IngestResult.class));
+
+    PatchEntityResult result = _resolver.get(_environment).get();
+
+    assertTrue(result.getSuccess(), "error=" + result.getError());
+  }
+
+  /** Create Entity is not an update privilege, so it cannot patch an entity that already exists. */
+  @Test
+  public void testPatchExistingEntityDeniedWithCreatePrivilegeOnly() throws Exception {
+    PatchEntityInput input = new PatchEntityInput();
+    input.setUrn("urn:li:glossaryTerm:existing-term");
+    input.setAspectName("glossaryTermInfo");
+    input.setPatch(
+        List.of(createPatchOperation(PatchOperationType.REPLACE, "/name", "\"Updated\"")));
+    when(_environment.getArgument("input")).thenReturn(input);
+    when(_entityService.exists(any(), any(com.linkedin.common.urn.Urn.class), eq(true)))
+        .thenReturn(true);
+    grantOnly(Set.of("CREATE_ENTITY"));
+
+    PatchEntityResult result = _resolver.get(_environment).get();
+
+    assertFalse(result.getSuccess());
+    verify(_entityService, never()).ingestProposal(any(), any(), any(), eq(false));
+  }
+
+  /**
+   * A failed existence lookup is not a missing URN. CREATE_ENTITY must not be allowed to patch
+   * while the store cannot say whether the entity is already there.
+   */
+  @Test
+  public void testPatchDeniedWhenExistenceCheckFails() throws Exception {
+    PatchEntityInput input = new PatchEntityInput();
+    input.setUrn("urn:li:glossaryTerm:existing-term");
+    input.setAspectName("glossaryTermInfo");
+    input.setPatch(
+        List.of(createPatchOperation(PatchOperationType.REPLACE, "/name", "\"Updated\"")));
+    when(_environment.getArgument("input")).thenReturn(input);
+    when(_entityService.exists(any(), any(com.linkedin.common.urn.Urn.class), eq(true)))
+        .thenThrow(new RuntimeException("metadata store unavailable"));
+    grantOnly(Set.of("CREATE_ENTITY"));
+
+    PatchEntityResult result = _resolver.get(_environment).get();
+
+    assertFalse(result.getSuccess());
+    verify(_entityService, never()).ingestProposal(any(), any(), any(), eq(false));
+  }
+
+  /**
+   * Update Users and Groups is an update-only privilege. It cannot create a user that does not
+   * exist.
+   */
+  @Test
+  public void testPatchMissingUserDeniedWithUpdateOnlyPrivilege() throws Exception {
+    PatchEntityInput input = new PatchEntityInput();
+    input.setUrn("urn:li:corpuser:new-user");
+    input.setAspectName("corpUserInfo");
+    input.setPatch(
+        List.of(createPatchOperation(PatchOperationType.ADD, "/displayName", "\"New\"")));
+    when(_environment.getArgument("input")).thenReturn(input);
+    when(_entityService.exists(any(), any(com.linkedin.common.urn.Urn.class), eq(true)))
+        .thenReturn(false);
+    grantOnly(Set.of("UPDATE_USERS_AND_GROUPS"));
+
+    PatchEntityResult result = _resolver.get(_environment).get();
+
+    assertFalse(result.getSuccess());
+    verify(_entityService, never()).ingestProposal(any(), any(), any(), eq(false));
+  }
+
+  @Test
+  public void testPatchExistingUserAllowedWithUpdateOnlyPrivilege() throws Exception {
+    PatchEntityInput input = new PatchEntityInput();
+    input.setUrn("urn:li:corpuser:existing-user");
+    input.setAspectName("corpUserInfo");
+    input.setPatch(
+        List.of(createPatchOperation(PatchOperationType.REPLACE, "/displayName", "\"Updated\"")));
+    when(_environment.getArgument("input")).thenReturn(input);
+    setupRegistryMock("corpuser", "corpUserInfo");
+    when(_entityService.exists(any(), any(com.linkedin.common.urn.Urn.class), eq(true)))
+        .thenReturn(true);
+    grantOnly(Set.of("UPDATE_USERS_AND_GROUPS"));
+    when(_entityService.ingestProposal(any(), any(), any(), eq(false)))
+        .thenReturn(mock(IngestResult.class));
+
+    PatchEntityResult result = _resolver.get(_environment).get();
+
+    assertTrue(result.getSuccess(), "error=" + result.getError());
+  }
+
+  @Test
+  public void testPatchPolicyDeniedWithUnrelatedPrivilege() throws Exception {
+    PatchEntityInput input = createPolicyInput();
+    when(_environment.getArgument("input")).thenReturn(input);
+    setupRegistryMock("dataHubPolicy", "dataHubPolicyInfo");
+    grantOnly(Set.of("VIEW_ENTITY_PAGE"));
+
+    PatchEntityResult result = _resolver.get(_environment).get();
+
+    assertFalse(result.getSuccess());
+    verify(_entityService, never()).ingestProposal(any(), any(), any(), eq(false));
+  }
+
+  private PatchEntityInput createPolicyInput() {
+    PatchEntityInput input = new PatchEntityInput();
+    input.setUrn("urn:li:dataHubPolicy:test-policy");
+    input.setAspectName("dataHubPolicyInfo");
+    input.setPatch(
+        List.of(createPatchOperation(PatchOperationType.REPLACE, "/description", "\"Updated\"")));
+    return input;
+  }
+
+  private void setupRegistryMock(String entityName, String aspectName) {
+    com.linkedin.metadata.models.EntitySpec mockEntitySpec =
+        mock(com.linkedin.metadata.models.EntitySpec.class);
+    when(_entityRegistry.getEntitySpec(entityName)).thenReturn(mockEntitySpec);
+    when(mockEntitySpec.getAspectSpec(aspectName)).thenReturn(mock(AspectSpec.class));
+  }
+
+  /** Answers ALLOW only for the named privileges, DENY for everything else. */
+  private void grantOnly(Set<String> privileges) {
+    when(_operationContext.authorize(any(), any(), any()))
+        .thenAnswer(
+            invocation -> {
+              Object privilege = invocation.getArgument(0);
+              return new AuthorizationResult(
+                  null,
+                  privileges.contains(String.valueOf(privilege))
+                      ? AuthorizationResult.Type.ALLOW
+                      : AuthorizationResult.Type.DENY,
+                  "");
+            });
+  }
+
+  private void allowAll() {
+    AuthorizationResult allow = mock(AuthorizationResult.class);
+    when(allow.getType()).thenReturn(AuthorizationResult.Type.ALLOW);
+    when(_operationContext.authorize(any(), any(), any())).thenReturn(allow);
+  }
+
+  private PatchOperationInput createPatchOperation(
+      PatchOperationType op, String path, String value) {
+    PatchOperationInput operation = new PatchOperationInput();
+    operation.setOp(op);
+    operation.setPath(path);
+    operation.setValue(value);
+    return operation;
+  }
+}

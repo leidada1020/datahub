@@ -1,0 +1,123 @@
+import { SealCheck } from '@phosphor-icons/react/dist/csr/SealCheck';
+import { Warning } from '@phosphor-icons/react/dist/csr/Warning';
+import { WarningCircle } from '@phosphor-icons/react/dist/csr/WarningCircle';
+import { Typography } from 'antd';
+import i18next from 'i18next';
+import React from 'react';
+import { Link } from 'react-router-dom';
+import styled from 'styled-components';
+
+import { EntityTabPath } from '@app/entityV2/shared/constants';
+import { useEmbeddedProfileLinkProps } from '@app/sharedV2/useEmbeddedProfileLinkProps';
+
+import { Health, HealthStatus, HealthStatusType } from '@types';
+
+const Content = styled.div`
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 180px;
+
+    color: ${(props) => props.theme.colors.text};
+    font-size: 16px;
+`;
+
+const Message = styled(Typography.Text)`
+    font-size: 12px;
+    margin: 5px;
+    line-height: 12px;
+    font-weight: 400;
+    text-align: center;
+    display: flex;
+`;
+
+const StyledLink = styled(Link)`
+    display: flex;
+    align-items: center;
+    gap: 3px;
+
+    border-radius: 14px;
+
+    :hover {
+        background-color: ${(props) => props.theme.colors.bgHover};
+
+        ${Message} {
+            text-decoration: underline;
+        }
+    }
+`;
+
+const Icon = styled.div`
+    height: 28px;
+    width: 28px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    border-radius: 50%;
+    padding: 5px;
+    background: ${(props) => props.theme.colors.bgSurface};
+    border: 1px solid ${(props) => props.theme.colors.border};
+    color: ${(props) => props.theme.colors.textSecondary};
+`;
+
+interface Props {
+    health: Health[];
+    baseUrl: string;
+}
+
+export default function HealthPopover({ health, baseUrl }: Props) {
+    const linkProps = useEmbeddedProfileLinkProps();
+    return (
+        <Content data-testid="assertions-details">
+            {health.map((item) => (
+                <StyledLink key={item.type} to={`${baseUrl}${healthUrlSuffix(item)}`} {...linkProps}>
+                    <Icon>{healthIcon(item)}</Icon>
+                    <Message>{healthMessage(item)}</Message>
+                </StyledLink>
+            ))}
+        </Content>
+    );
+}
+
+function healthIcon({ type }: Health) {
+    switch (type) {
+        case HealthStatusType.Incidents:
+            return <Warning size="1em" />;
+        case HealthStatusType.Assertions:
+            return <WarningCircle size="1em" />;
+        case HealthStatusType.Tests:
+            return <SealCheck size="1em" />;
+        default:
+            return null;
+    }
+}
+
+export function healthUrlSuffix({ type }: Pick<Health, 'type'>) {
+    switch (type) {
+        case HealthStatusType.Incidents:
+            return `/${EntityTabPath.INCIDENTS}`;
+        case HealthStatusType.Assertions:
+            return `/${EntityTabPath.QUALITY}/List`;
+        case HealthStatusType.Tests:
+            return `/${EntityTabPath.GOVERNANCE}/Tests`;
+        default:
+            return null;
+    }
+}
+
+function healthMessage({ message, status, type }: Health) {
+    if (message) return message;
+    if (status === HealthStatus.Pass) {
+        switch (type) {
+            case HealthStatusType.Assertions:
+                return i18next.t('entity.preview:health.assertionsPassing');
+            case HealthStatusType.Incidents:
+                return i18next.t('entity.preview:health.noActiveIncidents');
+            case HealthStatusType.Tests:
+                return i18next.t('entity.preview:health.noFailingGovernanceTests');
+            default:
+                return null;
+        }
+    }
+    return null;
+}

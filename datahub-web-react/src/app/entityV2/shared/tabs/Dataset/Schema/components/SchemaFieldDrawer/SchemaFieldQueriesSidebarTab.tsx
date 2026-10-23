@@ -1,0 +1,200 @@
+import { Button, Typography } from 'antd';
+import React, { useEffect } from 'react';
+import { Trans, useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { useBaseEntity, useRouteToTab } from '@app/entity/shared/EntityContext';
+import { EntityTabPath } from '@app/entityV2/shared/constants';
+import Query from '@app/entityV2/shared/tabs/Dataset/Queries/Query';
+import { QueryCreatedBy } from '@app/entityV2/shared/tabs/Dataset/Queries/queryColumns';
+import { usePopularQueries } from '@app/entityV2/shared/tabs/Dataset/Queries/usePopularQueries';
+import { generateSchemaFieldUrn } from '@app/entityV2/shared/tabs/Lineage/utils';
+import Loading from '@app/sharedV2/Loading';
+import { useIsSeparateSiblingsMode } from '@src/app/entity/shared/siblingUtils';
+import dayjs from '@utils/dayjs';
+
+import { GetDatasetQuery } from '@graphql/dataset.generated';
+
+import NoStatsAvailble from '@images/no-stats-available.svg?react';
+
+interface Props {
+    properties: {
+        fieldPath: string;
+    };
+}
+
+const StyledCreatedBy = styled.div`
+    margin-top: -2.5px;
+    margin-left: 4px;
+    margin-right: 4px;
+`;
+
+const StyledQueryContainer = styled.div`
+    margin-top: 10px;
+    display: flex;
+    flex-direction: column;
+    max-width: 100%;
+`;
+
+const StyledQueryCard = styled.div`
+    background: ${(props) => props.theme.colors.bgHover};
+    border-radius: 4px;
+    margin-bottom: 10px;
+    margin-left: 10px;
+    margin-right: 10px;
+    border: 1px solid ${(props) => props.theme.colors.border};
+    border-radius: 4px;
+    box-shadow: ${(props) => props.theme.colors.shadowMd};
+`;
+
+const QuerySubtitleContainer = styled.div`
+    align-items: center;
+    padding: 10px;
+    display: flex;
+    flex-direction: row;
+    justify-content: space-between;
+`;
+
+const SubtitleSection = styled.div`
+    display: flex;
+    flex-direction: row;
+`;
+
+const QUERIES_TO_SHOW = 6;
+
+const SeeAllButton = styled(Button)`
+    margin-top: 10px;
+    margin-left: 10px;
+    margin-right: 10px;
+    margin-bottom: 50px;
+    width: 170px;
+`;
+
+const QueriesTabContainer = styled.div`
+    display: flex;
+    flex-direction: column;
+    max-width: 485px;
+    text-align: center;
+    align-items: center;
+    margin: auto;
+`;
+
+const NoDataContainer = styled.div`
+    margin: 40px auto;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+`;
+
+const NoStatsIcon = styled(NoStatsAvailble)`
+    width: 80px;
+    height: 80px;
+    margin-bottom: 6px;
+    color: ${(props) => props.theme.colors.bg};
+`;
+
+const Section = styled.div`
+    color: ${(props) => props.theme.colors.textSecondary};
+    font-weight: 700;
+    font-size: 12px;
+    line-height: 24px;
+`;
+
+const QueriesTitle = styled(Typography.Text)`
+    && {
+        margin: 0px;
+        font-size: 16px;
+        font-weight: 700;
+        align-self: flex-start;
+        margin: 10px 0 0 10px;
+    }
+`;
+
+export default function SchemaFieldQueriesSidebarTab({ properties: { fieldPath } }: Props) {
+    const { t } = useTranslation('entity.profile.schema');
+    const isSeparateSiblings = useIsSeparateSiblingsMode();
+    const baseEntity = useBaseEntity<GetDatasetQuery>();
+    const urn = (baseEntity && baseEntity.dataset && baseEntity.dataset?.urn) || '';
+    const siblingUrn = isSeparateSiblings
+        ? undefined
+        : baseEntity?.dataset?.siblingsSearch?.searchResults?.[0]?.entity?.urn;
+    const schemaFieldUrn = generateSchemaFieldUrn(fieldPath, urn) || '';
+    const siblingSchemaFieldUrn =
+        !isSeparateSiblings && siblingUrn ? generateSchemaFieldUrn(fieldPath, siblingUrn) || '' : '';
+    const canViewQueries = baseEntity?.dataset?.privileges?.canViewQueries ?? false;
+
+    const { popularQueries, loading, total, selectedColumnsFilter, setSelectedColumnsFilter } = usePopularQueries({
+        entityUrn: urn,
+        siblingUrn,
+        filterText: '',
+        defaultSelectedColumns: [schemaFieldUrn || '', siblingSchemaFieldUrn],
+        canViewQueries,
+    });
+
+    useEffect(() => {
+        setSelectedColumnsFilter({ ...selectedColumnsFilter, values: [schemaFieldUrn, siblingSchemaFieldUrn] });
+        // disable next line because we ONLY want this to run when schemaFieldUrn or siblingSchemaFieldUrn changes
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [schemaFieldUrn, siblingSchemaFieldUrn]);
+
+    const routeToTab = useRouteToTab();
+
+    const firstQueries = popularQueries.slice(0, QUERIES_TO_SHOW);
+
+    const hasMore = total > firstQueries.length;
+
+    const hasNoQueries = popularQueries.length === 0;
+
+    return (
+        <QueriesTabContainer>
+            {!loading && hasNoQueries && (
+                <NoDataContainer>
+                    <NoStatsIcon />
+                    <Section>{t('queriesSidebarTab.noQueriesFound')}</Section>
+                </NoDataContainer>
+            )}
+            {loading && <Loading />}
+            {!loading && firstQueries.length > 0 && <QueriesTitle>{t('queriesSidebarTab.sectionTitle')}</QueriesTitle>}
+
+            {firstQueries.length > 0 &&
+                firstQueries.map((query, idx) => (
+                    <StyledQueryContainer>
+                        <StyledQueryCard>
+                            <Query query={query.query} index={idx} isCompact showDetails={false} showHeader={false} />
+                            <QuerySubtitleContainer>
+                                <SubtitleSection>
+                                    <Trans
+                                        t={t}
+                                        i18nKey="queriesSidebarTab.lastRunBy"
+                                        values={{
+                                            name: query.createdBy?.username,
+                                            date: dayjs(query.lastRun).format('MM/DD/YYYY'),
+                                        }}
+                                        components={{
+                                            1: (
+                                                <StyledCreatedBy>
+                                                    {query.createdBy && <QueryCreatedBy createdBy={query.createdBy} />}
+                                                </StyledCreatedBy>
+                                            ),
+                                        }}
+                                    />
+                                </SubtitleSection>
+                            </QuerySubtitleContainer>
+                        </StyledQueryCard>
+                    </StyledQueryContainer>
+                ))}
+            {hasMore && !loading && (
+                <SeeAllButton
+                    onClick={() => {
+                        routeToTab({
+                            tabName: EntityTabPath.QUERIES,
+                            tabParams: { column: schemaFieldUrn, siblingColumn: siblingSchemaFieldUrn },
+                        });
+                    }}
+                >
+                    {t('queriesSidebarTab.seeAllQueries')}
+                </SeeAllButton>
+            )}
+        </QueriesTabContainer>
+    );
+}

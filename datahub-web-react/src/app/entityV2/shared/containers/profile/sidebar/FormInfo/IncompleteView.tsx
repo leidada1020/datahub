@@ -1,0 +1,103 @@
+import React, { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import styled, { useTheme } from 'styled-components';
+
+import OptionalPromptsRemaining from '@app/entity/shared/containers/profile/sidebar/FormInfo/OptionalPromptsRemaining';
+import RequiredPromptsRemaining from '@app/entity/shared/containers/profile/sidebar/FormInfo/RequiredPromptsRemaining';
+import {
+    CTAWrapper,
+    Content,
+    FlexWrapper,
+    StyledArrow,
+    StyledBookIcon,
+    StyledButtonWrapper,
+    StyledImgIcon,
+    Title,
+    TitleWrapper,
+} from '@app/entityV2/shared/containers/profile/sidebar/FormInfo/components';
+import { Button } from '@src/alchemy-components';
+
+import ShieldExclamation from '@images/shield-exclamation.svg';
+
+const Text = styled.div`
+    text-wrap: wrap;
+`;
+
+interface Props {
+    showVerificationStyles: boolean;
+    numOptionalPromptsRemaining: number;
+    numRequiredPromptsRemaining: number;
+    isUserAssigned: boolean;
+    openFormModal?: () => void;
+}
+
+export default function IncompleteView({
+    showVerificationStyles,
+    numOptionalPromptsRemaining,
+    numRequiredPromptsRemaining,
+    isUserAssigned,
+    openFormModal,
+}: Props) {
+    const { t } = useTranslation('entity.shared.containers');
+    const themeConfig = useTheme();
+    const [isOpen, setIsOpen] = useState(false);
+
+    return (
+        <CTAWrapper
+            backgroundColor={themeConfig.colors.bgSurfaceWarning}
+            borderColor={themeConfig.colors.borderWarning}
+        >
+            <FlexWrapper>
+                <Content>
+                    <TitleWrapper
+                        isOpen={isOpen}
+                        isUserAssigned={isUserAssigned}
+                        onClick={() => isUserAssigned && setIsOpen(!isOpen)}
+                        data-testid={
+                            showVerificationStyles ? 'incomplete-verification-title' : 'incomplete-documentation-title'
+                        }
+                    >
+                        <Title>
+                            {isUserAssigned && (
+                                <>
+                                    {showVerificationStyles ? (
+                                        <StyledImgIcon src={ShieldExclamation} />
+                                    ) : (
+                                        <StyledBookIcon color={themeConfig.colors.iconWarning} $addLineHeight />
+                                    )}
+                                </>
+                            )}
+                            {!isUserAssigned && <StyledImgIcon src={ShieldExclamation} disable />}
+                            {showVerificationStyles
+                                ? t('sidebar.formInfo.awaitingVerificationTitle')
+                                : t('sidebar.formInfo.awaitingDocumentationTitle')}
+                        </Title>
+                        {isUserAssigned && <StyledArrow $isOpen={isOpen} />}
+                    </TitleWrapper>
+                    {isUserAssigned && isOpen && (
+                        <>
+                            <Text>{t('sidebar.formInfo.assignedBodyText')}</Text>
+                            <RequiredPromptsRemaining numRemaining={numRequiredPromptsRemaining} />
+                            <OptionalPromptsRemaining numRemaining={numOptionalPromptsRemaining} />
+                        </>
+                    )}
+                </Content>
+            </FlexWrapper>
+            {!!openFormModal && isUserAssigned && isOpen && (
+                <StyledButtonWrapper>
+                    <Button
+                        variant="outline"
+                        onClick={openFormModal}
+                        data-testid={
+                            showVerificationStyles ? 'complete-verification-button' : 'complete-documentation-button'
+                        }
+                    >
+                        {showVerificationStyles
+                            ? t('sidebar.formInfo.completeVerificationButton')
+                            : t('sidebar.formInfo.completeDocumentationButton')}
+                    </Button>
+                </StyledButtonWrapper>
+            )}
+        </CTAWrapper>
+    );
+}

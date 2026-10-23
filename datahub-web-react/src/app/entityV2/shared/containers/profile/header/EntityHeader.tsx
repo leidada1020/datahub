@@ -1,0 +1,90 @@
+import React from 'react';
+import styled from 'styled-components/macro';
+
+import { useUserContext } from '@app/context/useUserContext';
+import { useEntityData, useRefetch } from '@app/entity/shared/EntityContext';
+import { EntitySubHeaderSection, GenericEntityProperties } from '@app/entity/shared/types';
+import { EntityMenuItems } from '@app/entityV2/shared/EntityDropdown/EntityMenuActions';
+import { DefaultEntityHeader } from '@app/entityV2/shared/containers/profile/header/DefaultEntityHeader';
+import { EntityActionItem } from '@app/entityV2/shared/entity/EntityActions';
+import { withLogicalModelHeaderItems } from '@app/entityV2/shared/logicalModels/logicalModels.utils';
+import { useAppConfig } from '@app/useAppConfig';
+import { useEntityRegistry } from '@app/useEntityRegistry';
+
+import { DisplayProperties, EntityType, PlatformPrivileges } from '@types';
+
+const Container = styled.div``;
+
+export function getCanEditEntityProperties(
+    entityType: EntityType,
+    entityData: GenericEntityProperties | null,
+    privileges?: PlatformPrivileges,
+) {
+    switch (entityType) {
+        case EntityType.GlossaryTerm:
+        case EntityType.GlossaryNode:
+            return privileges?.manageGlossaries || !!entityData?.privileges?.canManageEntity;
+        case EntityType.Domain:
+            return privileges?.manageDomains;
+        case EntityType.DataProduct:
+            return true; // TODO: add permissions for data products
+        default:
+            return false;
+    }
+}
+
+type Props = {
+    headerDropdownItems?: Set<EntityMenuItems>;
+    headerActionItems?: Set<EntityActionItem>;
+    isNameEditable?: boolean;
+    isIconEditable?: boolean;
+    isColorEditable?: boolean;
+    displayProperties?: DisplayProperties;
+    subHeader?: EntitySubHeaderSection;
+};
+
+export const EntityHeader = ({
+    headerDropdownItems,
+    headerActionItems,
+    isNameEditable,
+    isIconEditable,
+    isColorEditable,
+    displayProperties,
+    subHeader,
+}: Props) => {
+    const { urn, entityType, entityData, loading } = useEntityData();
+    const refetch = useRefetch();
+    const me = useUserContext();
+    const entityRegistry = useEntityRegistry();
+    const { config } = useAppConfig();
+
+    const entityUrl = entityRegistry.getEntityUrl(entityType, urn);
+    const canEdit = getCanEditEntityProperties(entityType, entityData, me?.platformPrivileges as PlatformPrivileges);
+    // Logical models (logical-platform datasets) get a Delete action; regular datasets are unaffected.
+    const effectiveDropdownItems = withLogicalModelHeaderItems(
+        entityType,
+        entityData,
+        headerDropdownItems,
+        config.featureFlags.logicalModelsEnabled,
+    );
+
+    return (
+        <Container data-testid="entity-header-test-id">
+            <DefaultEntityHeader
+                entityType={entityType}
+                urn={urn}
+                entityUrl={entityUrl}
+                loading={loading}
+                entityData={entityData}
+                refetch={refetch}
+                showEditName={isNameEditable && canEdit}
+                isColorEditable={isColorEditable && canEdit}
+                isIconEditable={isIconEditable && canEdit}
+                displayProperties={displayProperties}
+                headerActionItems={headerActionItems}
+                headerDropdownItems={effectiveDropdownItems}
+                subHeader={subHeader}
+            />
+        </Container>
+    );
+};

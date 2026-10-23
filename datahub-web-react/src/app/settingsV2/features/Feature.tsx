@@ -1,0 +1,209 @@
+import { Button, Pill, StructuredPopover, Switch } from '@components';
+import { ArrowRight } from '@phosphor-icons/react/dist/csr/ArrowRight';
+import { Card, Divider } from 'antd';
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+const StyledCard = styled(Card)`
+    && {
+        border-radius: 12px;
+        border: 1px solid ${(props) => props.theme.colors.border};
+        box-shadow: ${(props) => props.theme.colors.shadowXs};
+        margin-bottom: 24px;
+
+        .ant-card-body {
+            padding: 16px;
+        }
+    }
+`;
+
+const Title = styled.div`
+    font-size: 16px;
+    font-weight: 700;
+    color: ${(props) => props.theme.colors.textSecondary};
+    display: flex;
+    align-items: center;
+    gap: 8px;
+`;
+
+const TitleDescriptionText = styled.div`
+    font-size: 14px;
+    color: ${(props) => props.theme.colors.textSecondary};
+`;
+
+const SettingTitle = styled.div`
+    display: flex;
+    align-items: start;
+    font-size: 14px;
+    flex-direction: column;
+    margin-bottom: 24px;
+`;
+
+const FeatureRow = styled.div`
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+`;
+
+const FeatureOptionRow = styled.div`
+    display: flex;
+    justify-content: space-between;
+
+    &:not(:last-child) {
+        margin-bottom: 8px;
+    }
+`;
+
+const StyledDivider = styled(Divider)`
+    color: ${(props) => props.theme.colors.border};
+`;
+
+const SettingsOptionRow = styled.div`
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0 16px;
+
+    &:not(:last-child) {
+        margin-bottom: 8px;
+    }
+`;
+
+const DescriptionText = styled.div`
+    color: ${(props) => props.theme.colors.textSecondary};
+    font-size: 12px;
+`;
+
+const OptionTitle = styled.div`
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 14px;
+    color: ${(props) => props.theme.colors.textSecondary};
+    font-weight: 600;
+`;
+
+export interface FeatureType {
+    key: string;
+    title: string;
+    description: string;
+    settings: Array<{
+        key: string;
+        title: string;
+        isAvailable: boolean;
+        buttonText: string;
+        onClick?: () => void;
+    }>;
+    options: Array<{
+        key: string;
+        title: string;
+        description: string;
+        isAvailable: boolean;
+        isDisabled: boolean;
+        disabledMessage?: string;
+        checked: boolean;
+        onChange?: (checked: boolean) => void;
+    }>;
+    isNew: boolean;
+    learnMoreLink?: string;
+}
+
+export const Feature = ({ key, title, description, settings, options, isNew, learnMoreLink }: FeatureType) => {
+    const { t } = useTranslation('settings.features');
+
+    return (
+        <StyledCard key={key}>
+            <FeatureRow>
+                <SettingTitle>
+                    <Title>
+                        {title} {isNew && <Pill color="blue" size="sm" label={t('newLabel')} />}
+                    </Title>
+                    <TitleDescriptionText>{description}</TitleDescriptionText>
+                </SettingTitle>
+                <div>
+                    {learnMoreLink && (
+                        <Button
+                            variant="text"
+                            onClick={() => window.open(learnMoreLink, '_blank')}
+                            icon={{ icon: ArrowRight }}
+                            iconPosition="right"
+                        >
+                            {t('learnMore')}
+                        </Button>
+                    )}
+                </div>
+            </FeatureRow>
+            <StyledCard>
+                {options.map((option, index) => (
+                    <>
+                        <FeatureOptionRow key={option.key}>
+                            <span>
+                                <OptionTitle>
+                                    <span>{option.title}</span>
+                                    {!option.isAvailable && <Pill color="primary" size="sm" label={t('onlyOnCloud')} />}
+                                </OptionTitle>
+                                <div>
+                                    <DescriptionText>{option.description}</DescriptionText>
+                                </div>
+                            </span>
+                            {option.disabledMessage ? (
+                                <StructuredPopover
+                                    title={option.disabledMessage}
+                                    placement="top"
+                                    showArrow
+                                    mouseEnterDelay={0.1}
+                                    mouseLeaveDelay={0.1}
+                                >
+                                    <span style={{ cursor: 'default' }}>
+                                        <Switch
+                                            label=""
+                                            checked={option.checked}
+                                            onChange={(e) =>
+                                                option.onChange ? option.onChange(e.target.checked) : null
+                                            }
+                                            disabled={!option.isAvailable || option.isDisabled}
+                                        />
+                                    </span>
+                                </StructuredPopover>
+                            ) : (
+                                <Switch
+                                    label=""
+                                    checked={option.checked}
+                                    onChange={(e) => (option.onChange ? option.onChange(e.target.checked) : null)}
+                                    disabled={!option.isAvailable || option.isDisabled}
+                                />
+                            )}
+                        </FeatureOptionRow>
+                        {index !== options.length - 1 && <StyledDivider />}
+                    </>
+                ))}
+            </StyledCard>
+            {settings.map((option) => (
+                <>
+                    <SettingsOptionRow key={option.key}>
+                        <span>
+                            <OptionTitle>
+                                <span>{option.title}</span>
+                                <Pill color="primary" size="sm" label={t('cloudLabel')} />
+                            </OptionTitle>
+                        </span>
+                        <StructuredPopover
+                            title={option.isAvailable ? '' : t('onlyOnCloud')}
+                            placement="left"
+                            showArrow
+                            mouseEnterDelay={0.1}
+                            mouseLeaveDelay={0.1}
+                        >
+                            <span>
+                                <Button onClick={option.onClick} disabled={!option.isAvailable}>
+                                    {option.buttonText}
+                                </Button>
+                            </span>
+                        </StructuredPopover>
+                    </SettingsOptionRow>
+                </>
+            ))}
+        </StyledCard>
+    );
+};

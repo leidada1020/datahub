@@ -1,0 +1,14 @@
+---
+# see https://docs.datahub.com/docs/generated/ingestion/sources/file for complete documentation
+source:
+  type: "file"
+  config:
+    filename: ./examples/mce_files/nih_demo.json
+
+# see https://docs.datahub.com/docs/metadata-ingestion/sink_docs/datahub for complete documentation
+sink:
+  type: datahub-kafka
+  config:
+    connection:
+      schema_registry_url: http://localhost:8081
+      bootstrap: localhost:9092

@@ -1,0 +1,125 @@
+import { Popover } from '@components';
+import { ArrowBendDownLeft } from '@phosphor-icons/react/dist/csr/ArrowBendDownLeft';
+import { Rows } from '@phosphor-icons/react/dist/csr/Rows';
+import { Divider, Typography } from 'antd';
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import styled, { useTheme } from 'styled-components';
+
+const FIELD_PATH_SEPARATOR = '.';
+const MIRROR_X_TRANSFORM = 'scaleX(-1)';
+
+const FieldPathWrapper = styled.div`
+    display: flex;
+    align-self: center;
+    stroke: ${(props) => props.theme.colors.bg};
+`;
+
+const PopoverContentWrapper = styled.span`
+    color: ${(props) => props.theme.colors.text};
+`;
+const FieldName = styled(Typography.Text)`
+    font-size: 12px;
+    font-weight: 400;
+    line-height: 24px;
+    // padding-left: 15px;
+    overflow: hidden;
+    display: block;
+    cursor: pointer;
+`;
+const LevelNum = styled(Typography.Text)`
+    font-size: 12px;
+    font-weight: 400;
+    line-height: 24px;
+`;
+
+const StyledDivider = styled(Divider)`
+    margin: 5px;
+    margin-left: 0px;
+    height: 1px;
+    background: ${(props) => props.theme.colors.bgSurfaceDarker};
+    opacity: 0.1;
+`;
+const RowIconContainer = styled.div`
+    position: relative;
+    display: flex;
+    align-items: center;
+`;
+const DepthContainer = styled.div`
+    height: 13px;
+    width: 13px;
+    border-radius: 50%;
+    background: ${(props) => props.theme.colors.bg};
+    margin-left: -7px;
+    margin-top: -12px;
+    display: flex;
+    align-items: center;
+`;
+
+const DepthNumber = styled(Typography.Text)`
+    margin-left: 4px;
+    background: transparent;
+    color: ${(props) => props.theme.colors.textBrand};
+    font-size: 10px;
+    font-weight: 400;
+`;
+
+interface Props {
+    displayName: string;
+    setExpandedDrawerFieldPath: (fieldPath: string | null) => void;
+}
+
+export default function FieldPath({ displayName, setExpandedDrawerFieldPath }: Props) {
+    const { t } = useTranslation('entity.profile.schema');
+    const theme = useTheme();
+    const displayNameTokens = displayName.split('.');
+    const isNestedField = displayNameTokens.length > 1;
+    if (!isNestedField) {
+        return null;
+    }
+    const content = (
+        <PopoverContentWrapper>
+            <LevelNum>{t('fieldPath.levelsNested', { count: displayNameTokens.length })}</LevelNum>
+            <StyledDivider />
+            {displayNameTokens.map((token, idx) => (
+                <FieldName
+                    onClick={() =>
+                        setExpandedDrawerFieldPath(displayNameTokens.slice(0, idx + 1).join(FIELD_PATH_SEPARATOR))
+                    }
+                >
+                    {idx !== 0 && (
+                        <ArrowBendDownLeft
+                            style={{
+                                transform: MIRROR_X_TRANSFORM,
+                                paddingLeft: 6,
+                                fontSize: 14,
+                                fontWeight: 'bolder',
+                            }}
+                        />
+                    )}
+                    {idx === displayNameTokens.length - 1 ? <strong>{token}</strong> : token}
+                </FieldName>
+            ))}
+        </PopoverContentWrapper>
+    );
+    return (
+        <FieldPathWrapper>
+            <Popover
+                content={content}
+                overlayStyle={{ borderRadius: 10, minWidth: 200 }}
+                overlayInnerStyle={{
+                    borderRadius: 10,
+                    border: `1px solid ${theme.colors.border}`,
+                    background: theme.colors.bgSurface,
+                }}
+            >
+                <RowIconContainer className="row-icon">
+                    <Rows size={16} />
+                    <DepthContainer className="depth-container">
+                        <DepthNumber className="depth-text">{displayNameTokens.length}</DepthNumber>
+                    </DepthContainer>
+                </RowIconContainer>
+            </Popover>
+        </FieldPathWrapper>
+    );
+}

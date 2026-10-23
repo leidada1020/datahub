@@ -1,0 +1,266 @@
+import { useMemo } from 'react';
+
+import { getStructuredPropertyValue } from '@app/entity/shared/utils';
+import {
+    EntityFilterField,
+    FieldType,
+    FilterField,
+    FilterOperatorType,
+    FilterValueOption,
+} from '@app/searchV2/filters/types';
+import { filterOptionsWithSearch, getStructuredPropFilterDisplayName } from '@app/searchV2/filters/utils';
+import {
+    CONTAINER_FILTER_NAME,
+    DOMAINS_FILTER_NAME,
+    FILTER_DELIMITER,
+    PARENT_DOCUMENT_FILTER_NAME,
+} from '@app/searchV2/utils/constants';
+import { combineOrFilters } from '@app/searchV2/utils/filterUtils';
+import { capitalizeFirstLetterOnly } from '@app/sharedV2/textUtil';
+import { useEntityRegistry } from '@app/useEntityRegistry';
+import useGetSearchQueryInputs from '@src/app/search/useGetSearchQueryInputs';
+import { ENTITY_FILTER_NAME } from '@src/app/search/utils/constants';
+import { EntityRegistry } from '@src/entityRegistryContext';
+
+import {
+    useAggregateAcrossEntitiesQuery,
+    useGetAutoCompleteMultipleResultsQuery,
+    useGetSearchResultsForMultipleQuery,
+} from '@graphql/search.generated';
+import { AllowedValue, AndFilterInput, EntityType, StructuredPropertyEntity } from '@types';
+
+const MAX_AGGREGATION_COUNT = 40;
+
+/**
+ * Simply removes the baseOptions from moreOptions parameters in case the same filter option
+ * appears in both lists.
+ */
+export const deduplicateOptions = (baseOptions: FilterValueOption[], moreOptions: FilterValueOption[]) => {
+    const baseValues = baseOptions.map((op) => op.value);
+    return moreOptions.filter((op) => !baseValues.includes(op.value));
+};
+
+const getAllowedValueFilterKey = (allowedValue: AllowedValue): string | null => {
+    const raw = getStructuredPropertyValue(allowedValue.value);
+    if (raw === null || raw === undefined) {
+        return null;
+    }
+    return String(raw);
+};
+
+export const mergeFilterOptionsInAllowedValuesOrder = (
+    aggregationOptions: FilterValueOption[],
+    allowedValuesFromDefinition: AllowedValue[],
+    buildMissingOption: (rawValue: string) => FilterValueOption,
+): FilterValueOption[] => {
+    const aggByValue = new Map(aggregationOptions.map((option) => [option.value, option]));
+
+    const definitionValues = allowedValuesFromDefinition
+        .map(getAllowedValueFilterKey)
+        .filter((rawValue): rawValue is string => rawValue !== null);
+
+    const orderedFromDefinition = definitionValues.map(
+        (rawValue) => aggByValue.get(rawValue) ?? buildMissingOption(rawValue),
+    );
+
+    const remainingOptions = aggregationOptions.filter((option) => !definitionValues.includes(option.value));
+
+    return [...orderedFromDefinition, ...remainingOptions];
+};
+
+export const mapFilterCountsToZero = (options: FilterValueOption[]) => {
+    return options.map((option) => {
+        return {
+            ...option,
+            count: 0,
+        };
+    });
+};
+
+/**
+ * Hook used to load the default set of options for a selector dropdown
+ * by using an aggregation query to the backend.
+ *
+ * TODO: Determine if we need to provide an option context that would help with filtering.
+ */
+export const useLoadAggregationOptions = ({
+    field,
+    visible,
+    includeCounts,
+    aggregationsEntityTypes,
+    extraOrFilters,
+    removeOptionsWithNoCount = false,
+}: {
+    field: FilterField;
+    visible: boolean;
+    includeCounts: boolean;
+    aggregationsEntityTypes?: Array<EntityType>;
+    extraOrFilters?: AndFilterInput[];
+    removeOptionsWithNoCount?: boolean;
+}) => {
+    const { entityFilters, query, orFilters, viewUrn } = useGetSearchQueryInputs(
+        useMemo(() => [field.field], [field.field]),
+    );
+    const { data, loading } = useAggregateAcrossEntitiesQuery({
+        skip: !visible,
+        variables: {
+            input: {
+                query,
+                facets: [field.field],
+                searchFlags: {
+                    maxAggValues: MAX_AGGREGATION_COUNT,
+                },
+                types: aggregationsEntityTypes || (field.field === ENTITY_FILTER_NAME ? null : entityFilters),
+                orFilters: extraOrFilters ? combineOrFilters(orFilters, extraOrFilters) : orFilters,
+                viewUrn,
+            },
+        },
+        fetchPolicy: 'cache-first',
+    });
+
+    if (!visible) {
+        return { loading: false, options: [] };
+    }
+
+    const requestedAgg = data?.aggregateAcrossEntities?.facets?.find((facet: any) => facet.field === field.field);
+
+    // The aggregation facet's entity carries the structured-property definition (incl. valueType),
+    // which getStructuredPropFilterDisplayName needs to format numbers and dates. Prefer it over
+    // field.entity, which doesn't carry the definition in every dropdown path — without it, number
+    // buckets render as the raw double (e.g. "42000.0") and dates as raw epochs in the selector,
+    // inconsistent with how the selected-filter chip renders the same value.
+    const structuredPropEntity =
+        requestedAgg?.entity?.__typename === 'StructuredPropertyEntity'
+            ? (requestedAgg.entity as StructuredPropertyEntity)
+            : undefined;
+    const propertyEntity = structuredPropEntity ?? field.entity;
+
+    // Filter out options with no count only if removeOptionsWithNoCount otherwise do not filter
+    const filteredOptions = requestedAgg?.aggregations?.filter((agg) =>
+        removeOptionsWithNoCount ? !!agg.count : true,
+    );
+    const options = filteredOptions?.map((aggregation): FilterValueOption => {
+        return {
+            value: aggregation.value,
+            entity: aggregation.entity,
+            icon: field.icon,
+            count: includeCounts ? aggregation.count : undefined,
+            displayName: getStructuredPropFilterDisplayName(field.field, aggregation.value, propertyEntity),
+        };
+    });
+    // For structured property fields with allowedValues, surface every allowed value even if it
+    // has no indexed documents yet — so the full set of filterable choices is always visible.
+    const allowedValuesFromDefinition = structuredPropEntity?.definition?.allowedValues;
+    if (allowedValuesFromDefinition?.length) {
+        return {
+            options: mergeFilterOptionsInAllowedValuesOrder(options || [], allowedValuesFromDefinition, (rawValue) => ({
+                value: rawValue,
+                icon: field.icon,
+                count: includeCounts ? 0 : undefined,
+                displayName: getStructuredPropFilterDisplayName(field.field, rawValue, propertyEntity),
+            })),
+            loading,
+        };
+    }
+
+    return { options: options || [], loading };
+};
+
+/**
+ * Hook used to load autocomplete / search options when a user types into a selector dropdown
+ * search bar.
+ */
+export const useLoadSearchOptions = (field: EntityFilterField, query?: string, skip?: boolean) => {
+    const { data, loading } = useGetAutoCompleteMultipleResultsQuery({
+        skip: skip || !query,
+        variables: {
+            input: {
+                query: query || '',
+                types: field.entityTypes,
+                limit: 20,
+            },
+        },
+        fetchPolicy: 'cache-first',
+    });
+
+    // do initial search to get initial data to display
+    const { data: searchData, loading: searchLoading } = useGetSearchResultsForMultipleQuery({
+        skip: skip || !!query, // only do a search if not doing auto-complete,
+        variables: {
+            input: {
+                query: '*',
+                types: field.entityTypes,
+                count: 10,
+            },
+        },
+        fetchPolicy: 'cache-first',
+    });
+
+    if (skip) {
+        return { loading: false, options: [] };
+    }
+
+    const options = data?.autoCompleteForMultiple?.suggestions
+        ?.flatMap((suggestion) => suggestion.entities)
+        .map((entity): FilterValueOption => {
+            return {
+                value: entity.urn,
+                entity,
+                icon: field.icon,
+            };
+        });
+    const searchOptions = searchData?.searchAcrossEntities?.searchResults?.map((result) => ({
+        value: result.entity.urn,
+        entity: result.entity,
+        icon: field.icon,
+    }));
+
+    return { options: options || searchOptions || [], loading: loading || searchLoading };
+};
+
+/**
+ * Hook used to filter selector options by a raw search query string. Matches against the option's
+ * human-readable form only — the entity display name for urn-typed options, or the formatted display
+ * name otherwise.
+ *
+ * We deliberately do NOT match the raw underlying value. The raw value is only ever the interesting
+ * thing to search when it equals the human-readable form (strings, numbers), and in those cases the
+ * display name already covers it. When they differ — a urn behind an entity option, or an epoch behind
+ * a date option — the raw value is noise no user would type, so matching it only produces spurious
+ * hits. (This relies on getStructuredPropFilterDisplayName rendering the real value; previously a
+ * parseFloat bug corrupted numeric-looking strings to "Infinity", which is fixed separately.)
+ */
+export const useFilterOptionsBySearchQuery = (
+    options: FilterValueOption[],
+    searchQuery?: string,
+): FilterValueOption[] => {
+    const entityRegistry = useEntityRegistry();
+    if (!searchQuery) {
+        return options;
+    }
+    return options.filter((option) => {
+        const optionName = option.entity
+            ? entityRegistry.getDisplayName(option.entity.type, option.entity)
+            : option.displayName || option.value;
+        return filterOptionsWithSearch(searchQuery, optionName, []);
+    });
+};
+
+export const getEntityTypeFilterValueDisplayName = (value: string, entityRegistry: EntityRegistry) => {
+    if (value.includes(FILTER_DELIMITER)) {
+        const subType = value.split(FILTER_DELIMITER)[1];
+        return capitalizeFirstLetterOnly(subType);
+    }
+    return entityRegistry.getCollectionName(value.toUpperCase() as EntityType);
+};
+
+export const getDefaultFieldOperatorType = (field: FilterField) => {
+    if (
+        field.field === DOMAINS_FILTER_NAME ||
+        field.field === CONTAINER_FILTER_NAME ||
+        field.field === PARENT_DOCUMENT_FILTER_NAME
+    ) {
+        return FilterOperatorType.WITHIN;
+    }
+    return field.type === FieldType.TEXT ? FilterOperatorType.CONTAINS : FilterOperatorType.EQUALS;
+};

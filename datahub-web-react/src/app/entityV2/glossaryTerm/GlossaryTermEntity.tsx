@@ -1,0 +1,283 @@
+import { BookmarkSimple } from '@phosphor-icons/react/dist/csr/BookmarkSimple';
+import { Columns } from '@phosphor-icons/react/dist/csr/Columns';
+import { FileText } from '@phosphor-icons/react/dist/csr/FileText';
+import { ListBullets } from '@phosphor-icons/react/dist/csr/ListBullets';
+import { SquaresFour } from '@phosphor-icons/react/dist/csr/SquaresFour';
+import i18next from 'i18next';
+import * as React from 'react';
+
+import { GenericEntityProperties } from '@app/entity/shared/types';
+import { Entity, EntityCapabilityType, IconStyleType, PreviewType } from '@app/entityV2/Entity';
+import { Preview } from '@app/entityV2/glossaryTerm/preview/Preview';
+import { RelatedTermTypes } from '@app/entityV2/glossaryTerm/profile/RelatedTermTypes';
+import useGlossaryRelatedAssetsTabCount from '@app/entityV2/glossaryTerm/profile/useGlossaryRelatedAssetsTabCount';
+import { EntityMenuItems } from '@app/entityV2/shared/EntityDropdown/EntityMenuActions';
+import { TYPE_ICON_CLASS_NAME } from '@app/entityV2/shared/components/subtypes';
+import { EntityTabPath } from '@app/entityV2/shared/constants';
+import { getDataForEntityType } from '@app/entityV2/shared/containers/profile/entityData';
+import { EntityActionItem } from '@app/entityV2/shared/entity/EntityActions';
+import { lazyProfileComponent } from '@app/entityV2/shared/lazyEntityProfile';
+import {
+    DocumentationTab,
+    EntityProfile,
+    PropertiesTab,
+    SchemaTab,
+    SidebarAboutSection,
+    SidebarApplicationSection,
+    SidebarDomainSection,
+    SidebarEntityHeader,
+    SidebarNotesSection,
+    SidebarOwnerSection,
+    SidebarStructuredProperties,
+    SidebarTagsSection,
+    StatusSection,
+    SummaryTab,
+} from '@app/entityV2/shared/profileChunks';
+import { EntityTab } from '@app/entityV2/shared/types';
+import { useShowAssetSummaryPage } from '@app/entityV2/summary/useShowAssetSummaryPage';
+import { FetchedEntity } from '@app/lineage/types';
+
+import { GetGlossaryTermQuery, useGetGlossaryTermQuery } from '@graphql/glossaryTerm.generated';
+import { EntityType, GlossaryTerm, SearchResult } from '@types';
+
+const GlossaryRelatedEntity = lazyProfileComponent(
+    'GlossaryRelatedEntity',
+    () => import('@app/entityV2/glossaryTerm/profile/GlossaryRelatedEntity'),
+);
+const GlossayRelatedTerms = lazyProfileComponent(
+    'GlossayRelatedTerms',
+    () => import('@app/entityV2/glossaryTerm/profile/GlossaryRelatedTerms'),
+);
+
+const headerDropdownItems = new Set([
+    EntityMenuItems.EDIT_GLOSSARY,
+    EntityMenuItems.CHANGE_HISTORY,
+    EntityMenuItems.MOVE,
+    EntityMenuItems.SHARE,
+    EntityMenuItems.UPDATE_DEPRECATION,
+    EntityMenuItems.CLONE,
+    EntityMenuItems.DELETE,
+    EntityMenuItems.ANNOUNCE,
+]);
+
+/**
+ * Definition of the DataHub Dataset entity.
+ */
+export class GlossaryTermEntity implements Entity<GlossaryTerm> {
+    getLineageVizConfig?: ((entity: GlossaryTerm) => FetchedEntity) | undefined;
+
+    type: EntityType = EntityType.GlossaryTerm;
+
+    icon = (fontSize?: number, styleType?: IconStyleType, color?: string) => {
+        return (
+            <BookmarkSimple
+                className={TYPE_ICON_CLASS_NAME}
+                size={fontSize || 14}
+                color={color || 'currentColor'}
+                weight={styleType === IconStyleType.HIGHLIGHT ? 'fill' : 'regular'}
+            />
+        );
+    };
+
+    isSearchEnabled = () => true;
+
+    isBrowseEnabled = () => true;
+
+    getAutoCompleteFieldName = () => 'name';
+
+    isLineageEnabled = () => false;
+
+    getPathName = () => 'glossaryTerm';
+
+    getCollectionName = () => i18next.t('entity.types:glossaryTerm.namePlural');
+
+    getEntityName = () => i18next.t('entity.types:glossaryTerm.name');
+
+    useEntityQuery = useGetGlossaryTermQuery;
+
+    renderProfile = (urn) => {
+        return (
+            <EntityProfile
+                urn={urn}
+                entityType={EntityType.GlossaryTerm}
+                useEntityQuery={useGetGlossaryTermQuery as any}
+                headerActionItems={new Set([EntityActionItem.BATCH_ADD_GLOSSARY_TERM])}
+                headerDropdownItems={headerDropdownItems}
+                tabs={this.getProfileTabs()}
+                sidebarSections={this.getSidebarSections()}
+                getOverrideProperties={this.getOverridePropertiesFromEntity}
+                sidebarTabs={this.getSidebarTabs()}
+            />
+        );
+    };
+
+    getSidebarSections = () => [
+        {
+            component: SidebarEntityHeader,
+        },
+        {
+            component: SidebarAboutSection,
+        },
+        {
+            component: SidebarNotesSection,
+        },
+        {
+            component: SidebarOwnerSection,
+        },
+        {
+            component: SidebarDomainSection,
+            properties: {
+                hideOwnerType: true,
+            },
+        },
+        {
+            component: SidebarApplicationSection,
+        },
+        {
+            component: SidebarTagsSection,
+        },
+        {
+            component: SidebarStructuredProperties,
+        },
+        {
+            component: StatusSection,
+        },
+    ];
+
+    getProfileTabs = (): EntityTab[] => {
+        const showSummaryTab = useShowAssetSummaryPage();
+
+        return [
+            ...(showSummaryTab
+                ? [
+                      {
+                          name: i18next.t('entity.types:tab.summary'),
+                          path: EntityTabPath.SUMMARY,
+                          component: SummaryTab,
+                          id: 'asset-summary-tab',
+                      },
+                  ]
+                : []),
+            ...(!showSummaryTab
+                ? [
+                      {
+                          name: i18next.t('entity.types:tab.documentation'),
+                          path: EntityTabPath.DOCUMENTATION,
+                          component: DocumentationTab,
+                          icon: FileText,
+                      },
+                  ]
+                : []),
+            {
+                name: i18next.t('entity.types:shared.relatedAssets'),
+                path: EntityTabPath.RELATED_ASSETS,
+                getCount: useGlossaryRelatedAssetsTabCount,
+                component: GlossaryRelatedEntity,
+                icon: SquaresFour,
+            },
+            {
+                name: i18next.t('entity.types:glossaryTerm.schemaTab'),
+                path: EntityTabPath.SCHEMA,
+                component: SchemaTab,
+                icon: Columns,
+                properties: {
+                    editMode: false,
+                },
+                display: {
+                    visible: (_, glossaryTerm: GetGlossaryTermQuery) =>
+                        glossaryTerm?.glossaryTerm?.schemaMetadata !== null,
+                    enabled: (_, glossaryTerm: GetGlossaryTermQuery) =>
+                        glossaryTerm?.glossaryTerm?.schemaMetadata !== null,
+                },
+            },
+            {
+                name: i18next.t('entity.types:glossaryTerm.relatedTermsTab'),
+                path: EntityTabPath.RELATED_TERMS,
+                getCount: (entityData, _, loading) => {
+                    const totalRelatedTerms = Object.keys(RelatedTermTypes).reduce((acc, curr) => {
+                        return acc + (entityData?.[curr]?.total || 0);
+                    }, 0);
+                    return !loading ? totalRelatedTerms : undefined;
+                },
+                component: GlossayRelatedTerms,
+                icon: () => <BookmarkSimple style={{ marginRight: 6 }} />,
+            },
+            {
+                name: i18next.t('entity.types:tab.properties'),
+                path: EntityTabPath.PROPERTIES,
+                component: PropertiesTab,
+                icon: ListBullets,
+            },
+        ];
+    };
+
+    getSidebarTabs = () => [
+        {
+            name: i18next.t('entity.types:tab.properties'),
+            component: PropertiesTab,
+            description: i18next.t('entity.types:sidebar.propertiesDescription'),
+            icon: ListBullets,
+        },
+    ];
+
+    getOverridePropertiesFromEntity = (glossaryTerm?: GlossaryTerm | null): GenericEntityProperties => {
+        // if dataset has subTypes filled out, pick the most specific subtype and return it
+        return {
+            customProperties: glossaryTerm?.properties?.customProperties,
+        };
+    };
+
+    renderSearch = (result: SearchResult) => {
+        return this.renderPreview(PreviewType.SEARCH, result.entity as GlossaryTerm);
+    };
+
+    renderPreview = (previewType: PreviewType, data: GlossaryTerm) => {
+        const genericProperties = this.getGenericEntityProperties(data);
+        return (
+            <Preview
+                data={genericProperties}
+                previewType={previewType}
+                urn={data?.urn}
+                parentNodes={data.parentNodes}
+                name={this.displayName(data)}
+                description={data?.properties?.description || ''}
+                owners={data?.ownership?.owners}
+                deprecation={data?.deprecation}
+                domain={data.domain?.domain}
+                headerDropdownItems={headerDropdownItems}
+            />
+        );
+    };
+
+    displayName = (data: GlossaryTerm) => {
+        return data?.properties?.name || data?.name || data?.urn;
+    };
+
+    platformLogoUrl = (_: GlossaryTerm) => {
+        return undefined;
+    };
+
+    getGenericEntityProperties = (glossaryTerm: GlossaryTerm) => {
+        return getDataForEntityType({
+            data: glossaryTerm,
+            entityType: this.type,
+            getOverrideProperties: (data) => data,
+        });
+    };
+
+    supportedCapabilities = () => {
+        return new Set([
+            EntityCapabilityType.OWNERS,
+            EntityCapabilityType.DEPRECATION,
+            EntityCapabilityType.SOFT_DELETE,
+            EntityCapabilityType.APPLICATIONS,
+            EntityCapabilityType.DOMAINS,
+            EntityCapabilityType.TEST,
+            EntityCapabilityType.RELATED_DOCUMENTS,
+            EntityCapabilityType.FORMS,
+            EntityCapabilityType.TAGS,
+        ]);
+    };
+
+    getGraphName = () => this.getPathName();
+}

@@ -1,0 +1,650 @@
+import logging
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from typing import List, Optional, Union
+from unittest import mock
+
+import pytest
+import time_machine
+
+import datahub.metadata.schema_classes as models
+from datahub.configuration.time_window_config import BaseTimeWindowConfig
+from datahub.emitter.mce_builder import make_dataset_urn
+from datahub.emitter.mcp import MetadataChangeProposalWrapper
+from datahub.ingestion.api.source_helpers import (
+    auto_empty_dataset_usage_statistics,
+    auto_workunit,
+    create_dataset_props_patch_builder,
+)
+from datahub.ingestion.api.workunit import MetadataWorkUnit
+from datahub.ingestion.api.workunit_processor import WorkunitProcessorContext
+from datahub.ingestion.workunit_processors.auto_lowercase_urns import (
+    AutoLowercaseUrnsProcessor,
+)
+from datahub.ingestion.workunit_processors.auto_patch_last_modified import (
+    AutoPatchLastModifiedProcessor,
+)
+from datahub.ingestion.workunit_processors.auto_status_aspect import (
+    AutoStatusAspectProcessor,
+    _gms_supports_status_patch,
+)
+from datahub.metadata.schema_classes import (
+    DatasetPropertiesClass,
+    OperationTypeClass,
+    TimeStampClass,
+)
+from datahub.specific.dataset import DatasetPatchBuilder
+
+_base_metadata: List[
+    Union[MetadataChangeProposalWrapper, models.MetadataChangeEventClass]
+] = [
+    MetadataChangeProposalWrapper(
+        entityUrn="urn:li:container:008e111aa1d250dd52e0fd5d4b307b1a",
+        aspect=models.ContainerPropertiesClass(
+            name="test",
+        ),
+    ),
+    MetadataChangeProposalWrapper(
+        entityUrn="urn:li:container:108e111aa1d250dd52e0fd5d4b307b12",
+        aspect=models.StatusClass(removed=True),
+    ),
+    models.MetadataChangeEventClass(
+        proposedSnapshot=models.DatasetSnapshotClass(
+            urn="urn:li:dataset:(urn:li:dataPlatform:bigquery,bigquery-public-data.covid19_aha.staffing,PROD)",
+            aspects=[
+                models.DatasetPropertiesClass(
+                    customProperties={
+                        "key": "value",
+                    },
+                ),
+            ],
+        ),
+    ),
+    models.MetadataChangeEventClass(
+        proposedSnapshot=models.DatasetSnapshotClass(
+            urn="urn:li:dataset:(urn:li:dataPlatform:bigquery,bigquery-public-data.covid19_aha.hospital_beds,PROD)",
+            aspects=[
+                models.StatusClass(removed=True),
+            ],
+        ),
+    ),
+]
+
+
+def test_auto_workunit():
+    wu = list(auto_workunit(_base_metadata))
+    assert all(isinstance(w, MetadataWorkUnit) for w in wu)
+
+    ids = [w.id for w in wu]
+    assert ids == [
+        "urn:li:container:008e111aa1d250dd52e0fd5d4b307b1a-containerProperties",
+        "urn:li:container:108e111aa1d250dd52e0fd5d4b307b12-status",
+        "urn:li:dataset:(urn:li:dataPlatform:bigquery,bigquery-public-data.covid19_aha.staffing,PROD)/mce",
+        "urn:li:dataset:(urn:li:dataPlatform:bigquery,bigquery-public-data.covid19_aha.hospital_beds,PROD)/mce",
+    ]
+
+
+def test_auto_status_aspect():
+    """Default (no GMS config) emits UPSERT status aspects."""
+    initial_wu = list(auto_workunit(_base_metadata))
+
+    expected = [
+        *initial_wu,
+        *list(
+            auto_workunit(
+                [
+                    MetadataChangeProposalWrapper(
+                        entityUrn="urn:li:container:008e111aa1d250dd52e0fd5d4b307b1a",
+                        aspect=models.StatusClass(removed=False),
+                    ),
+                    MetadataChangeProposalWrapper(
+                        entityUrn="urn:li:dataset:(urn:li:dataPlatform:bigquery,bigquery-public-data.covid19_aha.staffing,PROD)",
+                        aspect=models.StatusClass(removed=False),
+                    ),
+                ]
+            )
+        ),
+    ]
+    processor = AutoStatusAspectProcessor.create(mock.MagicMock())
+    assert list(processor.process(initial_wu)) == expected
+
+
+def test_auto_status_aspect_patch_mode():
+    """When GMS supports status PATCH, emit PATCH MCPs instead of UPSERT."""
+    initial_wu = list(auto_workunit(_base_metadata))
+
+    processor = AutoStatusAspectProcessor.create(mock.MagicMock())
+    with mock.patch(
+        "datahub.ingestion.workunit_processors.auto_status_aspect._gms_supports_status_patch",
+        return_value=True,
+    ):
+        result = list(processor.process(initial_wu))
+
+    # First N items are the original workunits passed through unchanged.
+    assert result[: len(initial_wu)] == initial_wu
+
+    # The processor should emit PATCH MCPs for URNs that didn't already have a
+    # status aspect in the stream.
+    auto_status_wus = result[len(initial_wu) :]
+    assert len(auto_status_wus) == 2
+
+    auto_status_urns = [wu.get_urn() for wu in auto_status_wus]
+    assert auto_status_urns == [
+        "urn:li:container:008e111aa1d250dd52e0fd5d4b307b1a",
+        "urn:li:dataset:(urn:li:dataPlatform:bigquery,bigquery-public-data.covid19_aha.staffing,PROD)",
+    ]
+
+    for wu in auto_status_wus:
+        mcp = wu.metadata
+        assert isinstance(mcp, models.MetadataChangeProposalClass)
+        assert mcp.changeType == models.ChangeTypeClass.PATCH
+        assert mcp.aspectName == "status"
+
+    assert processor.report.status_patch_mode is True
+
+
+def test_auto_status_aspect_upsert_fallback():
+    """When GMS does not support status PATCH, fall back to UPSERT."""
+    initial_wu = list(auto_workunit(_base_metadata))
+
+    processor = AutoStatusAspectProcessor.create(mock.MagicMock())
+    with mock.patch(
+        "datahub.ingestion.workunit_processors.auto_status_aspect._gms_supports_status_patch",
+        return_value=False,
+    ):
+        result = list(processor.process(initial_wu))
+
+    auto_status_wus = result[len(initial_wu) :]
+    assert len(auto_status_wus) == 2
+
+    for wu in auto_status_wus:
+        mcp = wu.metadata
+        assert isinstance(mcp, MetadataChangeProposalWrapper)
+        assert isinstance(mcp.aspect, models.StatusClass)
+        assert mcp.aspect.removed is False
+
+    assert processor.report.status_patch_mode is False
+
+
+class TestGmsSupportsStatusPatch:
+    """Tests for the _gms_supports_status_patch version-gating logic."""
+
+    def test_no_config_returns_false(self) -> None:
+        """When GMS config is unavailable (e.g. file sink), returns False."""
+        with mock.patch(
+            "datahub.ingestion.workunit_processors.auto_status_aspect.get_gms_config",
+            return_value={},
+        ):
+            assert _gms_supports_status_patch() is False
+
+    def test_cloud_below_threshold_returns_false(self) -> None:
+        """Cloud server below v2.1.0 should not support status PATCH."""
+        config = {
+            "versions": {"acryldata/datahub": {"version": "v2.0.5"}},
+            "datahub": {"serverEnv": "cloud"},
+        }
+        with mock.patch(
+            "datahub.ingestion.workunit_processors.auto_status_aspect.get_gms_config",
+            return_value=config,
+        ):
+            assert _gms_supports_status_patch() is False
+
+    def test_cloud_at_threshold_returns_true(self) -> None:
+        """Cloud server at exactly v2.1.0 should support status PATCH."""
+        config = {
+            "versions": {"acryldata/datahub": {"version": "v2.1.0"}},
+            "datahub": {"serverEnv": "cloud"},
+        }
+        with mock.patch(
+            "datahub.ingestion.workunit_processors.auto_status_aspect.get_gms_config",
+            return_value=config,
+        ):
+            assert _gms_supports_status_patch() is True
+
+    def test_core_below_threshold_returns_false(self) -> None:
+        """Core server below v1.7.0 should not support status PATCH."""
+        config = {
+            "versions": {"acryldata/datahub": {"version": "v1.6.9"}},
+            "datahub": {"serverEnv": "core"},
+        }
+        with mock.patch(
+            "datahub.ingestion.workunit_processors.auto_status_aspect.get_gms_config",
+            return_value=config,
+        ):
+            assert _gms_supports_status_patch() is False
+
+    def test_core_at_threshold_returns_true(self) -> None:
+        """Core server at exactly v1.7.0 should support status PATCH."""
+        config = {
+            "versions": {"acryldata/datahub": {"version": "v1.7.0"}},
+            "datahub": {"serverEnv": "core"},
+        }
+        with mock.patch(
+            "datahub.ingestion.workunit_processors.auto_status_aspect.get_gms_config",
+            return_value=config,
+        ):
+            assert _gms_supports_status_patch() is True
+
+    def test_core_above_threshold_returns_true(self) -> None:
+        """Core server above v1.7.0 should support status PATCH."""
+        config = {
+            "versions": {"acryldata/datahub": {"version": "v1.8.0"}},
+            "datahub": {"serverEnv": "core"},
+        }
+        with mock.patch(
+            "datahub.ingestion.workunit_processors.auto_status_aspect.get_gms_config",
+            return_value=config,
+        ):
+            assert _gms_supports_status_patch() is True
+
+    def test_raw_dict_config_is_wrapped(self) -> None:
+        """When get_gms_config returns a plain dict, it should be wrapped in RestServiceConfig."""
+        config = {
+            "versions": {"acryldata/datahub": {"version": "v1.7.0"}},
+            "datahub": {"serverEnv": "core"},
+        }
+        with mock.patch(
+            "datahub.ingestion.workunit_processors.auto_status_aspect.get_gms_config",
+            return_value=config,
+        ):
+            assert _gms_supports_status_patch() is True
+
+    def test_null_version_string_returns_false(self) -> None:
+        """Misconfigured GMS /config version should fall back to UPSERT, not crash."""
+        config = {
+            "versions": {"acryldata/datahub": {"version": "null"}},
+            "datahub": {"serverEnv": "core"},
+        }
+        with mock.patch(
+            "datahub.ingestion.workunit_processors.auto_status_aspect.get_gms_config",
+            return_value=config,
+        ):
+            assert _gms_supports_status_patch() is False
+
+
+def test_auto_lowercase_aspects():
+    mcws = auto_workunit(
+        [
+            MetadataChangeProposalWrapper(
+                entityUrn=make_dataset_urn(
+                    "bigquery", "myProject.mySchema.myTable", "PROD"
+                ),
+                aspect=models.DatasetKeyClass(
+                    "urn:li:dataPlatform:bigquery", "myProject.mySchema.myTable", "PROD"
+                ),
+            ),
+            MetadataChangeProposalWrapper(
+                entityUrn="urn:li:container:008e111aa1d250dd52e0fd5d4b307b1a",
+                aspect=models.ContainerPropertiesClass(
+                    name="test",
+                ),
+            ),
+            models.MetadataChangeEventClass(
+                proposedSnapshot=models.DatasetSnapshotClass(
+                    urn="urn:li:dataset:(urn:li:dataPlatform:bigquery,bigquery-Public-Data.Covid19_Aha.staffing,PROD)",
+                    aspects=[
+                        models.DatasetPropertiesClass(
+                            customProperties={
+                                "key": "value",
+                            },
+                        ),
+                    ],
+                ),
+            ),
+        ]
+    )
+
+    expected = [
+        *list(
+            auto_workunit(
+                [
+                    MetadataChangeProposalWrapper(
+                        entityUrn="urn:li:dataset:(urn:li:dataPlatform:bigquery,myproject.myschema.mytable,PROD)",
+                        aspect=models.DatasetKeyClass(
+                            "urn:li:dataPlatform:bigquery",
+                            "myProject.mySchema.myTable",
+                            "PROD",
+                        ),
+                    ),
+                    MetadataChangeProposalWrapper(
+                        entityUrn="urn:li:container:008e111aa1d250dd52e0fd5d4b307b1a",
+                        aspect=models.ContainerPropertiesClass(
+                            name="test",
+                        ),
+                    ),
+                    models.MetadataChangeEventClass(
+                        proposedSnapshot=models.DatasetSnapshotClass(
+                            urn="urn:li:dataset:(urn:li:dataPlatform:bigquery,bigquery-public-data.covid19_aha.staffing,PROD)",
+                            aspects=[
+                                models.DatasetPropertiesClass(
+                                    customProperties={
+                                        "key": "value",
+                                    },
+                                ),
+                            ],
+                        ),
+                    ),
+                ]
+            )
+        ),
+    ]
+    processor = AutoLowercaseUrnsProcessor(mock.MagicMock())
+    assert list(processor.process(mcws)) == expected
+
+
+def _lowercase_ctx(
+    recipe_config: object, parsed_default: bool
+) -> WorkunitProcessorContext:
+    """Build a context whose recipe dict is `recipe_config` and whose parsed
+    source config defaults convert_urns_to_lowercase to `parsed_default`."""
+    pipeline_config = SimpleNamespace(source=SimpleNamespace(config=recipe_config))
+    pipeline_context = SimpleNamespace(pipeline_config=pipeline_config)
+    return WorkunitProcessorContext(
+        source_report=mock.MagicMock(),
+        pipeline_context=pipeline_context,  # type: ignore[arg-type]
+        source_config=SimpleNamespace(convert_urns_to_lowercase=parsed_default),  # type: ignore[arg-type]
+        platform=None,
+    )
+
+
+def test_auto_lowercase_should_enable_ignores_connector_default():
+    # A recipe that never sets the flag must NOT lowercase, even when the
+    # connector default is True (e.g. Snowflake). Guards against the identity
+    # flip regression where the parsed default was honored.
+    assert (
+        AutoLowercaseUrnsProcessor.should_enable(
+            _lowercase_ctx(recipe_config={}, parsed_default=True)
+        )
+        is False
+    )
+
+
+def test_auto_lowercase_should_enable_honors_explicit_recipe_value():
+    assert (
+        AutoLowercaseUrnsProcessor.should_enable(
+            _lowercase_ctx(
+                recipe_config={"convert_urns_to_lowercase": True}, parsed_default=False
+            )
+        )
+        is True
+    )
+    assert (
+        AutoLowercaseUrnsProcessor.should_enable(
+            _lowercase_ctx(
+                recipe_config={"convert_urns_to_lowercase": False}, parsed_default=True
+            )
+        )
+        is False
+    )
+
+
+@time_machine.travel("2023-01-02 00:00:00+00:00", tick=False)
+def test_auto_empty_dataset_usage_statistics(caplog: pytest.LogCaptureFixture) -> None:
+    has_urn = make_dataset_urn("my_platform", "has_aspect")
+    empty_urn = make_dataset_urn("my_platform", "no_aspect")
+    config = BaseTimeWindowConfig()
+    wus = [
+        MetadataChangeProposalWrapper(
+            entityUrn=has_urn,
+            aspect=models.DatasetUsageStatisticsClass(
+                timestampMillis=int(config.start_time.timestamp() * 1000),
+                eventGranularity=models.TimeWindowSizeClass(
+                    models.CalendarIntervalClass.DAY
+                ),
+                uniqueUserCount=1,
+                totalSqlQueries=1,
+            ),
+        ).as_workunit()
+    ]
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        new_wus = list(
+            auto_empty_dataset_usage_statistics(
+                wus,
+                dataset_urns={has_urn, empty_urn},
+                config=config,
+                all_buckets=False,
+            )
+        )
+        assert not caplog.records
+
+    assert new_wus == [
+        *wus,
+        MetadataChangeProposalWrapper(
+            entityUrn=empty_urn,
+            aspect=models.DatasetUsageStatisticsClass(
+                timestampMillis=int(
+                    datetime(2023, 1, 1, tzinfo=timezone.utc).timestamp() * 1000
+                ),
+                eventGranularity=models.TimeWindowSizeClass(
+                    models.CalendarIntervalClass.DAY
+                ),
+                uniqueUserCount=0,
+                totalSqlQueries=0,
+                topSqlQueries=[],
+                userCounts=[],
+                fieldCounts=[],
+            ),
+        ).as_workunit(),
+    ]
+
+
+@time_machine.travel("2023-01-02 00:00:00+00:00", tick=False)
+def test_auto_empty_dataset_usage_statistics_invalid_timestamp(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    urn = make_dataset_urn("my_platform", "my_dataset")
+    config = BaseTimeWindowConfig()
+    wus = [
+        MetadataChangeProposalWrapper(
+            entityUrn=urn,
+            aspect=models.DatasetUsageStatisticsClass(
+                timestampMillis=0,
+                eventGranularity=models.TimeWindowSizeClass(
+                    models.CalendarIntervalClass.DAY
+                ),
+                uniqueUserCount=1,
+                totalSqlQueries=1,
+            ),
+        ).as_workunit()
+    ]
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        new_wus = list(
+            auto_empty_dataset_usage_statistics(
+                wus,
+                dataset_urns={urn},
+                config=config,
+                all_buckets=True,
+            )
+        )
+        assert len(caplog.records) == 1
+        assert "1970-01-01 00:00:00+00:00" in caplog.records[0].msg
+
+    assert new_wus == [
+        *wus,
+        MetadataChangeProposalWrapper(
+            entityUrn=urn,
+            aspect=models.DatasetUsageStatisticsClass(
+                timestampMillis=int(config.start_time.timestamp() * 1000),
+                eventGranularity=models.TimeWindowSizeClass(
+                    models.CalendarIntervalClass.DAY
+                ),
+                uniqueUserCount=0,
+                totalSqlQueries=0,
+                topSqlQueries=[],
+                userCounts=[],
+                fieldCounts=[],
+            ),
+            changeType=models.ChangeTypeClass.CREATE,
+        ).as_workunit(),
+    ]
+
+
+def get_sample_mcps(
+    mcps_to_append: Optional[List] = None,
+) -> List[MetadataChangeProposalWrapper]:
+    if not mcps_to_append:
+        mcps_to_append = []
+    mcps = [
+        MetadataChangeProposalWrapper(
+            entityUrn="urn:li:dataset:(urn:li:dataPlatform:dbt,abc.foo.bar,PROD)",
+            aspect=models.OperationClass(
+                timestampMillis=10,
+                lastUpdatedTimestamp=12,
+                operationType=OperationTypeClass.CREATE,
+            ),
+        ),
+        MetadataChangeProposalWrapper(
+            entityUrn="urn:li:dataset:(urn:li:dataPlatform:dbt,abc.foo.bar,PROD)",
+            aspect=models.OperationClass(
+                timestampMillis=11,
+                lastUpdatedTimestamp=20,
+                operationType=OperationTypeClass.CREATE,
+            ),
+        ),
+    ]
+    mcps.extend(mcps_to_append)
+    return mcps
+
+
+def to_patch_work_units(patch_builder: DatasetPatchBuilder) -> List[MetadataWorkUnit]:
+    return [
+        MetadataWorkUnit(
+            id=MetadataWorkUnit.generate_workunit_id(patch_mcp), mcp_raw=patch_mcp
+        )
+        for patch_mcp in patch_builder.build()
+    ]
+
+
+def get_auto_generated_wu() -> List[MetadataWorkUnit]:
+    dataset_patch_builder = DatasetPatchBuilder(
+        urn="urn:li:dataset:(urn:li:dataPlatform:dbt,abc.foo.bar,PROD)"
+    ).set_last_modified(TimeStampClass(time=20))
+
+    auto_generated_work_units = to_patch_work_units(dataset_patch_builder)
+
+    return auto_generated_work_units
+
+
+@time_machine.travel("2023-01-02 00:00:00+00:00", tick=False)
+def test_auto_patch_last_modified_no_change():
+    mcps = [
+        MetadataChangeProposalWrapper(
+            entityUrn="urn:li:container:008e111aa1d250dd52e0fd5d4b307b1a",
+            aspect=models.StatusClass(removed=False),
+        )
+    ]
+
+    initial_wu = list(auto_workunit(mcps))
+
+    expected = initial_wu
+
+    processor = AutoPatchLastModifiedProcessor.create(mock.MagicMock())
+    assert list(processor.process(initial_wu)) == expected  # There should be no change
+
+
+@time_machine.travel("2023-01-02 00:00:00+00:00", tick=False)
+def test_auto_patch_last_modified_max_last_updated_timestamp():
+    mcps = get_sample_mcps()
+
+    expected = list(auto_workunit(mcps))
+
+    auto_generated_work_units = get_auto_generated_wu()
+
+    expected.extend(auto_generated_work_units)
+
+    # work unit should contain a path of datasetProperties with lastModified set to max of operation.lastUpdatedTime
+    # i.e., 20
+    processor = AutoPatchLastModifiedProcessor.create(mock.MagicMock())
+    assert list(processor.process(auto_workunit(mcps))) == expected
+
+
+@pytest.mark.parametrize("primary_flags", [[False, False], [False, True]])
+def test_auto_patch_last_modified_is_primary_only_with_a_primary_workunit(
+    primary_flags: List[bool],
+) -> None:
+    work_units = list(auto_workunit(get_sample_mcps()))
+    for wu, is_primary_source in zip(work_units, primary_flags, strict=True):
+        wu.is_primary_source = is_primary_source
+
+    processor = AutoPatchLastModifiedProcessor.create(mock.MagicMock())
+    patches = list(processor.process(work_units))[len(work_units) :]
+
+    assert patches
+    assert all(wu.is_primary_source == any(primary_flags) for wu in patches)
+
+
+@time_machine.travel("2023-01-02 00:00:00+00:00", tick=False)
+def test_auto_patch_last_modified_multi_patch():
+    mcps = get_sample_mcps()
+
+    dataset_patch_builder = DatasetPatchBuilder(
+        urn="urn:li:dataset:(urn:li:dataPlatform:dbt,abc.foo.bar,PROD)"
+    )
+
+    dataset_patch_builder.set_display_name("foo")
+    dataset_patch_builder.set_description("it is fake")
+
+    patch_work_units = to_patch_work_units(dataset_patch_builder)
+
+    work_units = [*list(auto_workunit(mcps)), *patch_work_units]
+
+    auto_generated_work_units = get_auto_generated_wu()
+
+    expected = [*work_units, *auto_generated_work_units]
+
+    # In this case, the final work units include two patch units: one originating from the source and
+    # the other from auto_patch_last_modified.
+    processor = AutoPatchLastModifiedProcessor.create(mock.MagicMock())
+    assert list(processor.process(work_units)) == expected
+
+
+@time_machine.travel("2023-01-02 00:00:00+00:00", tick=False)
+def test_auto_patch_last_modified_last_modified_patch_exist():
+    mcps = get_sample_mcps()
+
+    patch_builder = create_dataset_props_patch_builder(
+        dataset_urn="urn:li:dataset:(urn:li:dataPlatform:dbt,abc.foo.bar,PROD)",
+        dataset_properties=DatasetPropertiesClass(
+            name="foo",
+            description="dataset for collection of foo",
+            lastModified=TimeStampClass(time=20),
+        ),
+    )
+
+    work_units = [
+        *list(auto_workunit(mcps)),
+        *to_patch_work_units(patch_builder),
+    ]
+    # The input and output should align since the source is generating a patch for datasetProperties with the
+    # lastModified attribute.
+    # Therefore, `auto_patch_last_modified` should not create any additional patch.
+    processor = AutoPatchLastModifiedProcessor.create(mock.MagicMock())
+    assert list(processor.process(work_units)) == work_units
+
+
+@time_machine.travel("2023-01-02 00:00:00+00:00", tick=False)
+def test_auto_patch_last_modified_last_modified_patch_not_exist():
+    mcps = get_sample_mcps()
+
+    patch_builder = create_dataset_props_patch_builder(
+        dataset_urn="urn:li:dataset:(urn:li:dataPlatform:dbt,abc.foo.bar,PROD)",
+        dataset_properties=DatasetPropertiesClass(
+            name="foo",
+            description="dataset for collection of foo",
+        ),
+    )
+
+    work_units = [
+        *list(auto_workunit(mcps)),
+        *to_patch_work_units(patch_builder),
+    ]
+
+    expected = [
+        *work_units,
+        *get_auto_generated_wu(),  # The output should include an additional patch for the `lastModified` attribute.
+    ]
+
+    processor = AutoPatchLastModifiedProcessor.create(mock.MagicMock())
+    assert list(processor.process(work_units)) == expected

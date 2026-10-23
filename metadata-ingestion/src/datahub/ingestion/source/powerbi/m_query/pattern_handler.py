@@ -1,0 +1,2488 @@
+import logging
+import re
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from enum import Enum
+from typing import Callable, Dict, List, Optional, Set, Tuple, Type
+
+import sqlglot
+from sqlglot import ParseError, expressions as exp
+from sqlparse.exceptions import SQLParseError
+from typing_extensions import LiteralString
+
+from datahub.configuration.source_common import PlatformDetail
+from datahub.emitter import mce_builder as builder
+from datahub.ingestion.api.common import PipelineContext
+from datahub.ingestion.source.powerbi.config import (
+    Constant,
+    DataBricksPlatformDetail,
+    DataPlatformPair,
+    OraclePlatformDetail,
+    PowerBiDashboardSourceConfig,
+    PowerBiDashboardSourceReport,
+    PowerBIPlatformDetail,
+    SupportedDataPlatform,
+)
+from datahub.ingestion.source.powerbi.dataplatform_instance_resolver import (
+    AbstractDataPlatformInstanceResolver,
+)
+from datahub.ingestion.source.powerbi.m_query import native_sql_parser
+from datahub.ingestion.source.powerbi.m_query.ast_utils import (
+    find_nodes_by_kind,
+    get_literal_value,
+    get_record_field_values,
+    resolve_identifier,
+    resolve_parameter_value,
+)
+from datahub.ingestion.source.powerbi.m_query.data_classes import (
+    DataAccessFunctionDetail,
+    DataPlatformTable,
+    FunctionName,
+    IdentifierAccessor,
+    Lineage,
+    ReferencedTable,
+)
+from datahub.ingestion.source.powerbi.m_query.odbc import (
+    extract_dsn,
+    extract_platform,
+    extract_server,
+    normalize_platform_name,
+)
+from datahub.ingestion.source.powerbi.rest_api_wrapper.data_classes import (
+    Column,
+    Table,
+)
+from datahub.metadata.schema_classes import SchemaFieldDataTypeClass
+from datahub.metadata.urns import DatasetUrn
+from datahub.sql_parsing.sqlglot_lineage import (
+    ColumnLineageInfo,
+    ColumnRef,
+    DownstreamColumnRef,
+    SqlParsingResult,
+)
+from datahub.sql_parsing.sqlglot_utils import get_dialect
+
+logger = logging.getLogger(__name__)
+
+_BIGQUERY_PLATFORM_NAME = (
+    SupportedDataPlatform.GOOGLE_BIGQUERY.value.datahub_data_platform_name
+)
+
+# First enum entry wins when multiple PowerBI names share a DataHub platform
+# (e.g. Databricks / DatabricksMultiCloud both map to "databricks").
+_DATAHUB_PLATFORM_TO_PAIR: Dict[str, DataPlatformPair] = {}
+for _item in SupportedDataPlatform:
+    _DATAHUB_PLATFORM_TO_PAIR.setdefault(
+        _item.value.datahub_data_platform_name, _item.value
+    )
+
+
+@dataclass
+class _ExternalQueryResolution:
+    """Result of resolving BigQuery EXTERNAL_QUERY federations in a native query."""
+
+    upstreams: List[DataPlatformTable]
+    rewritten_query: str
+    # Already reported; caller must not re-parse the outer query.
+    outer_parse_failed: bool = False
+
+
+def _data_platform_pair_for(platform: str) -> DataPlatformPair:
+    """Resolve a DataPlatformPair for a DataHub platform name.
+
+    Config validation already restricts external-query platforms to
+    SupportedDataPlatform, so a miss here is a programming error — raise rather
+    than return a silently wrong pair (powerbi name == datahub name).
+    """
+    try:
+        return _DATAHUB_PLATFORM_TO_PAIR[platform]
+    except KeyError:
+        raise ValueError(
+            f"platform '{platform}' is not a recognized DataHub platform. "
+            f"Known platforms: {sorted(_DATAHUB_PLATFORM_TO_PAIR)}."
+        ) from None
+
+
+def _unwrap_csv(elem: dict) -> dict:
+    """Unwrap a Csv wrapper node, returning the inner node."""
+    if isinstance(elem, dict) and elem.get("kind") == "Csv":
+        return elem.get("node", elem)
+    return elem
+
+
+def _get_invoke_elements(invoke_node: dict) -> List[dict]:
+    """Return the unwrapped argument elements from an InvokeExpression."""
+    content = invoke_node.get("content", {})
+    if not isinstance(content, dict) or content.get("kind") != "ArrayWrapper":
+        return []
+    return [_unwrap_csv(e) for e in content.get("elements", []) if isinstance(e, dict)]
+
+
+def _get_arg_values(
+    invoke_node: dict,
+    parameters: Dict[str, str],
+) -> List[Optional[str]]:
+    """Extract positional string arguments from an InvokeExpression node.
+
+    Returns a list of Optional[str] -- one per argument.
+    RecordExpression arguments return None.
+    IdentifierExpression arguments are resolved via parameters dict.
+    """
+    values: List[Optional[str]] = []
+    for inner in _get_invoke_elements(invoke_node):
+        val = get_literal_value(inner)
+        if val is None and isinstance(inner, dict):
+            if inner.get("kind") == "IdentifierExpression":
+                ref_name = inner.get("identifier", {}).get("literal", "")
+                val = resolve_parameter_value(parameters, ref_name)
+                if val is None:
+                    logger.debug(
+                        "Argument '%s' is an unresolved parameter reference"
+                        " — not found in dataset parameters",
+                        ref_name,
+                    )
+        values.append(val)
+    return values
+
+
+def _get_record_args(node_map: Dict[int, dict], invoke_node: dict) -> Dict[str, str]:
+    """Extract all key-value pairs from RecordExpression arguments in an InvokeExpression."""
+    result: Dict[str, str] = {}
+    for inner in _get_invoke_elements(invoke_node):
+        if isinstance(inner, dict) and inner.get("kind") == "RecordExpression":
+            result.update(get_record_field_values(node_map, inner))
+    return result
+
+
+def _get_data_source_tokens(
+    node_map: Dict[int, dict],
+    arg_node: dict,
+    parameters: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """Extract [platform_name, server, ...other_args] from a data source node.
+
+    If arg_node is an IdentifierExpression, resolves it through the let scope.
+    """
+    # Resolve through let scope if identifier
+    if arg_node.get("kind") == "IdentifierExpression":
+        name = arg_node.get("identifier", {}).get("literal", "")
+        let_nodes = sorted(
+            find_nodes_by_kind(node_map, "LetExpression"),
+            key=lambda n: n.get("id", 0),
+        )
+        if let_nodes:
+            resolved = resolve_identifier(node_map, let_nodes[0], name)
+            if resolved is not None:
+                arg_node = resolved
+
+    if arg_node.get("kind") != "RecursivePrimaryExpression":
+        return []
+
+    head = arg_node.get("head", {})
+    platform_name = ""
+    if head.get("kind") == "IdentifierExpression":
+        platform_name = head.get("identifier", {}).get("literal", "")
+
+    tokens: List[str] = [platform_name]
+
+    rec_exprs = arg_node.get("recursiveExpressions", {})
+    elements = rec_exprs.get("elements", []) if isinstance(rec_exprs, dict) else []
+
+    for elem in elements:
+        if elem.get("kind") == "ItemAccessExpression":
+            # e.g. Snowflake.Databases(...){[Name=X, Kind="Database"]}[Data] --
+            # the {[...]} step is an ItemAccessExpression whose content is the
+            # RecordExpression directly (no ArrayWrapper/Csv wrapping here,
+            # unlike a function call's argument list below).
+            content = elem.get("content", {})
+            if isinstance(content, dict) and content.get("kind") == "RecordExpression":
+                kv = get_record_field_values(node_map, content, parameters=parameters)
+                for k, v in kv.items():
+                    tokens.append(k)
+                    tokens.append(v)
+            continue
+
+        if elem.get("kind") != "InvokeExpression":
+            continue
+        content = elem.get("content", {})
+        if not isinstance(content, dict) or content.get("kind") != "ArrayWrapper":
+            continue
+        for arg_elem in content.get("elements", []):
+            inner = _unwrap_csv(arg_elem)
+            if not isinstance(inner, dict):
+                continue
+            val = get_literal_value(inner)
+            if val is None and inner.get("kind") == "IdentifierExpression":
+                # Snowflake.Databases(SnowflakeURL, SnowflakeWarehouse) -- the
+                # positional args are Parameter references, not literals.
+                # Skipping them shifts {[Name=...]} into tokens[1], so
+                # create_lineage treats the key "Name" as the server.
+                val = resolve_parameter_value(
+                    parameters, inner.get("identifier", {}).get("literal", "")
+                )
+            if val is not None:
+                tokens.append(val)
+            elif inner.get("kind") == "RecordExpression":
+                kv = get_record_field_values(node_map, inner, parameters=parameters)
+                for k, v in kv.items():
+                    tokens.append(k)
+                    tokens.append(v)
+
+    return tokens
+
+
+# Keys of Snowflake's {[Name=<db>, Kind="Database"]} navigation record.
+# Snowflake.Databases(server, warehouse) takes positional args; if those
+# IdentifierExpression args were unresolved, this record leaks into tokens[1]
+# and must not be treated as the host. Other NativeQuery connectors (BigQuery
+# BillingProject, Databricks Catalog, ...) take a record as the first argument,
+# so a record key in tokens[1] is expected there.
+_SNOWFLAKE_NAVIGATION_RECORD_KEYS = frozenset({"Name", "Kind"})
+
+
+def _sql_has_unqualified_snowflake_tables(query: str) -> bool:
+    try:
+        tables = native_sql_parser.get_tables(query)
+    except Exception as e:
+        logger.debug(
+            "Failed to parse native query for Snowflake table qualification: %s",
+            e,
+            exc_info=True,
+        )
+        return True
+    return any(len(name.split(".")) < 3 for name in tables)
+
+
+def get_next_item(items: List[str], item: str) -> Optional[str]:
+    if item in items:
+        try:
+            index = items.index(item)
+            return items[index + 1]
+        except IndexError:
+            logger.debug(f'item:"{item}", not found in item-list: {items}')
+    return None
+
+
+def urn_to_lowercase(value: str, flag: bool) -> str:
+    if flag is True:
+        return value.lower()
+
+    return value
+
+
+def _remap_column_lineage_to_pbi_fields(
+    column_lineage: List[ColumnLineageInfo],
+    pbi_columns: Optional[List[Column]],
+) -> List[ColumnLineageInfo]:
+    """sqlglot returns downstream column names in the parsed SQL's casing (driven
+    by the query's aliases and the source dialect's identifier folding), but
+    PowerBI fields keep their original casing from the API response. Without this
+    remap the downstream schemaField URN does not resolve and the column-level
+    edge points to a non-existent field. Applied for every SQL-parsing path via
+    parse_custom_sql (native-query, ODBC, and the two/three-step patterns)."""
+    if not column_lineage or not pbi_columns:
+        return column_lineage
+
+    pbi_col_map: Dict[str, str] = {col.name.lower(): col.name for col in pbi_columns}
+
+    remapped: List[ColumnLineageInfo] = []
+    for cll_info in column_lineage:
+        if cll_info.downstream and cll_info.downstream.column:
+            pbi_name = pbi_col_map.get(cll_info.downstream.column.lower())
+            if pbi_name and pbi_name != cll_info.downstream.column:
+                cll_info = ColumnLineageInfo(
+                    downstream=DownstreamColumnRef(
+                        table=cll_info.downstream.table,
+                        column=pbi_name,
+                        column_type=cll_info.downstream.column_type,
+                        native_column_type=cll_info.downstream.native_column_type,
+                    ),
+                    upstreams=cll_info.upstreams,
+                    logic=cll_info.logic,
+                )
+        remapped.append(cll_info)
+    return remapped
+
+
+def make_urn(
+    config: PowerBiDashboardSourceConfig,
+    platform_instance_resolver: AbstractDataPlatformInstanceResolver,
+    data_platform_pair: DataPlatformPair,
+    server: str,
+    qualified_table_name: str,
+    platform_detail: Optional[PlatformDetail] = None,
+) -> str:
+    if platform_detail is None:
+        platform_detail = platform_instance_resolver.get_platform_instance(
+            PowerBIPlatformDetail(
+                data_platform_pair=data_platform_pair,
+                data_platform_server=server,
+            )
+        )
+
+    return builder.make_dataset_urn_with_platform_instance(
+        platform=data_platform_pair.datahub_data_platform_name,
+        platform_instance=platform_detail.platform_instance,
+        env=platform_detail.env,
+        name=urn_to_lowercase(
+            qualified_table_name, config.convert_lineage_urns_to_lowercase
+        ),
+    )
+
+
+class AbstractLineage(ABC):
+    """
+    Base class to share common functionalities among different dataplatform for M-Query parsing.
+
+    To create qualified table name we need to parse M-Query data-access-functions(https://learn.microsoft.com/en-us/powerquery-m/accessing-data-functions) and
+    the data-access-functions has some define pattern to access database-name, schema-name and table-name, for example, see below M-Query.
+
+        let
+            Source = Sql.Database("localhost", "library"),
+            dbo_book_issue = Source{[Schema="dbo",Item="book_issue"]}[Data]
+        in
+            dbo_book_issue
+
+    It is MSSQL M-Query and Sql.Database is the data-access-function to access MSSQL. If this function is available in M-Query then database name is available in the second argument of the first statement and schema-name and table-name is available in the second statement. the second statement can be repeated to access different tables from MSSQL.
+
+    DefaultTwoStepDataAccessSources extends the AbstractDataPlatformTableCreator and provides the common functionalities for data-platform which has above type of M-Query pattern
+
+    data-access-function varies as per data-platform for example for MySQL.Database for MySQL, PostgreSQL.Database for Postgres and Oracle.Database for Oracle and number of statement to
+    find out database-name , schema-name and table-name also varies as per dataplatform.
+
+    Value.NativeQuery is one of the functions which is used to execute a native query inside M-Query, for example see below M-Query
+
+        let
+            Source = Value.NativeQuery(AmazonRedshift.Database("redshift-url","dev"), "select * from dev.public.category", null, [EnableFolding=true])
+        in
+            Source
+
+    In this M-Query database-name is available in first argument and rest of the detail i.e database & schema is available in native query.
+
+    NativeQueryDataPlatformTableCreator extends AbstractDataPlatformTableCreator to support Redshift and Snowflake native query parsing.
+
+    """
+
+    ctx: PipelineContext
+    table: Table
+    config: PowerBiDashboardSourceConfig
+    reporter: PowerBiDashboardSourceReport
+    platform_instance_resolver: AbstractDataPlatformInstanceResolver
+
+    def __init__(
+        self,
+        ctx: PipelineContext,
+        table: Table,
+        config: PowerBiDashboardSourceConfig,
+        reporter: PowerBiDashboardSourceReport,
+        platform_instance_resolver: AbstractDataPlatformInstanceResolver,
+    ) -> None:
+        super().__init__()
+        self.ctx = ctx
+        self.table = table
+        self.config = config
+        self.reporter = reporter
+        self.platform_instance_resolver = platform_instance_resolver
+
+    @abstractmethod
+    def create_lineage(
+        self, data_access_func_detail: DataAccessFunctionDetail
+    ) -> Lineage:
+        pass
+
+    @abstractmethod
+    def get_platform_pair(self) -> DataPlatformPair:
+        pass
+
+    @staticmethod
+    def get_db_detail_from_argument(
+        arg_list: dict,
+        parameters: Dict[str, str],
+    ) -> Tuple[Optional[str], Optional[str]]:
+        args = _get_arg_values(arg_list, parameters=parameters)
+        logger.debug(f"DB Details: {args}")
+
+        return (
+            args[0] if len(args) > 0 else None,
+            args[1] if len(args) > 1 else None,
+        )
+
+    @staticmethod
+    def create_reference_table(
+        arg_list: dict,
+        table_detail: Dict[str, str],
+        parameters: Dict[str, str],
+        node_map: Optional[Dict[int, dict]] = None,
+    ) -> Optional[ReferencedTable]:
+        node_map = node_map or {}
+        args = _get_arg_values(arg_list, parameters=parameters)
+        record_fields = _get_record_args(node_map, arg_list)
+
+        logger.debug(f"Processing arguments {args}, record_fields {record_fields}")
+
+        warehouse = args[0] if args else None
+        if warehouse is None:
+            logger.debug(
+                "No warehouse/host argument resolved from %s — skipping lineage",
+                args,
+            )
+            return None
+
+        catalog = record_fields.get("Catalog")
+        if catalog is not None:
+            return ReferencedTable(
+                warehouse=warehouse,
+                catalog=catalog,
+                database=table_detail["Database"]
+                if table_detail.get("Database")
+                else catalog,
+                schema=table_detail["Schema"],
+                table=table_detail.get("Table") or table_detail["View"],
+            )
+        elif len(args) >= 2:
+            return ReferencedTable(
+                warehouse=warehouse,
+                database=table_detail["Database"],
+                schema=table_detail["Schema"],
+                table=table_detail.get("Table") or table_detail["View"],
+                catalog=None,
+            )
+
+        logger.debug(
+            "Insufficient arguments to build table reference"
+            " (warehouse=%s, args=%s, record_fields=%s) — skipping lineage",
+            warehouse,
+            args,
+            record_fields,
+        )
+        return None
+
+    @staticmethod
+    def is_sql_query(query: Optional[str], platform: Optional[str] = None) -> bool:
+        if not query:
+            return False
+        query = native_sql_parser.remove_special_characters(query)
+        # Use the platform dialect so platform-specific syntax (e.g. BigQuery
+        # backtick-quoted, hyphenated project ids) parses as SQL. Platforms
+        # sqlglot has no dialect for (e.g. db2, vertica) fall back to the
+        # default dialect rather than raising.
+        dialect: Optional[sqlglot.Dialect] = None
+        if platform:
+            try:
+                dialect = get_dialect(platform)
+            except ValueError:
+                dialect = None
+        try:
+            expression = sqlglot.parse_one(query, dialect=dialect)
+            return isinstance(expression, exp.Select)
+        except (ParseError, Exception):
+            logger.debug(f"Failed to parse query as SQL: {query}")
+            return False
+
+    def _report_external_query_failure(
+        self,
+        message: LiteralString,
+        context: str,
+        exc: Optional[BaseException] = None,
+    ) -> None:
+        self.reporter.m_query_external_query_failures += 1
+        self.reporter.warning(
+            title=Constant.SQL_PARSING_FAILURE,
+            message=message,
+            context=context,
+            exc=exc,
+        )
+
+    def _return_partial_external_lineage(
+        self, external_upstreams: List[DataPlatformTable], context: str
+    ) -> Lineage:
+        # The outer (native) query failed to parse but federated EXTERNAL_QUERY upstreams
+        # were resolved, so any remaining native BigQuery tables are dropped and the
+        # lineage is only partial. Count it as an EXTERNAL_QUERY parse error so the run
+        # summary reflects the partial loss, then return whatever federation we resolved.
+        self._report_external_query_failure(
+            message="Fail to parse native sql present in PowerBI M-Query; "
+            "only federated EXTERNAL_QUERY upstreams were resolved.",
+            context=context,
+        )
+        return Lineage(upstreams=external_upstreams, column_lineage=[])
+
+    def _resolve_external_query_upstreams(self, query: str) -> _ExternalQueryResolution:
+        """Resolve upstreams for BigQuery EXTERNAL_QUERY federations in a native query.
+
+        Each EXTERNAL_QUERY exposes a connection id and the SQL run on the external engine.
+        The connection is mapped to its external platform via
+        ``bigquery_external_query_connection_to_platform``, and the inner SQL is parsed in
+        that platform's dialect — parsing in the correct dialect is what lets
+        engine-specific syntax resolve to the real upstream table rather than failing.
+        """
+        assert native_sql_parser.contains_external_query_call(
+            query, _BIGQUERY_PLATFORM_NAME
+        ), "_resolve_external_query_upstreams requires EXTERNAL_QUERY in the query"
+        extraction = native_sql_parser.extract_external_queries(
+            query, _BIGQUERY_PLATFORM_NAME
+        )
+
+        if extraction.parse_failed or not (
+            extraction.references or extraction.unresolvable
+        ):
+            # A cleanup-recoverable T-SQL preamble (USE/GO/SET/DROP ahead of the SELECT)
+            # either fails the raw parse or collapses the batch into a single opaque
+            # Command, and in both cases would otherwise discard the whole table's lineage,
+            # native tables included. remove_drop_statement strips those statements, so
+            # retry extraction on the cleaned query. The retry is reached only when the
+            # first pass extracted no federation at all (references and unresolvable both
+            # empty — either the parse failed or nothing federation-like was found), so —
+            # unlike running cleanup up front — the regex cleanup has no preserved
+            # federation string literal it could corrupt. The rewritten_query from this
+            # retry is already cleaned, so the caller's later remove_drop_statement pass is
+            # a no-op.
+            cleaned_query = native_sql_parser.remove_drop_statement(query)
+            if (
+                cleaned_query != query
+                and native_sql_parser.contains_external_query_call(
+                    cleaned_query, _BIGQUERY_PLATFORM_NAME
+                )
+            ):
+                extraction = native_sql_parser.extract_external_queries(
+                    cleaned_query, _BIGQUERY_PLATFORM_NAME
+                )
+
+        upstreams: List[DataPlatformTable] = []
+
+        if extraction.parse_failed:
+            self._report_external_query_failure(
+                message="Fail to parse PowerBI M-Query containing EXTERNAL_QUERY; "
+                "federated lineage will be skipped.",
+                context=f"table-name={self.table.full_name}, sql={query}",
+            )
+            return _ExternalQueryResolution(
+                upstreams=upstreams,
+                rewritten_query=extraction.rewritten_query,
+                outer_parse_failed=True,
+            )
+
+        for unresolvable_sql in extraction.unresolvable:
+            self._report_external_query_failure(
+                message="BigQuery EXTERNAL_QUERY could not be extracted (non-literal "
+                "arguments or unsupported placement); federated lineage will be skipped.",
+                context=f"table-name={self.table.full_name}, external-query={unresolvable_sql}",
+            )
+
+        mapping = self.config.bigquery_external_query_connection_to_platform
+        for reference in extraction.references:
+            connection_detail = mapping.get(reference.connection)
+            if connection_detail is None:
+                self.reporter.m_query_external_query_connections_unmapped += 1
+                self.reporter.info(
+                    title=Constant.EXTERNAL_QUERY_NOT_MAPPED,
+                    message="BigQuery EXTERNAL_QUERY connection is not mapped to a "
+                    "platform; skipping federated lineage. Add the connection to "
+                    "bigquery_external_query_connection_to_platform to resolve it.",
+                    context=f"table-name={self.table.full_name}, connection={reference.connection}",
+                )
+                continue
+
+            # T-SQL cleanup on inner SQL only after extraction — regexes ignore string
+            # boundaries and would corrupt USE/GO/SET/DROP inside the EXTERNAL_QUERY literal.
+            inner_sql = reference.inner_sql
+            if (
+                connection_detail.platform
+                == SupportedDataPlatform.MS_SQL.value.datahub_data_platform_name
+            ):
+                inner_sql = native_sql_parser.remove_drop_statement(inner_sql)
+
+            parsed_result = native_sql_parser.parse_custom_sql(
+                ctx=self.ctx,
+                query=inner_sql,
+                platform=connection_detail.platform,
+                platform_instance=connection_detail.platform_instance,
+                env=connection_detail.env,
+                database=connection_detail.default_database,
+                schema=connection_detail.default_schema,
+            )
+
+            table_error = (
+                parsed_result.debug_info.table_error
+                if parsed_result is not None and parsed_result.debug_info is not None
+                else None
+            )
+            if parsed_result is None or table_error is not None:
+                self._report_external_query_failure(
+                    message="Fail to parse federated EXTERNAL_QUERY SQL in PowerBI M-Query",
+                    context=(
+                        f"table-name={self.table.full_name}, connection={reference.connection}, "
+                        f"platform={connection_detail.platform}, error={table_error}, "
+                        f"sql={reference.inner_sql}"
+                    ),
+                )
+                continue
+
+            if not parsed_result.in_tables:
+                self._report_external_query_failure(
+                    message="EXTERNAL_QUERY inner SQL parsed but resolved no upstream "
+                    "table; federated lineage will be skipped.",
+                    context=(
+                        f"table-name={self.table.full_name}, connection={reference.connection}, "
+                        f"platform={connection_detail.platform}, sql={reference.inner_sql}"
+                    ),
+                )
+                continue
+
+            platform_pair = _data_platform_pair_for(connection_detail.platform)
+            for urn in parsed_result.in_tables:
+                upstreams.append(
+                    DataPlatformTable(data_platform_pair=platform_pair, urn=urn)
+                )
+            self.reporter.m_query_external_query_connections_resolved += 1
+
+        # Two federations (or a self-join within one) can resolve to the same table;
+        # dedup by URN so identical upstream edges are not emitted twice. Order is
+        # preserved so lineage output stays deterministic.
+        seen_urns: Set[str] = set()
+        deduped_upstreams: List[DataPlatformTable] = []
+        for upstream in upstreams:
+            if upstream.urn not in seen_urns:
+                seen_urns.add(upstream.urn)
+                deduped_upstreams.append(upstream)
+
+        return _ExternalQueryResolution(
+            upstreams=deduped_upstreams,
+            rewritten_query=extraction.rewritten_query,
+        )
+
+    def get_tables_using_old_parser(self, query: str) -> List[str]:
+        # sqlparse raises SQLParseError once its DoS-protection limits
+        # (MAX_GROUPING_DEPTH / MAX_GROUPING_TOKENS) are hit. Without this, the
+        # error escapes to the caller in parser.py, which abandons the remaining
+        # data-access functions for this table and reports the generic "Unknown
+        # M-Query Pattern" warning. Only that error is caught: anything else is a
+        # bug in get_tables and should not be relabelled as a parse failure.
+        try:
+            return native_sql_parser.get_tables(query)
+        except SQLParseError as e:
+            self.reporter.warning(
+                title=Constant.SQL_PARSING_FAILURE,
+                message="Native SQL exceeded the SQL parser's size limits, so "
+                "lineage for this query is skipped. Enabling "
+                "enable_advance_lineage_sql_construct uses the sqlglot-based parser instead.",
+                context=f"table-name={self.table.full_name}",
+                exc=e,
+            )
+            return []
+
+    def parse_custom_sql(
+        self,
+        query: str,
+        server: str,
+        database: Optional[str],
+        schema: Optional[str],
+        platform_pair: Optional[DataPlatformPair] = None,
+        platform_detail: Optional[PlatformDetail] = None,
+    ) -> Lineage:
+        dataplatform_tables: List[DataPlatformTable] = []
+        if not platform_pair:
+            platform_pair = self.get_platform_pair()
+
+        if platform_detail is None:
+            platform_detail = self.platform_instance_resolver.get_platform_instance(
+                PowerBIPlatformDetail(
+                    data_platform_pair=platform_pair,
+                    data_platform_server=server,
+                )
+            )
+
+        # remove_special_characters must run first to expand #(lf) → \n before
+        # remove_drop_statement applies line-anchored patterns (USE, GO, SET, etc.)
+        query = native_sql_parser.remove_special_characters(query)
+
+        # Extract EXTERNAL_QUERY before T-SQL cleanup so regexes do not rewrite
+        # USE/GO/SET/DROP inside federation string literals.
+        external_upstreams: List[DataPlatformTable] = []
+        if platform_pair.datahub_data_platform_name == _BIGQUERY_PLATFORM_NAME:
+            try:
+                has_external_query = native_sql_parser.contains_external_query_call(
+                    query, platform_pair.datahub_data_platform_name
+                )
+            except sqlglot.errors.SqlglotError as exc:
+                # The query could not even be tokenized (e.g. an unterminated comment or
+                # string literal). We cannot tell whether a real EXTERNAL_QUERY federation
+                # is present, and the native parser below silently resolves no tables for
+                # the same unparseable SQL, so the table would otherwise lose lineage with
+                # no signal. Report it as a federation failure and skip, rather than
+                # dropping it silently. Pass the parser diagnostic through so the structured
+                # report keeps the exact tokenizer error.
+                self._report_external_query_failure(
+                    message="Fail to tokenize PowerBI M-Query while detecting "
+                    "EXTERNAL_QUERY federation; lineage for this query is skipped.",
+                    context=f"table-name={self.table.full_name}, sql={query}",
+                    exc=exc,
+                )
+                return Lineage.empty()
+
+            if has_external_query:
+                resolution = self._resolve_external_query_upstreams(query)
+                if resolution.outer_parse_failed:
+                    # Extraction could not parse the query even after retrying on the
+                    # T-SQL-cleaned form (see _resolve_external_query_upstreams), so the
+                    # EXTERNAL_QUERY calls were left in place (not rewritten to placeholders).
+                    # Feeding that raw federation syntax to the native parser cannot isolate
+                    # the BigQuery tables and only re-triggers the empty-URN failure this
+                    # handling exists to avoid. The failure was already reported in
+                    # _resolve_external_query_upstreams, so skip lineage here.
+                    return Lineage.empty()
+                external_upstreams = resolution.upstreams
+                query = resolution.rewritten_query
+
+        query = native_sql_parser.remove_drop_statement(query)
+
+        parsed_result: Optional["SqlParsingResult"] = (
+            native_sql_parser.parse_custom_sql(
+                ctx=self.ctx,
+                query=query,
+                platform=platform_pair.datahub_data_platform_name,
+                platform_instance=platform_detail.platform_instance,
+                env=platform_detail.env,
+                database=database,
+                schema=schema,
+            )
+        )
+
+        # A parse failure of the outer (native) query must still be reported even when
+        # federated upstreams were resolved: any remaining native tables are lost, so the
+        # lineage is only partial. Report first, then return whatever we did resolve.
+        if parsed_result is None:
+            if external_upstreams:
+                return self._return_partial_external_lineage(
+                    external_upstreams,
+                    context=f"table-name={self.table.full_name}, sql={query}",
+                )
+            self.reporter.info(
+                title=Constant.SQL_PARSING_FAILURE,
+                message="Fail to parse native sql present in PowerBI M-Query",
+                context=f"table-name={self.table.full_name}, sql={query}",
+            )
+            return Lineage.empty()
+
+        if parsed_result.debug_info and parsed_result.debug_info.table_error:
+            context = f"table-name={self.table.full_name}, error={parsed_result.debug_info.table_error},sql={query}"
+            if external_upstreams:
+                # Same partial-lineage case as above but signalled via table_error rather
+                # than a None result.
+                return self._return_partial_external_lineage(
+                    external_upstreams, context=context
+                )
+            self.reporter.warning(
+                title=Constant.SQL_PARSING_FAILURE,
+                message="Fail to parse native sql present in PowerBI M-Query",
+                context=context,
+            )
+            return Lineage.empty()
+
+        dataplatform_tables.extend(external_upstreams)
+
+        for urn in parsed_result.in_tables:
+            dataplatform_tables.append(
+                DataPlatformTable(
+                    data_platform_pair=platform_pair,
+                    urn=urn,
+                )
+            )
+
+        logger.debug(f"Native Query parsed result={parsed_result}")
+        logger.debug(f"Generated dataplatform_tables={dataplatform_tables}")
+
+        # sqlglot returns downstream columns in the SQL's alias casing, which
+        # rarely matches the casing PowerBI stores its fields in. Remap in this
+        # shared SQL-parsing path so the downstream column resolves to the real
+        # PowerBI field regardless of the platform driving the parse.
+        column_lineage = _remap_column_lineage_to_pbi_fields(
+            parsed_result.column_lineage
+            if parsed_result.column_lineage is not None
+            else [],
+            self.table.columns,
+        )
+
+        # Drop entries that resolved no upstream column. A resolved EXTERNAL_QUERY
+        # federation is rewritten to an inert placeholder subquery
+        # (SELECT 1 AS pbi_federation_placeholder), so its outer columns have nothing
+        # real to trace into and sqlglot returns them with an empty upstreams list.
+        # (Columns that simply fail to resolve upstreams, e.g. when the source schema
+        # is unknown, land here too.) Emitting such a downstream as a FineGrainedLineage
+        # with no upstreams is a meaningless edge, so skip it rather than propagate it.
+        column_lineage = [cll for cll in column_lineage if cll.upstreams]
+
+        return Lineage(
+            upstreams=dataplatform_tables,
+            column_lineage=column_lineage,
+        )
+
+    def create_table_column_lineage(self, urn: str) -> List[ColumnLineageInfo]:
+        column_lineage = []
+
+        if self.table.columns is not None:
+            for column in self.table.columns:
+                downstream = DownstreamColumnRef(
+                    table=self.table.name,
+                    column=column.name,
+                    column_type=SchemaFieldDataTypeClass(type=column.datahubDataType),
+                    native_column_type=column.dataType or "UNKNOWN",
+                )
+
+                upstreams = [
+                    ColumnRef(
+                        table=urn,
+                        # Preserve the source column casing so the upstream
+                        # schemaField URN matches the warehouse's field, which
+                        # stores columns in their original casing. Lowercasing is
+                        # governed for the dataset portion by
+                        # convert_lineage_urns_to_lowercase downstream in powerbi.py.
+                        column=column.name,
+                    )
+                ]
+
+                column_lineage_info = ColumnLineageInfo(
+                    downstream=downstream, upstreams=upstreams
+                )
+
+                column_lineage.append(column_lineage_info)
+
+        return column_lineage
+
+
+class AmazonAthenaLineage(AbstractLineage):
+    """
+    Handles lineage extraction for Amazon Athena data sources in PowerBI.
+
+    Athena uses a three-level hierarchy: catalog.database.table
+    Example M-Query:
+        Source = AmazonAthena.Databases("us-east-1")
+        catalog = Source{[Name="AwsDataCatalog",Kind="Database"]}[Data]
+        database = catalog{[Name="my_database",Kind="Schema"]}[Data]
+        table = database{[Name="my_table",Kind="Table"]}[Data]
+
+    URN Format:
+        Generated URNs use database.table format (catalog is omitted) to match the
+        standalone Athena connector behavior. This ensures URN consistency across
+        different ingestion sources.
+        Example: urn:li:dataset:(urn:li:dataPlatform:athena,my_database.my_table,PROD)
+
+        Note: Athena's default catalog is "AwsDataCatalog", but users can have multiple
+        catalogs (Glue, Hive, federated). The catalog is intentionally omitted from URNs
+        because the standalone Athena connector also omits it, treating the database as
+        the top-level namespace. This matches Athena's typical usage where most users
+        work within a single catalog context.
+    """
+
+    def get_platform_pair(self) -> DataPlatformPair:
+        return SupportedDataPlatform.AMAZON_ATHENA.value
+
+    def create_lineage(
+        self, data_access_func_detail: DataAccessFunctionDetail
+    ) -> Lineage:
+        logger.debug(
+            f"Processing AmazonAthena data-access function detail {data_access_func_detail}"
+        )
+
+        server, _ = self.get_db_detail_from_argument(
+            data_access_func_detail.arg_list,
+            parameters=data_access_func_detail.parameters,
+        )
+        if server is None:
+            logger.debug("Server/region not found in Athena data access function")
+            return Lineage.empty()
+
+        # Validate identifier accessor exists
+        if data_access_func_detail.identifier_accessor is None:
+            logger.warning(
+                f"Missing identifier accessor for Athena table {self.table.full_name}"
+            )
+            return Lineage.empty()
+
+        # Extract database and table names from Athena's 3-level hierarchy (catalog.database.table)
+        # Note: Catalog is extracted but NOT included in URN to match the standalone Athena connector
+        # which uses database.table format. This avoids URN mismatches between PowerBI and Athena sources.
+        try:
+            catalog_accessor = data_access_func_detail.identifier_accessor
+
+            if catalog_accessor.next is None:
+                logger.warning(
+                    f"Incomplete Athena hierarchy for table {self.table.full_name}: "
+                    f"missing database level after catalog. Expected format: catalog.database.table"
+                )
+                return Lineage.empty()
+
+            db_accessor = catalog_accessor.next
+
+            # Extract database name with specific error handling
+            try:
+                db_name: str = db_accessor.items["Name"]
+            except KeyError:
+                logger.warning(
+                    f"Missing 'Name' key in database accessor for table {self.table.full_name}. "
+                    f"Available keys: {list(db_accessor.items.keys())}"
+                )
+                return Lineage.empty()
+
+            if db_accessor.next is None:
+                logger.warning(
+                    f"Incomplete Athena hierarchy for table {self.table.full_name}: "
+                    f"missing table level after database '{db_name}'. Expected format: catalog.database.table"
+                )
+                return Lineage.empty()
+
+            table_accessor = db_accessor.next
+
+            # Extract table name with specific error handling
+            try:
+                table_name: str = table_accessor.items["Name"]
+            except KeyError:
+                logger.warning(
+                    f"Missing 'Name' key in table accessor for table {self.table.full_name}. "
+                    f"Available keys: {list(table_accessor.items.keys())}"
+                )
+                return Lineage.empty()
+
+        except AttributeError as e:
+            logger.warning(
+                f"AttributeError while accessing Athena hierarchy for table {self.table.full_name}: {e}. "
+                f"This usually indicates a malformed M-Query structure."
+            )
+            return Lineage.empty()
+        except TypeError as e:
+            logger.warning(
+                f"TypeError while processing Athena hierarchy for table {self.table.full_name}: {e}. "
+                f"This usually indicates unexpected data types in the M-Query structure."
+            )
+            return Lineage.empty()
+
+        # Validate that database and table names are not empty to prevent malformed URNs
+        if not db_name or not db_name.strip():
+            logger.warning(
+                f"Empty database name for table {self.table.full_name}. Cannot generate valid URN."
+            )
+            return Lineage.empty()
+
+        if not table_name or not table_name.strip():
+            logger.warning(
+                f"Empty table name for table {self.table.full_name}. Cannot generate valid URN."
+            )
+            return Lineage.empty()
+
+        qualified_table_name: str = f"{db_name}.{table_name}"
+        logger.debug(
+            f"Extracted Athena qualified table name: {qualified_table_name} from server: {server}"
+        )
+
+        urn = make_urn(
+            config=self.config,
+            platform_instance_resolver=self.platform_instance_resolver,
+            data_platform_pair=self.get_platform_pair(),
+            server=server,
+            qualified_table_name=qualified_table_name,
+        )
+
+        column_lineage = self.create_table_column_lineage(urn)
+
+        return Lineage(
+            upstreams=[
+                DataPlatformTable(
+                    data_platform_pair=self.get_platform_pair(),
+                    urn=urn,
+                )
+            ],
+            column_lineage=column_lineage,
+        )
+
+
+class AmazonRedshiftLineage(AbstractLineage):
+    def get_platform_pair(self) -> DataPlatformPair:
+        return SupportedDataPlatform.AMAZON_REDSHIFT.value
+
+    def create_lineage(
+        self, data_access_func_detail: DataAccessFunctionDetail
+    ) -> Lineage:
+        logger.debug(
+            f"Processing AmazonRedshift data-access function detail {data_access_func_detail}"
+        )
+
+        server, db_name = self.get_db_detail_from_argument(
+            data_access_func_detail.arg_list,
+            parameters=data_access_func_detail.parameters,
+        )
+        if db_name is None or server is None:
+            logger.debug(
+                "Server or database argument not resolved for Redshift table %s"
+                " (server=%s, db=%s) — skipping lineage",
+                self.table.full_name,
+                server,
+                db_name,
+            )
+            return Lineage.empty()
+
+        accessor = data_access_func_detail.identifier_accessor
+        if accessor is None or accessor.next is None:
+            logger.debug(
+                "Incomplete accessor chain for Redshift table %s"
+                " — expected two navigation steps (schema then table)",
+                self.table.full_name,
+            )
+            return Lineage.empty()
+
+        schema_name: str = accessor.items["Name"]
+        table_name: str = accessor.next.items["Name"]
+
+        qualified_table_name: str = f"{db_name}.{schema_name}.{table_name}"
+
+        urn = make_urn(
+            config=self.config,
+            platform_instance_resolver=self.platform_instance_resolver,
+            data_platform_pair=self.get_platform_pair(),
+            server=server,
+            qualified_table_name=qualified_table_name,
+        )
+
+        column_lineage = self.create_table_column_lineage(urn)
+
+        return Lineage(
+            upstreams=[
+                DataPlatformTable(
+                    data_platform_pair=self.get_platform_pair(),
+                    urn=urn,
+                )
+            ],
+            column_lineage=column_lineage,
+        )
+
+
+class OracleLineage(AbstractLineage):
+    # Hyphens are valid in host names and TNS aliases (e.g. "oracle-tns.example.com").
+    _TNS_ALIAS_RE = re.compile(r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$")
+    _TNS_SERVICE_NAME_RE = re.compile(r"service_name\s*=\s*([A-Za-z0-9_.-]+)")
+
+    def get_platform_pair(self) -> DataPlatformPair:
+        return SupportedDataPlatform.ORACLE.value
+
+    @staticmethod
+    def _get_server_and_db_name(value: str) -> Tuple[Optional[str], Optional[str]]:
+        splitter_result: List[str] = value.split("/")
+        if len(splitter_result) == 2:
+            db_name = splitter_result[1].split(".")[0]
+            return splitter_result[0].strip('"'), db_name
+
+        # Lowercased so customer recipe keys match regardless of the M-query's
+        # casing of the TNS alias (Oracle TNS lookup is case-insensitive).
+        cleaned = value.strip().strip('"').lower()
+
+        if OracleLineage._TNS_ALIAS_RE.match(cleaned):
+            return cleaned, None
+
+        if cleaned.startswith("(") and "service_name" in cleaned:
+            m = OracleLineage._TNS_SERVICE_NAME_RE.search(cleaned)
+            if m:
+                return m.group(1), None
+
+        logger.debug(
+            "Oracle.Database connection string %r is not in a recognized form "
+            "(EZ-Connect, bare TNS alias, or descriptor with SERVICE_NAME). "
+            "Skipping lineage.",
+            value,
+        )
+        return None, None
+
+    def _resolve_platform_detail(self, server: str) -> PlatformDetail:
+        return self.platform_instance_resolver.get_platform_instance(
+            PowerBIPlatformDetail(
+                data_platform_pair=self.get_platform_pair(),
+                data_platform_server=server,
+            )
+        )
+
+    def create_lineage(
+        self, data_access_func_detail: DataAccessFunctionDetail
+    ) -> Lineage:
+        logger.debug(
+            f"Processing Oracle data-access function detail {data_access_func_detail}"
+        )
+
+        args = _get_arg_values(
+            data_access_func_detail.arg_list,
+            parameters=data_access_func_detail.parameters,
+        )
+
+        if not args or args[0] is None:
+            return Lineage.empty()
+
+        server, db_name = self._get_server_and_db_name(args[0])
+
+        if server is None:
+            self.reporter.warning(
+                title="Oracle.Database connection string not recognized",
+                message=(
+                    "Could not parse host/db from the Oracle.Database first "
+                    "argument; lineage skipped. Supported forms: EZ-Connect "
+                    "'host:port/db', bare TNS alias, or a descriptor "
+                    "containing SERVICE_NAME=."
+                ),
+                context=f"table={self.table.full_name}, value={args[0]!r}",
+            )
+            return Lineage.empty()
+
+        record_fields = _get_record_args(
+            data_access_func_detail.node_map,
+            data_access_func_detail.arg_list,
+        )
+        inline_query: Optional[str] = record_fields.get("Query")
+        if inline_query:
+            return self._create_lineage_from_query(
+                server=server,
+                query=inline_query,
+            )
+
+        accessor = data_access_func_detail.identifier_accessor
+        if accessor is None or accessor.next is None:
+            logger.debug(
+                "Oracle.Database for %s has no two-step identifier accessor; "
+                "skipping hierarchical lineage.",
+                self.table.full_name,
+            )
+            return Lineage.empty()
+
+        schema_name: Optional[str] = accessor.items.get("Schema")
+        table_name: Optional[str] = accessor.next.items.get("Name")
+        if schema_name is None or table_name is None:
+            self.reporter.warning(
+                title="Oracle.Database hierarchical navigation missing schema/table",
+                message=(
+                    "Oracle.Database hierarchical navigation was found but its "
+                    "Schema or table Name item is missing; lineage skipped."
+                ),
+                context=(
+                    f"table={self.table.full_name}, server={server}, "
+                    f"schema={schema_name}, name={table_name}"
+                ),
+            )
+            return Lineage.empty()
+
+        platform_detail = self._resolve_platform_detail(server)
+
+        # A bare TNS alias / descriptor carries no database; fall back to a
+        # configured `default_database` so Oracle ingestions using 3-part URNs
+        # match, otherwise emit a 2-part `schema.table` URN.
+        effective_db: Optional[str] = db_name
+        if effective_db is None and isinstance(platform_detail, OraclePlatformDetail):
+            effective_db = platform_detail.default_database
+        if db_name is None and effective_db is None:
+            self.reporter.info(
+                title="Oracle lineage produced a 2-part URN",
+                message=(
+                    "A bare Oracle TNS alias/descriptor carries no database, so a "
+                    "2-part schema.table URN was produced. If your Oracle "
+                    "ingestion runs with add_database_name_to_urn=true (3-part "
+                    "URNs), set 'default_database' under server_to_platform_instance."
+                ),
+                context=f"table={self.table.full_name}, server={server}",
+            )
+
+        qualified_table_name = ".".join(
+            part for part in (effective_db, schema_name, table_name) if part is not None
+        )
+
+        urn = make_urn(
+            config=self.config,
+            platform_instance_resolver=self.platform_instance_resolver,
+            data_platform_pair=self.get_platform_pair(),
+            server=server,
+            qualified_table_name=qualified_table_name,
+            platform_detail=platform_detail,
+        )
+
+        column_lineage = self.create_table_column_lineage(urn)
+
+        return Lineage(
+            upstreams=[
+                DataPlatformTable(
+                    data_platform_pair=self.get_platform_pair(),
+                    urn=urn,
+                )
+            ],
+            column_lineage=column_lineage,
+        )
+
+    def _create_lineage_from_query(self, server: str, query: str) -> Lineage:
+        """Resolve lineage for an ``Oracle.Database(…, Query="…")`` invocation."""
+        if self.config.enable_advance_lineage_sql_construct is False:
+            self.reporter.info(
+                title="Oracle inline native-query lineage skipped",
+                message=(
+                    "Oracle.Database(…, Query=…) was found but "
+                    "enable_advance_lineage_sql_construct=False — set the flag "
+                    "to extract lineage from inline native SQL."
+                ),
+                context=f"table={self.table.full_name}",
+            )
+            return Lineage.empty()
+
+        platform_detail = self._resolve_platform_detail(server)
+
+        default_schema: Optional[str] = None
+        default_database: Optional[str] = None
+        if isinstance(platform_detail, OraclePlatformDetail):
+            default_schema = platform_detail.default_schema
+            default_database = platform_detail.default_database
+
+        if default_schema is None and self._sql_has_unqualified_tables(query):
+            self.reporter.warning(
+                title="Oracle native-query lineage missing default_schema",
+                message=(
+                    'Oracle.Database(…, Query="…") references unqualified tables '
+                    "but no default_schema is configured for this server. Add "
+                    "'default_schema: <schema>' under server_to_platform_instance "
+                    "in your PowerBI recipe."
+                ),
+                context=f"table={self.table.full_name}, server={server}",
+            )
+
+        # `default_database` is None for the default 2-part URN shape; set, it
+        # produces 3-part URNs matching `add_database_name_to_urn: true`.
+        return self.parse_custom_sql(
+            query=query,
+            server=server,
+            database=default_database,
+            schema=default_schema,
+            platform_detail=platform_detail,
+        )
+
+    def _sql_has_unqualified_tables(self, query: str) -> bool:
+        """True if the SQL contains any table reference without a schema/owner prefix."""
+        try:
+            cleaned = native_sql_parser.remove_special_characters(query)
+            cleaned = native_sql_parser.remove_drop_statement(cleaned)
+            for statement in sqlglot.parse(cleaned, dialect="oracle"):
+                if statement is None:
+                    continue
+                for table in statement.find_all(exp.Table):
+                    if not table.db:
+                        return True
+        except (sqlglot.errors.SqlglotError, ValueError, AttributeError) as e:
+            # Conservative: parse failure is reported as "unqualified" so the user
+            # gets the missing-default_schema warning instead of silent zero-lineage.
+            # Logged at WARNING so a dialect regression is visible, not hidden by
+            # a perpetual default_schema warning.
+            logger.warning(
+                "Could not parse Oracle inline SQL for table %s to detect unqualified "
+                "tables; assuming unqualified. Error type=%s: %s",
+                self.table.full_name,
+                type(e).__name__,
+                e,
+            )
+            return True
+        return False
+
+
+# Databricks navigation chains are ordered catalog -> schema -> table, so a step
+# that omits Kind (valid M that Power BI refreshes) takes the first level the
+# chain has not filled yet.
+_DATABRICKS_NAVIGATION_LEVELS: Tuple[str, ...] = ("Database", "Schema", "Table")
+
+
+class DatabricksLineage(AbstractLineage):
+    def form_qualified_table_name(
+        self,
+        table_reference: ReferencedTable,
+        data_platform_pair: DataPlatformPair,
+    ) -> str:
+        platform_detail: PlatformDetail = (
+            self.platform_instance_resolver.get_platform_instance(
+                PowerBIPlatformDetail(
+                    data_platform_pair=data_platform_pair,
+                    data_platform_server=table_reference.warehouse,
+                )
+            )
+        )
+
+        metastore: Optional[str] = None
+
+        qualified_table_name: str = f"{table_reference.database}.{table_reference.schema}.{table_reference.table}"
+
+        if isinstance(platform_detail, DataBricksPlatformDetail):
+            metastore = platform_detail.metastore
+
+        if metastore is not None:
+            return f"{metastore}.{qualified_table_name}"
+
+        return qualified_table_name
+
+    def create_lineage(
+        self, data_access_func_detail: DataAccessFunctionDetail
+    ) -> Lineage:
+        logger.debug(
+            f"Processing Databrick data-access function detail {data_access_func_detail}"
+        )
+        table_detail: Dict[str, str] = {}
+        temp_accessor: Optional[IdentifierAccessor] = (
+            data_access_func_detail.identifier_accessor
+        )
+
+        while temp_accessor:
+            # Condition to handle databricks M-query pattern where table, schema and database all are present in
+            # the same invoke statement
+            if all(
+                element in temp_accessor.items
+                for element in ["Item", "Schema", "Catalog"]
+            ):
+                table_detail["Schema"] = temp_accessor.items["Schema"]
+                table_detail["Table"] = temp_accessor.items["Item"]
+            else:
+                name: Optional[str] = temp_accessor.items.get("Name")
+                level: Optional[str] = temp_accessor.items.get("Kind")
+                if level is None:
+                    level = next(
+                        (
+                            candidate
+                            for candidate in _DATABRICKS_NAVIGATION_LEVELS
+                            if candidate not in table_detail
+                        ),
+                        None,
+                    )
+
+                if name is None or level is None:
+                    self.reporter.warning(
+                        title="Unusable M-Query navigation step",
+                        message="A navigation step could not be mapped to a Databricks "
+                        "catalog, schema or table. Lineage will be missing for this "
+                        "table.",
+                        context=f"table-full-name={self.table.full_name}, "
+                        f"navigation-step={temp_accessor.items}",
+                    )
+                    return Lineage.empty()
+
+                table_detail[level] = name
+
+            if temp_accessor.next is not None:
+                temp_accessor = temp_accessor.next
+            else:
+                break
+
+        table_reference = self.create_reference_table(
+            arg_list=data_access_func_detail.arg_list,
+            table_detail=table_detail,
+            node_map=data_access_func_detail.node_map,
+            parameters=data_access_func_detail.parameters,
+        )
+
+        if table_reference:
+            qualified_table_name: str = self.form_qualified_table_name(
+                table_reference=table_reference,
+                data_platform_pair=self.get_platform_pair(),
+            )
+
+            urn = make_urn(
+                config=self.config,
+                platform_instance_resolver=self.platform_instance_resolver,
+                data_platform_pair=self.get_platform_pair(),
+                server=table_reference.warehouse,
+                qualified_table_name=qualified_table_name,
+            )
+
+            column_lineage = self.create_table_column_lineage(urn)
+
+            return Lineage(
+                upstreams=[
+                    DataPlatformTable(
+                        data_platform_pair=self.get_platform_pair(),
+                        urn=urn,
+                    )
+                ],
+                column_lineage=column_lineage,
+            )
+
+        return Lineage.empty()
+
+    def get_platform_pair(self) -> DataPlatformPair:
+        return SupportedDataPlatform.DATABRICKS_SQL.value
+
+
+class TwoStepDataAccessPattern(AbstractLineage, ABC):
+    """
+    These are the DataSource for which PowerBI Desktop generates default M-Query of the following pattern
+        let
+            Source = Sql.Database("localhost", "library"),
+            dbo_book_issue = Source{[Schema="dbo",Item="book_issue"]}[Data]
+        in
+            dbo_book_issue
+    """
+
+    def two_level_access_pattern(
+        self, data_access_func_detail: DataAccessFunctionDetail
+    ) -> Lineage:
+        logger.debug(
+            f"Processing {self.get_platform_pair().powerbi_data_platform_name} data-access function detail {data_access_func_detail}"
+        )
+
+        server, db_name = self.get_db_detail_from_argument(
+            data_access_func_detail.arg_list,
+            parameters=data_access_func_detail.parameters,
+        )
+        if db_name is None:
+            logger.debug(
+                "No database argument resolved for %s (%s) — skipping lineage",
+                self.get_platform_pair().powerbi_data_platform_name,
+                self.table.full_name,
+            )
+            return Lineage.empty()
+        if server is None:
+            # Server argument is an unresolved parameter reference (e.g. Sql.Database(ServerName, "db")).
+            # Fall back to empty-string server to preserve the pre-v2-parser behavior (partial lineage).
+            logger.info(
+                "Server argument not resolved from dataset parameters for table %s"
+                " — emitting partial lineage without server host."
+                " Add the server parameter to the dataset to resolve fully.",
+                self.table.full_name,
+            )
+            server = ""
+
+        accessor = data_access_func_detail.identifier_accessor
+        if accessor is None:
+            logger.debug(
+                "No accessor chain for %s (%s) — expression may reference the source"
+                " directly without a table navigation step (e.g. missing"
+                " Source{[Schema=...,Item=...]}[Data])",
+                self.get_platform_pair().powerbi_data_platform_name,
+                self.table.full_name,
+            )
+            return Lineage.empty()
+
+        schema_name: Optional[str] = accessor.items.get("Schema")
+        table_name: Optional[str] = accessor.items.get("Item")
+
+        qualified_table_name: str = f"{db_name}.{schema_name}.{table_name}"
+
+        logger.debug(
+            f"Platform({self.get_platform_pair().datahub_data_platform_name}) qualified_table_name= {qualified_table_name}"
+        )
+
+        urn = make_urn(
+            config=self.config,
+            platform_instance_resolver=self.platform_instance_resolver,
+            data_platform_pair=self.get_platform_pair(),
+            server=server,
+            qualified_table_name=qualified_table_name,
+        )
+
+        column_lineage = self.create_table_column_lineage(urn)
+
+        return Lineage(
+            upstreams=[
+                DataPlatformTable(
+                    data_platform_pair=self.get_platform_pair(),
+                    urn=urn,
+                )
+            ],
+            column_lineage=column_lineage,
+        )
+
+
+class MySQLLineage(AbstractLineage):
+    def create_lineage(
+        self, data_access_func_detail: DataAccessFunctionDetail
+    ) -> Lineage:
+        logger.debug(
+            f"Processing {self.get_platform_pair().powerbi_data_platform_name} data-access function detail {data_access_func_detail}"
+        )
+
+        server, db_name = self.get_db_detail_from_argument(
+            data_access_func_detail.arg_list,
+            parameters=data_access_func_detail.parameters,
+        )
+        if server is None or db_name is None:
+            logger.debug(
+                "Server or database argument not resolved for MySQL table %s"
+                " (server=%s, db=%s) — skipping lineage",
+                self.table.full_name,
+                server,
+                db_name,
+            )
+            return Lineage.empty()
+
+        accessor = data_access_func_detail.identifier_accessor
+        if accessor is None:
+            logger.debug(
+                "No accessor chain for MySQL table %s"
+                " — expected Source{[Schema=...,Item=...]} navigation step",
+                self.table.full_name,
+            )
+            return Lineage.empty()
+
+        schema_name: Optional[str] = accessor.items.get("Schema")
+        table_name: Optional[str] = accessor.items.get("Item")
+
+        qualified_table_name: str = f"{schema_name}.{table_name}"
+
+        logger.debug(
+            f"Platform({self.get_platform_pair().datahub_data_platform_name}) qualified_table_name= {qualified_table_name}"
+        )
+
+        urn = make_urn(
+            config=self.config,
+            platform_instance_resolver=self.platform_instance_resolver,
+            data_platform_pair=self.get_platform_pair(),
+            server=server,
+            qualified_table_name=qualified_table_name,
+        )
+
+        column_lineage = self.create_table_column_lineage(urn)
+
+        return Lineage(
+            upstreams=[
+                DataPlatformTable(
+                    data_platform_pair=self.get_platform_pair(),
+                    urn=urn,
+                )
+            ],
+            column_lineage=column_lineage,
+        )
+
+    def get_platform_pair(self) -> DataPlatformPair:
+        return SupportedDataPlatform.MYSQL.value
+
+
+class PostgresLineage(TwoStepDataAccessPattern):
+    def create_lineage(
+        self, data_access_func_detail: DataAccessFunctionDetail
+    ) -> Lineage:
+        return self.two_level_access_pattern(data_access_func_detail)
+
+    def get_platform_pair(self) -> DataPlatformPair:
+        return SupportedDataPlatform.POSTGRES_SQL.value
+
+
+class MSSqlLineage(TwoStepDataAccessPattern):
+    # https://learn.microsoft.com/en-us/sql/relational-databases/security/authentication-access/ownership-and-user-schema-separation?view=sql-server-ver16
+    DEFAULT_SCHEMA = "dbo"  # Default schema name in MS-SQL is dbo
+
+    def get_platform_pair(self) -> DataPlatformPair:
+        return SupportedDataPlatform.MS_SQL.value
+
+    def create_urn_using_old_parser(
+        self, query: str, db_name: str, server: str
+    ) -> List[DataPlatformTable]:
+        dataplatform_tables: List[DataPlatformTable] = []
+
+        tables: List[str] = self.get_tables_using_old_parser(query)
+
+        for parsed_table in tables:
+            # components: List[str] = [v.strip("[]") for v in parsed_table.split(".")]
+            components = [v.strip("[]") for v in parsed_table.split(".")]
+            if len(components) == 3:
+                database, schema, table = components
+            elif len(components) == 2:
+                schema, table = components
+                database = db_name
+            elif len(components) == 1:
+                (table,) = components
+                database = db_name
+                schema = MSSqlLineage.DEFAULT_SCHEMA
+            else:
+                self.reporter.warning(
+                    title="Invalid table format",
+                    message="The advanced SQL lineage feature (enable_advance_lineage_sql_construct) is disabled. Please either enable this feature or ensure the table is referenced as <db-name>.<schema-name>.<table-name> in the SQL.",
+                    context=f"table-name={self.table.full_name}",
+                )
+                continue
+
+            qualified_table_name = f"{database}.{schema}.{table}"
+            urn = make_urn(
+                config=self.config,
+                platform_instance_resolver=self.platform_instance_resolver,
+                data_platform_pair=self.get_platform_pair(),
+                server=server,
+                qualified_table_name=qualified_table_name,
+            )
+            dataplatform_tables.append(
+                DataPlatformTable(
+                    data_platform_pair=self.get_platform_pair(),
+                    urn=urn,
+                )
+            )
+
+        logger.debug(f"Generated upstream tables = {dataplatform_tables}")
+
+        return dataplatform_tables
+
+    def create_lineage(
+        self, data_access_func_detail: DataAccessFunctionDetail
+    ) -> Lineage:
+        node_map = data_access_func_detail.node_map
+
+        server, database = self.get_db_detail_from_argument(
+            data_access_func_detail.arg_list,
+            parameters=data_access_func_detail.parameters,
+        )
+        if database is None:
+            logger.debug(
+                "No database argument resolved for MSSql table %s — skipping lineage",
+                self.table.full_name,
+            )
+            return Lineage.empty()
+        if server is None:
+            # Server argument is an unresolved parameter reference (e.g. Sql.Database(ServerName, "db")).
+            # The parameter is not in the dataset's parameters dict, so we can't resolve the host.
+            # Fall back to empty-string server to preserve the pre-v2-parser behavior (partial lineage).
+            logger.info(
+                "Server argument not resolved from dataset parameters for table %s"
+                " — emitting partial lineage without server host."
+                " Add the server parameter to the dataset to resolve fully.",
+                self.table.full_name,
+            )
+            server = ""
+
+        # Check for inline SQL query in record arguments (e.g. [Query="SELECT ..."])
+        record_fields = _get_record_args(node_map, data_access_func_detail.arg_list)
+        query: Optional[str] = record_fields.get("Query")
+        if query:
+            if self.config.enable_advance_lineage_sql_construct is False:
+                # Use previous parser to generate URN to keep backward compatibility
+                return Lineage(
+                    upstreams=self.create_urn_using_old_parser(
+                        query=query,
+                        db_name=database,
+                        server=server,
+                    ),
+                    column_lineage=[],
+                )
+
+            return self.parse_custom_sql(
+                query=query,
+                database=database,
+                server=server,
+                schema=MSSqlLineage.DEFAULT_SCHEMA,
+            )
+
+        # It is a regular case of MS-SQL
+        logger.debug("Handling with regular case")
+        return self.two_level_access_pattern(data_access_func_detail)
+
+
+class MSSqlMultiDatabaseLineage(AbstractLineage):
+    # https://learn.microsoft.com/en-us/sql/relational-databases/security/authentication-access/ownership-and-user-schema-separation?view=sql-server-ver16
+    DEFAULT_SCHEMA = "dbo"  # Default schema name in MS-SQL is dbo
+
+    def get_platform_pair(self) -> DataPlatformPair:
+        return SupportedDataPlatform.MS_SQL.value
+
+    def create_lineage(
+        self, data_access_func_detail: DataAccessFunctionDetail
+    ) -> Lineage:
+        logger.debug(
+            f"Platform({self.get_platform_pair().datahub_data_platform_name}) function detail {data_access_func_detail}"
+        )
+
+        accessor = data_access_func_detail.identifier_accessor
+        if accessor is None or accessor.next is None:
+            return Lineage.empty()
+
+        # First is host name
+        server, _ = self.get_db_detail_from_argument(
+            data_access_func_detail.arg_list,
+            parameters=data_access_func_detail.parameters,
+        )
+        if server is None:
+            logger.debug("Server not found in MSSQL Sql.Databases data access function")
+            return Lineage.empty()
+
+        # Second is database name
+        db_name: str = accessor.items["Name"]
+        # Third is schema name and table name
+        schema_name: str = accessor.next.items["Schema"]
+        table_name: str = accessor.next.items["Item"]
+
+        qualified_table_name: str = f"{db_name}.{schema_name}.{table_name}"
+
+        urn = make_urn(
+            config=self.config,
+            platform_instance_resolver=self.platform_instance_resolver,
+            data_platform_pair=self.get_platform_pair(),
+            server=server,
+            qualified_table_name=qualified_table_name,
+        )
+
+        column_lineage = self.create_table_column_lineage(urn)
+
+        return Lineage(
+            upstreams=[
+                DataPlatformTable(
+                    data_platform_pair=self.get_platform_pair(),
+                    urn=urn,
+                )
+            ],
+            column_lineage=column_lineage,
+        )
+
+
+class ThreeStepDataAccessPattern(AbstractLineage, ABC):
+    def get_datasource_server(
+        self,
+        args: List[Optional[str]],
+        data_access_func_detail: DataAccessFunctionDetail,
+    ) -> str:
+        return args[0].strip('"') if args and args[0] else ""
+
+    def create_lineage(
+        self, data_access_func_detail: DataAccessFunctionDetail
+    ) -> Lineage:
+        logger.debug(
+            f"Processing {self.get_platform_pair().datahub_data_platform_name} function detail {data_access_func_detail}"
+        )
+
+        args = _get_arg_values(
+            data_access_func_detail.arg_list,
+            parameters=data_access_func_detail.parameters,
+        )
+
+        accessor = data_access_func_detail.identifier_accessor
+        if accessor is None or accessor.next is None or accessor.next.next is None:
+            return Lineage.empty()
+
+        # First is database name
+        db_name: str = accessor.items["Name"]
+        # Second is schema name
+        schema_name: str = accessor.next.items["Name"]
+        # Third is table name
+        table_name: str = accessor.next.next.items["Name"]
+
+        qualified_table_name: str = f"{db_name}.{schema_name}.{table_name}"
+
+        logger.debug(
+            f"{self.get_platform_pair().datahub_data_platform_name} qualified_table_name {qualified_table_name}"
+        )
+
+        server: str = self.get_datasource_server(args, data_access_func_detail)
+
+        urn = make_urn(
+            config=self.config,
+            platform_instance_resolver=self.platform_instance_resolver,
+            data_platform_pair=self.get_platform_pair(),
+            server=server,
+            qualified_table_name=qualified_table_name,
+        )
+
+        column_lineage = self.create_table_column_lineage(urn)
+
+        return Lineage(
+            upstreams=[
+                DataPlatformTable(
+                    data_platform_pair=self.get_platform_pair(),
+                    urn=urn,
+                )
+            ],
+            column_lineage=column_lineage,
+        )
+
+
+class SnowflakeLineage(ThreeStepDataAccessPattern):
+    def get_platform_pair(self) -> DataPlatformPair:
+        return SupportedDataPlatform.SNOWFLAKE.value
+
+
+class StarburstTrinoLineage(ThreeStepDataAccessPattern):
+    def get_platform_pair(self) -> DataPlatformPair:
+        return SupportedDataPlatform.STARBURST_TRINO.value
+
+
+class GoogleBigQueryLineage(ThreeStepDataAccessPattern):
+    def get_platform_pair(self) -> DataPlatformPair:
+        return SupportedDataPlatform.GOOGLE_BIGQUERY.value
+
+    def get_datasource_server(
+        self,
+        args: List[Optional[str]],
+        data_access_func_detail: DataAccessFunctionDetail,
+    ) -> str:
+        # In Google BigQuery server is project-name
+        return (
+            data_access_func_detail.identifier_accessor.items["Name"]
+            if data_access_func_detail.identifier_accessor is not None
+            else ""
+        )
+
+
+# Both Databricks connectors are called as (host, http path, [Database=…,
+# Catalog=…]), so a native query's database resolves identically for either.
+_DATABRICKS_NATIVE_QUERY_FUNCTIONS = frozenset(
+    {
+        FunctionName.DATABRICK_DATA_ACCESS.value,
+        FunctionName.DATABRICK_MULTI_CLOUD_DATA_ACCESS.value,
+    }
+)
+
+
+class NativeQueryLineage(AbstractLineage):
+    # Maps the full data-access function name (e.g. "Snowflake.Databases") to its platform.
+    SUPPORTED_NATIVE_QUERY_DATA_PLATFORM: dict = {
+        FunctionName.SNOWFLAKE_DATA_ACCESS.value: SupportedDataPlatform.SNOWFLAKE,
+        FunctionName.AMAZON_REDSHIFT_DATA_ACCESS.value: SupportedDataPlatform.AMAZON_REDSHIFT,
+        FunctionName.DATABRICK_DATA_ACCESS.value: SupportedDataPlatform.DATABRICKS_SQL,
+        FunctionName.DATABRICK_MULTI_CLOUD_DATA_ACCESS.value: SupportedDataPlatform.DatabricksMultiCloud_SQL,
+        FunctionName.MSSQL_DATA_ACCESS.value: SupportedDataPlatform.MS_SQL,
+        FunctionName.POSTGRESQL_DATA_ACCESS.value: SupportedDataPlatform.POSTGRES_SQL,
+        FunctionName.GOOGLE_BIGQUERY_DATA_ACCESS.value: SupportedDataPlatform.GOOGLE_BIGQUERY,
+    }
+    current_data_platform: SupportedDataPlatform = SupportedDataPlatform.SNOWFLAKE
+
+    def get_platform_pair(self) -> DataPlatformPair:
+        return self.current_data_platform.value
+
+    @staticmethod
+    def is_native_parsing_supported(data_access_function_name: str) -> bool:
+        return (
+            data_access_function_name
+            in NativeQueryLineage.SUPPORTED_NATIVE_QUERY_DATA_PLATFORM
+        )
+
+    def create_urn_using_old_parser(self, query: str, server: str) -> Lineage:
+        dataplatform_tables: List[DataPlatformTable] = []
+
+        tables: List[str] = self.get_tables_using_old_parser(query)
+
+        column_lineage = []
+        for qualified_table_name in tables:
+            if len(qualified_table_name.split(".")) != 3:
+                logger.debug(
+                    f"Skipping table {qualified_table_name} as it is not as per qualified_table_name format"
+                )
+                continue
+
+            urn = make_urn(
+                config=self.config,
+                platform_instance_resolver=self.platform_instance_resolver,
+                data_platform_pair=self.get_platform_pair(),
+                server=server,
+                qualified_table_name=qualified_table_name,
+            )
+
+            dataplatform_tables.append(
+                DataPlatformTable(
+                    data_platform_pair=self.get_platform_pair(),
+                    urn=urn,
+                )
+            )
+
+            column_lineage = self.create_table_column_lineage(urn)
+
+        logger.debug(f"Generated dataplatform_tables {dataplatform_tables}")
+
+        return Lineage(upstreams=dataplatform_tables, column_lineage=column_lineage)
+
+    def get_db_name(self, data_access_tokens: List[str]) -> Optional[str]:
+        if data_access_tokens[0] in _DATABRICKS_NATIVE_QUERY_FUNCTIONS:
+            database: Optional[str] = get_next_item(data_access_tokens, "Database")
+
+            if (
+                database and database != Constant.M_QUERY_NULL
+            ):  # database name is explicitly set
+                return database
+
+            return (
+                get_next_item(  # database name is set in Name argument
+                    data_access_tokens, "Name"
+                )
+                or get_next_item(  # If both above arguments are not available, then try Catalog
+                    data_access_tokens, "Catalog"
+                )
+            )
+
+        if data_access_tokens[0] == FunctionName.GOOGLE_BIGQUERY_DATA_ACCESS.value:
+            return get_next_item(data_access_tokens, "BillingProject")
+
+        if data_access_tokens[0] == FunctionName.SNOWFLAKE_DATA_ACCESS.value:
+            # Snowflake.Databases(server, warehouse) does not take the database
+            # as a function argument -- it comes from the next navigation step,
+            # e.g. Snowflake.Databases(...){[Name=<db>, Kind="Database"]}[Data].
+            return get_next_item(data_access_tokens, "Name")
+
+        return None
+
+    def create_lineage(
+        self, data_access_func_detail: DataAccessFunctionDetail
+    ) -> Lineage:
+        node_map = data_access_func_detail.node_map
+        invoke_node = data_access_func_detail.arg_list
+
+        elements = _get_invoke_elements(invoke_node)
+
+        if len(elements) < 2:
+            logger.debug(
+                "Expecting at least 2 arguments for Value.NativeQuery, got %d",
+                len(elements),
+            )
+            return Lineage.empty()
+
+        source_node = elements[0]
+        sql_node = elements[1]
+
+        # Extract SQL query from second arg
+        sql_query = get_literal_value(sql_node)
+        if sql_query is None:
+            logger.debug("Could not extract SQL query from second argument")
+            return Lineage.empty()
+
+        # Extract data source tokens from first arg
+        data_access_tokens = _get_data_source_tokens(
+            node_map, source_node, parameters=data_access_func_detail.parameters
+        )
+
+        if not data_access_tokens or not self.is_native_parsing_supported(
+            data_access_tokens[0]
+        ):
+            logger.debug(
+                "Unsupported native-query data-platform = %s",
+                data_access_tokens[0] if data_access_tokens else "none",
+            )
+            return Lineage.empty()
+
+        platform = self.SUPPORTED_NATIVE_QUERY_DATA_PLATFORM[data_access_tokens[0]]
+
+        if len(data_access_tokens) < 2 or (
+            platform == SupportedDataPlatform.SNOWFLAKE
+            and data_access_tokens[1] in _SNOWFLAKE_NAVIGATION_RECORD_KEYS
+        ):
+            logger.debug(
+                "Server not available in data source tokens for %s",
+                data_access_tokens[0],
+            )
+            return Lineage.empty()
+
+        self.current_data_platform = platform
+        # data_access_tokens[0] = platform name, [1] = first literal arg = server
+        # (for record-first connectors such as BigQuery this is a record key,
+        # used only for server_to_platform_instance lookup)
+        server = data_access_tokens[1]
+
+        if self.config.enable_advance_lineage_sql_construct is False:
+            return self.create_urn_using_old_parser(
+                query=sql_query,
+                server=server,
+            )
+
+        database_name: Optional[str] = self.get_db_name(data_access_tokens)
+
+        if (
+            database_name is None
+            and self.current_data_platform == SupportedDataPlatform.SNOWFLAKE
+            and _sql_has_unqualified_snowflake_tables(sql_query)
+        ):
+            self.reporter.warning(
+                title="Unresolved database name in Value.NativeQuery",
+                message=(
+                    "Could not determine the Snowflake database from the M-Query's "
+                    "data-access navigation chain (the `{[Name=...]}` step). This "
+                    "typically happens when `Name` is a Power Query parameter or "
+                    "identifier reference rather than a quoted literal, and the "
+                    "dataset's parameter values were not available. Lineage will "
+                    "still be attempted from the SQL text alone; any table "
+                    "referenced there without an explicit database prefix may "
+                    "resolve to the wrong URN or be dropped."
+                ),
+                context=f"table-full-name={self.table.full_name}, server={server}",
+            )
+
+        return self.parse_custom_sql(
+            query=sql_query,
+            server=server,
+            database=database_name,
+            schema=None,
+        )
+
+
+# Two-tier platforms whose connector URNs are schema.table. Their ODBC
+# navigation exposes a pseudo-catalog (e.g. Hive's constant "HIVE") that must be
+# dropped so URNs match (HiveSource is a TwoTierSQLAlchemySource). Derived from
+# the enum so a platform-name rename can't silently disable the catalog drop.
+ODBC_TWO_TIER_PLATFORMS = {SupportedDataPlatform.HIVE.value.datahub_data_platform_name}
+
+
+class OdbcLineage(AbstractLineage):
+    def create_lineage(
+        self, data_access_func_detail: DataAccessFunctionDetail
+    ) -> Lineage:
+        logger.debug(
+            f"Processing {self.get_platform_pair().powerbi_data_platform_name} "
+            f"data-access function detail {data_access_func_detail}"
+        )
+
+        connect_string, query = self.get_db_detail_from_argument(
+            data_access_func_detail.arg_list,
+            parameters=data_access_func_detail.parameters,
+        )
+
+        if not connect_string:
+            self.reporter.warning(
+                title="Can not extract ODBC connect string",
+                message="Can not extract ODBC connect string from data access function. Skipping Lineage creation.",
+                context=f"table-name={self.table.full_name}, data-access-func-detail={data_access_func_detail}",
+            )
+            return Lineage.empty()
+
+        logger.debug(f"ODBC connect string: {connect_string}")
+        data_platform, powerbi_platform = extract_platform(connect_string)
+        server_name = extract_server(connect_string)
+
+        dsn = extract_dsn(connect_string)
+        if not dsn:
+            self.reporter.warning(
+                title="Can not determine ODBC DSN",
+                message="Can not extract DSN from ODBC connect string. Skipping Lineage creation.",
+                context=f"table-name={self.table.full_name}, connect-string={connect_string}",
+            )
+            return Lineage.empty()
+        logger.debug(f"Extracted DSN: {dsn}")
+
+        if not data_platform:
+            server_name = dsn
+            if self.config.dsn_to_platform_name:
+                logger.debug(f"Attempting to map DSN {dsn} to platform")
+                name = self.config.dsn_to_platform_name.get(dsn)
+                if name:
+                    logger.debug(f"Found DSN {dsn} mapped to platform {name}")
+                    data_platform, powerbi_platform = normalize_platform_name(name)
+
+        if not data_platform or not powerbi_platform:
+            self.reporter.warning(
+                title="Can not determine ODBC platform",
+                message="Can not determine platform from ODBC connect string. Skipping Lineage creation.",
+                context=f"table-name={self.table.full_name}, connect-string={connect_string}",
+            )
+            return Lineage.empty()
+
+        platform_pair: DataPlatformPair = self.create_platform_pair(
+            data_platform, powerbi_platform
+        )
+
+        if not server_name and self.config.server_to_platform_instance:
+            self.reporter.warning(
+                title="Can not determine ODBC server name",
+                message="Can not determine server name with server_to_platform_instance mapping. Skipping Lineage creation.",
+                context=f"table-name={self.table.full_name}",
+            )
+            return Lineage.empty()
+        elif not server_name:
+            server_name = "unknown"
+
+        if self.is_sql_query(query, platform_pair.datahub_data_platform_name):
+            return self.query_lineage(query, platform_pair, server_name, dsn)
+        else:
+            return self.expression_lineage(
+                data_access_func_detail, data_platform, platform_pair, server_name
+            )
+
+    def query_lineage(
+        self,
+        query: Optional[str],
+        platform_pair: DataPlatformPair,
+        server_name: str,
+        dsn: str,
+    ) -> Lineage:
+        database = None
+        schema = None
+
+        if not query:
+            # query should never be None as it is checked before calling this function.
+            # however, we need to check just in case.
+            self.reporter.warning(
+                title="ODBC Query is null",
+                message="No SQL to parse. Skipping Lineage creation.",
+                context=f"table-name={self.table.full_name}",
+            )
+            return Lineage.empty()
+
+        if self.config.dsn_to_database_schema:
+            value = self.config.dsn_to_database_schema.get(dsn)
+            if value:
+                parts = value.split(".")
+                if len(parts) == 1:
+                    database = parts[0]
+                elif len(parts) == 2:
+                    database = parts[0]
+                    schema = parts[1]
+
+        logger.debug(
+            f"ODBC query processing: dsn={dsn} mapped to database={database}, schema={schema}"
+        )
+        result = self.parse_custom_sql(
+            query=query,
+            server=server_name,
+            database=database,
+            schema=schema,
+            platform_pair=platform_pair,
+        )
+        logger.debug(f"ODBC query lineage generated {len(result.upstreams)} upstreams")
+
+        # Athena-specific processing: catalog stripping and federated table platform override
+        if (
+            platform_pair.datahub_data_platform_name
+            == SupportedDataPlatform.AMAZON_ATHENA.value.datahub_data_platform_name
+        ):
+            # Strip Athena catalog prefix (e.g., "awsdatacatalog.") from URNs
+            # This ensures URN consistency with the standalone Athena connector
+            result = self._strip_athena_catalog_from_lineage(result)
+            # Apply table-specific platform overrides (e.g., athena -> mysql for federated tables)
+            result = self._apply_table_platform_override(result, dsn)
+
+        return result
+
+    @staticmethod
+    def _transform_lineage_urns(
+        lineage: Lineage, transform_fn: Callable[[str], str]
+    ) -> Lineage:
+        """
+        Transform URNs in lineage using the provided transformation function.
+
+        This is a helper method used by _strip_athena_catalog_from_lineage and
+        _apply_table_platform_override to avoid code duplication.
+
+        Args:
+            lineage: The lineage object to transform
+            transform_fn: Function that takes a URN string and returns a transformed URN
+
+        Returns:
+            New Lineage object with transformed URNs
+        """
+        # Transform upstream table URNs
+        updated_upstreams: List[DataPlatformTable] = []
+        for upstream in lineage.upstreams:
+            transformed_urn = transform_fn(upstream.urn)
+            updated_upstreams.append(
+                DataPlatformTable(
+                    data_platform_pair=upstream.data_platform_pair,
+                    urn=transformed_urn,
+                )
+            )
+
+        # Transform column lineage URNs
+        updated_column_lineage: List[ColumnLineageInfo] = []
+        for col_info in lineage.column_lineage:
+            updated_col_upstreams: List[ColumnRef] = []
+            for col_ref in col_info.upstreams:
+                transformed_table_urn = transform_fn(col_ref.table)
+                updated_col_upstreams.append(
+                    ColumnRef(table=transformed_table_urn, column=col_ref.column)
+                )
+
+            updated_column_lineage.append(
+                ColumnLineageInfo(
+                    downstream=col_info.downstream,
+                    upstreams=updated_col_upstreams,
+                    logic=col_info.logic,
+                )
+            )
+
+        return Lineage(
+            upstreams=updated_upstreams,
+            column_lineage=updated_column_lineage,
+        )
+
+    def _strip_athena_catalog_from_lineage(self, lineage: Lineage) -> Lineage:
+        """
+        Strip catalog/database prefix from Athena URNs to normalize to database.table format.
+
+        Athena queries may reference tables as:
+        - awsdatacatalog.database.table (AWS Glue catalog)
+        - catalog.database.table (any 3-part reference like thread-prod-data.normalized-data.table)
+
+        This method strips the first part from 3-part references to produce database.table format,
+        matching the standalone Athena connector URN format and enabling lineage connections
+        to entities cataloged with 2-part names.
+
+        This affects both:
+        - Table-level lineage (upstreams[*].urn)
+        - Column-level lineage (column_lineage[*].upstreams[*].table)
+        """
+
+        def strip_catalog_from_urn(urn: str) -> str:
+            """Strip first part from 3-part table names in URN."""
+            try:
+                parsed = DatasetUrn.from_string(urn)
+            except Exception as e:
+                logger.warning(f"Failed to parse URN for catalog stripping: {urn}: {e}")
+                return urn
+
+            parts = parsed.name.split(".")
+            if len(parts) < 3:
+                return urn
+
+            # Strip first part, keep remaining parts (database.table)
+            stripped_name = ".".join(parts[1:])
+            stripped_urn = str(
+                DatasetUrn(platform=parsed.platform, name=stripped_name, env=parsed.env)
+            )
+            logger.debug(f"Stripped catalog prefix from URN: {urn} -> {stripped_urn}")
+            return stripped_urn
+
+        return self._transform_lineage_urns(lineage, strip_catalog_from_urn)
+
+    def _apply_table_platform_override(self, lineage: Lineage, dsn: str) -> Lineage:
+        """
+        Override the platform in URNs for specific tables based on config.
+
+        This is used when Athena queries federated data sources (e.g., MySQL)
+        and the lineage should point to the actual source platform entity.
+
+        Matching priority:
+        1. DSN-scoped overrides (where override.dsn matches the current DSN)
+        2. Global overrides (where override.dsn is None)
+        """
+        if not self.config.athena_table_platform_override:
+            return lineage
+
+        def override_platform_in_urn(urn: str) -> str:
+            """Check if table matches override config and replace platform."""
+            try:
+                parsed = DatasetUrn.from_string(urn)
+            except Exception as e:
+                logger.warning(f"Failed to parse URN for platform override: {urn}: {e}")
+                return urn
+
+            urn_name = parsed.name  # format: "database.table"
+            current_platform = str(parsed.platform)
+
+            # Parse database and table from URN name
+            # Athena has no schema level, so expect exactly 2 parts (database.table)
+            # Skip override if format is unexpected (e.g., unstripped catalog prefix)
+            name_parts = urn_name.split(".")
+            if len(name_parts) != 2:
+                return urn
+            urn_database, urn_table = name_parts
+
+            # Find matching override: DSN-scoped first, then global
+            target_platform = None
+            for override in self.config.athena_table_platform_override:
+                if override.database == urn_database and override.table == urn_table:
+                    if override.dsn == dsn:
+                        # DSN-scoped match takes priority
+                        target_platform = override.platform
+                        break
+                    elif override.dsn is None and target_platform is None:
+                        # Global match (only if no DSN-scoped match found yet)
+                        target_platform = override.platform
+
+            if not target_platform:
+                return urn
+
+            overridden_urn = str(
+                DatasetUrn(platform=target_platform, name=urn_name, env=parsed.env)
+            )
+            logger.debug(
+                f"Overriding platform for table {urn_name}: {current_platform} -> {target_platform}"
+            )
+            return overridden_urn
+
+        return self._transform_lineage_urns(lineage, override_platform_in_urn)
+
+    def expression_lineage(
+        self,
+        data_access_func_detail: DataAccessFunctionDetail,
+        data_platform: str,
+        platform_pair: DataPlatformPair,
+        server_name: str,
+    ) -> Lineage:
+        database_name = None
+        schema_name = None
+        table_name = None
+        qualified_table_name = None
+
+        temp_accessor: Optional[IdentifierAccessor] = (
+            data_access_func_detail.identifier_accessor
+        )
+
+        while temp_accessor:
+            logger.debug(
+                f"identifier = {temp_accessor.identifier} items = {temp_accessor.items}"
+            )
+            if temp_accessor.items.get("Kind") == "Database":
+                database_name = temp_accessor.items["Name"]
+
+            if temp_accessor.items.get("Kind") == "Schema":
+                schema_name = temp_accessor.items["Name"]
+
+            # A view leaf uses Kind="View"; treat it as a table leaf
+            # (cf. create_reference_table).
+            if temp_accessor.items.get("Kind") in ("Table", "View"):
+                table_name = temp_accessor.items["Name"]
+
+            if temp_accessor.next is not None:
+                temp_accessor = temp_accessor.next
+            else:
+                break
+
+        if data_platform in ODBC_TWO_TIER_PLATFORMS and table_name is not None:
+            if schema_name is not None:
+                # Drop the pseudo-catalog database_name for two-tier platforms.
+                qualified_table_name = f"{schema_name}.{table_name}"
+            else:
+                # database_name here is the pseudo-catalog (e.g. "HIVE"), not a real
+                # schema; emitting it would produce a dangling URN. Surface instead.
+                self.reporter.warning(
+                    title="Cannot build two-tier ODBC table name",
+                    message="Two-tier ODBC navigation had no schema level; skipping lineage.",
+                    context=f"table-name={self.table.full_name}, data-platform={data_platform}, database={database_name}, table={table_name}",
+                )
+                return Lineage.empty()
+        elif (
+            database_name is not None
+            and schema_name is not None
+            and table_name is not None
+        ):
+            qualified_table_name = f"{database_name}.{schema_name}.{table_name}"
+        elif database_name is not None and table_name is not None:
+            qualified_table_name = f"{database_name}.{table_name}"
+
+        if not qualified_table_name:
+            self.reporter.warning(
+                title="Can not determine qualified table name",
+                message="Can not determine qualified table name for ODBC data source. Skipping Lineage creation.",
+                context=f"table-name={self.table.full_name}, data-platform={data_platform}",
+            )
+            logger.warning(
+                f"Can not determine qualified table name for ODBC data source {data_platform} "
+                f"table {self.table.full_name}."
+            )
+            return Lineage.empty()
+
+        logger.debug(
+            f"ODBC Platform {data_platform} found qualified table name {qualified_table_name}"
+        )
+
+        urn = make_urn(
+            config=self.config,
+            platform_instance_resolver=self.platform_instance_resolver,
+            data_platform_pair=platform_pair,
+            server=server_name,
+            qualified_table_name=qualified_table_name,
+        )
+
+        column_lineage = self.create_table_column_lineage(urn)
+
+        return Lineage(
+            upstreams=[
+                DataPlatformTable(
+                    data_platform_pair=platform_pair,
+                    urn=urn,
+                )
+            ],
+            column_lineage=column_lineage,
+        )
+
+    @staticmethod
+    def create_platform_pair(
+        data_platform: str, powerbi_platform: str
+    ) -> DataPlatformPair:
+        return DataPlatformPair(data_platform, powerbi_platform)
+
+    def get_platform_pair(self) -> DataPlatformPair:
+        return SupportedDataPlatform.ODBC.value
+
+
+class SupportedPattern(Enum):
+    DATABRICKS_QUERY = (
+        DatabricksLineage,
+        FunctionName.DATABRICK_DATA_ACCESS,
+    )
+
+    DATABRICKS_MULTI_CLOUD = (
+        DatabricksLineage,
+        FunctionName.DATABRICK_MULTI_CLOUD_DATA_ACCESS,
+    )
+
+    POSTGRES_SQL = (
+        PostgresLineage,
+        FunctionName.POSTGRESQL_DATA_ACCESS,
+    )
+
+    ORACLE = (
+        OracleLineage,
+        FunctionName.ORACLE_DATA_ACCESS,
+    )
+
+    SNOWFLAKE = (
+        SnowflakeLineage,
+        FunctionName.SNOWFLAKE_DATA_ACCESS,
+    )
+
+    MS_SQL = (
+        MSSqlLineage,
+        FunctionName.MSSQL_DATA_ACCESS,
+    )
+
+    MS_SQL_MULTI_DATABASE = (
+        MSSqlMultiDatabaseLineage,
+        FunctionName.MSSQL_MULTI_DATABASE_DATA_ACCESS,
+    )
+
+    GOOGLE_BIG_QUERY = (
+        GoogleBigQueryLineage,
+        FunctionName.GOOGLE_BIGQUERY_DATA_ACCESS,
+    )
+
+    AMAZON_ATHENA = (
+        AmazonAthenaLineage,
+        FunctionName.AMAZON_ATHENA_DATA_ACCESS,
+    )
+
+    AMAZON_REDSHIFT = (
+        AmazonRedshiftLineage,
+        FunctionName.AMAZON_REDSHIFT_DATA_ACCESS,
+    )
+
+    MYSQL = (
+        MySQLLineage,
+        FunctionName.MYSQL_DATA_ACCESS,
+    )
+
+    NATIVE_QUERY = (
+        NativeQueryLineage,
+        FunctionName.NATIVE_QUERY,
+    )
+
+    ODBC = (
+        OdbcLineage,
+        FunctionName.ODBC_DATA_ACCESS,
+    )
+
+    ODBC_QUERY = (
+        OdbcLineage,
+        FunctionName.ODBC_QUERY,
+    )
+
+    STARBURST_AAD = (
+        StarburstTrinoLineage,
+        FunctionName.STARBURST_AAD_DATA_ACCESS,
+    )
+
+    STARBURST_PRESTO = (
+        StarburstTrinoLineage,
+        FunctionName.STARBURST_PRESTO_DATA_ACCESS,
+    )
+
+    def handler(self) -> Type[AbstractLineage]:
+        return self.value[0]
+
+    def function_name(self) -> str:
+        return self.value[1].value
+
+    @staticmethod
+    def get_function_names() -> List[str]:
+        functions: List[str] = []
+        for supported_resolver in SupportedPattern:
+            functions.append(supported_resolver.function_name())
+
+        return functions
+
+    @staticmethod
+    def get_pattern_handler(function_name: str) -> Optional["SupportedPattern"]:
+        logger.debug(f"Looking for pattern-handler for {function_name}")
+        for supported_resolver in SupportedPattern:
+            if function_name == supported_resolver.function_name():
+                return supported_resolver
+        logger.debug(f"pattern-handler not found for function_name {function_name}")
+        return None

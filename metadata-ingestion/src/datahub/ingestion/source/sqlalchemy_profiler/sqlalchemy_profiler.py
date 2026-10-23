@@ -1,0 +1,2145 @@
+"""Custom SQLAlchemy-based profiler for DataHub metadata ingestion."""
+
+import collections
+import concurrent.futures
+import contextlib
+import dataclasses
+import json
+import logging
+import re
+import threading
+from datetime import datetime
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
+
+import sqlalchemy as sa
+import sqlalchemy.sql.compiler
+import sqlalchemy.types as sa_types
+from sqlalchemy.engine import Connection, Engine
+
+from datahub.emitter import mce_builder
+from datahub.emitter.mce_builder import get_sys_time
+from datahub.ingestion.graph.client import get_default_graph
+from datahub.ingestion.graph.config import ClientMode
+from datahub.ingestion.source.profiling.common import (
+    Cardinality,
+    convert_to_cardinality,
+)
+from datahub.ingestion.source.profiling.config import (
+    ProfilingConfig,
+    ProfilingIsolationLevel,
+)
+from datahub.ingestion.source.sql.sql_report import SQLSourceReport
+from datahub.ingestion.source.sqlalchemy_profiler.adapters import get_adapter
+from datahub.ingestion.source.sqlalchemy_profiler.base_adapter import (
+    PlatformAdapter,
+    ProfilingConnection,
+)
+from datahub.ingestion.source.sqlalchemy_profiler.profiling_context import (
+    ProfilingContext,
+)
+from datahub.ingestion.source.sqlalchemy_profiler.query_combiner import (
+    SQLAlchemyQueryCombiner,
+)
+from datahub.ingestion.source.sqlalchemy_profiler.query_combiner_runner import (
+    FutureResult,
+    QueryCombinerRunner,
+)
+from datahub.ingestion.source.sqlalchemy_profiler.type_mapping import (
+    NORMALIZE_TYPE_PATTERN,
+    ProfilerDataType,
+    _get_column_types_to_ignore,
+    get_column_profiler_type,
+    resolve_profiler_type_with_fallback,
+)
+from datahub.metadata.com.linkedin.pegasus2avro.schema import (
+    EditableSchemaMetadata,
+    SchemaMetadata,
+)
+from datahub.metadata.com.linkedin.pegasus2avro.timeseries import (
+    PartitionTypeClass,
+)
+from datahub.metadata.schema_classes import (
+    DatasetFieldProfileClass,
+    DatasetProfileClass,
+    HistogramClass,
+    PartitionSpecClass,
+    QuantileClass,
+    ValueFrequencyClass,
+)
+from datahub.metadata.urns import TagUrn
+from datahub.telemetry import stats, telemetry
+from datahub.utilities.perf_timer import PerfTimer
+
+
+def _get_columns_to_ignore_sampling(
+    dataset_name: str,
+    tags_to_ignore: Optional[List[str]],
+    platform: str,
+    env: str,
+) -> Tuple[bool, List[str]]:
+    """
+    Get columns to ignore sampling based on tags.
+
+    Uses the DataHub Graph API (which uses GraphQL under the hood) to fetch
+    dataset and column-level tags.
+
+    Error handling: errors from datahub_graph.get_tags() or get_aspect() are
+    caught by _resolve_sampling_ignore_list, which answers them by treating
+    the whole table as tagged rather than losing the profile.
+
+    Args:
+        dataset_name: Name of the dataset (table) to check
+        tags_to_ignore: List of tag names to filter on
+        platform: Platform name (e.g., 'bigquery', 'snowflake')
+        env: Environment (e.g., 'PROD', 'DEV')
+
+    Returns:
+        (ignore_table_sampling, columns_list_to_ignore_sampling) tuple where:
+        - ignore_table_sampling: True if table has a tag in tags_to_ignore
+        - columns_list_to_ignore_sampling: List of column names with tags in tags_to_ignore
+    """
+    logger.debug("Collecting columns to ignore for sampling")
+
+    if not tags_to_ignore:
+        return False, []
+
+    # TagUrn() accepts both full URNs and bare names, normalising both to the name portion.
+    tags_set = {TagUrn(t).name for t in tags_to_ignore}
+    dataset_urn = mce_builder.make_dataset_urn(
+        name=dataset_name, platform=platform, env=env
+    )
+    datahub_graph = get_default_graph(ClientMode.INGESTION)
+
+    dataset_tags = datahub_graph.get_tags(dataset_urn)
+    if dataset_tags and any(
+        TagUrn.from_string(ta.tag).name in tags_set for ta in dataset_tags.tags
+    ):
+        return True, []
+
+    # Collect from both aspects; use a set to deduplicate across them.
+    # SchemaMetadata holds ingestion-sourced column tags (e.g. from Snowflake).
+    # EditableSchemaMetadata holds tags applied via the DataHub UI.
+    columns_to_ignore: set[str] = set()
+
+    schema_metadata = datahub_graph.get_aspect(
+        entity_urn=dataset_urn, aspect_type=SchemaMetadata
+    )
+    if schema_metadata:
+        columns_to_ignore.update(
+            field.fieldPath
+            for field in schema_metadata.fields
+            if field.globalTags
+            and any(
+                TagUrn.from_string(ta.tag).name in tags_set
+                for ta in field.globalTags.tags
+            )
+        )
+
+    editable_metadata = datahub_graph.get_aspect(
+        entity_urn=dataset_urn, aspect_type=EditableSchemaMetadata
+    )
+    if editable_metadata:
+        columns_to_ignore.update(
+            field.fieldPath
+            for field in editable_metadata.editableSchemaFieldInfo
+            if field.globalTags
+            and any(
+                TagUrn.from_string(ta.tag).name in tags_set
+                for ta in field.globalTags.tags
+            )
+        )
+
+    return False, list(columns_to_ignore)
+
+
+if TYPE_CHECKING:
+    from datahub.ingestion.source.profiling.common import ProfilerRequest
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+BIGQUERY = "bigquery"
+ATHENA = "athena"
+TRINO = "trino"
+
+# How many tables the dialect allows in one join. The combined statement
+# cross-joins one subquery per query, so a batch above this cannot be parsed.
+# Platforms absent here either have no practical limit or it is not documented.
+MAX_JOINED_TABLES = {
+    "mysql": 61,
+    "mariadb": 61,
+    "sqlite": 64,
+}
+
+# A timed-out statement costs these platforms only the column it was for, not
+# the rest of the table, so the only isolation levels worth warning about are
+# the ones that hold a single read view across the whole table profile.
+MYSQL_FAMILY_PLATFORMS = {"mysql", "mariadb"}
+LEVELS_HOLDING_ONE_READ_VIEW = {"REPEATABLE READ", "SERIALIZABLE"}
+
+
+def format_profile_value(
+    value: Any,
+    col_type: ProfilerDataType,
+    *,
+    as_stat: bool = False,
+) -> Optional[str]:
+    """Format a profiling value as a consistent string.
+
+    Args:
+        value: Raw value from the database.
+        col_type: The column's profiler data type.
+        as_stat: If True, always format numeric values as float
+                 (for mean, median, stdev, quantiles).
+                 If False, format follows the column type
+                 (for min, max, histogram boundaries).
+    """
+    if value is None:
+        return None
+
+    if col_type == ProfilerDataType.DATETIME:
+        return _format_as_datetime(value)
+
+    if col_type in (
+        ProfilerDataType.INT,
+        ProfilerDataType.FLOAT,
+        ProfilerDataType.NUMERIC,
+    ):
+        if as_stat or col_type in (ProfilerDataType.FLOAT, ProfilerDataType.NUMERIC):
+            return _format_as_float(value)
+        else:
+            # INT column, data value (min/max/histogram)
+            return str(int(value))
+
+    return str(value)
+
+
+def _format_as_float(value: Any) -> str:
+    float_val = float(value)
+    if float_val.is_integer():
+        return f"{float_val:.1f}"
+    return str(float_val)
+
+
+def _format_as_datetime(value: Any) -> str:
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    # Some DBAPI drivers return strings instead of datetime objects.
+    # Parse and re-emit to guarantee ISO 8601 output.
+    s = str(value)
+    try:
+        return datetime.fromisoformat(s).isoformat()
+    except (ValueError, TypeError):
+        return s
+
+
+@dataclasses.dataclass
+class _ColumnSetup:
+    """What the column queries need before they can be scheduled."""
+
+    field_profiles: List[DatasetFieldProfileClass]
+    column_types: Dict[str, ProfilerDataType]
+    ignore_table_sampling: bool
+    columns_list_to_ignore_sampling: List[str]
+
+
+@dataclasses.dataclass(init=False)
+class SQLAlchemyProfiler:
+    """Custom SQLAlchemy-based profiler for DataHub metadata ingestion."""
+
+    report: SQLSourceReport
+    config: ProfilingConfig
+    times_taken: List[float]
+    total_row_count: int
+
+    base_engine: Engine
+    platform: str  # passed from parent source config
+    env: str
+
+    def __init__(
+        self,
+        conn: Union[Engine, Connection],
+        report: SQLSourceReport,
+        config: ProfilingConfig,
+        platform: str,
+        env: str = "PROD",
+        field_path_transform: Optional[Callable[[str], str]] = None,
+    ):
+        self.report = report
+        self.config = config
+        self.times_taken = []
+        self.total_row_count = 0
+
+        self.env = env
+        # How a stored column name becomes the field path the source emitted.
+        # A SQLAlchemy source emits reflection's normalized name, which is what
+        # the adapters return. A source that names columns by a rule of its own --
+        # Snowflake's depends on config this layer cannot see -- passes that rule
+        # in, so the translation still happens in one place.
+        self.field_path_transform = field_path_transform
+
+        # One adapter per worker thread rather than per table, so the Inspector
+        # it caches survives long enough to be worth caching. See _thread_adapter.
+        self._adapter_local = threading.local()
+
+        # TRICKY: The call to `.engine` is quite important here. Connection.connect()
+        # returns a "branched" connection, which does not actually use a new underlying
+        # DB-API object from the connection pool. Engine.connect() does what we want to
+        # make the threading code work correctly. As such, we need to make sure we've
+        # got an engine here.
+        self.base_engine = conn.engine
+
+        # SQLAlchemy's statement "linter" issues warnings about cartesian products in
+        # SELECT statements. The query combiner intentionally produces cartesian
+        # products, but they are safe because each "FROM" clause returns a single row,
+        # so the product is also a single row. Disable the linter here.
+        # Modified from https://github.com/sqlalchemy/sqlalchemy/blob/2f91dd79310657814ad28b6ef64f91fff7a007c9/lib/sqlalchemy/engine/create.py#L612
+        # SA 2.0 types compiler_linting as the Linting IntFlag; the in-place &= with
+        # the negated flag is an int to mypy, hence the extra assignment ignore.
+        self.base_engine.dialect.compiler_linting &= (  # type: ignore[attr-defined,assignment]
+            ~sqlalchemy.sql.compiler.COLLECT_CARTESIAN_PRODUCTS  # type: ignore[attr-defined]
+        )
+
+        self.platform = platform.lower()
+
+        # Resolve the profiling isolation level once, not per table. None (the
+        # default) means "set nothing", so the whole table profile runs under one
+        # transaction — unchanged from before this option existed. The per-table
+        # path only re-applies the resolved level (see the conn.execution_options
+        # call in _generate_single_profile).
+        isolation_level = self.config.profiling_isolation_level
+        self._profiling_isolation_level: Optional[str] = (
+            isolation_level.value if isolation_level is not None else None
+        )
+        # One log line per profiler instance if the isolation level is rejected —
+        # the structured report already dedups, but the logger does not. A profiler
+        # is built per database, so a multi-database run emits one line per database.
+        self._isolation_level_warning_logged = False
+        self._query_timeout_warning_logged = False
+        self._timeout_isolation_warning_logged = False
+        self._warn_if_batch_exceeds_join_limit()
+
+    def _get_columns_to_profile(self, table: sa.Table, dataset_name: str) -> List[str]:
+        """Get list of columns to profile based on config and patterns."""
+        if not self.config.any_field_level_metrics_enabled():
+            return []
+
+        columns_to_profile: List[str] = []
+        ignored_columns_by_pattern: List[str] = []
+        ignored_columns_by_type: List[str] = []
+
+        for column in table.columns:
+            col_name = column.name
+
+            # Check allow/deny patterns (format: <table>.<column>)
+            if not self.config._allow_deny_patterns.allowed(
+                f"{dataset_name}.{col_name}"
+            ):
+                ignored_columns_by_pattern.append(col_name)
+                continue
+
+            # Check nested fields
+            if not self.config.profile_nested_fields and "." in col_name:
+                ignored_columns_by_pattern.append(col_name)
+                continue
+
+            # Check column type
+            if self._should_ignore_column(column.type, column.name):
+                ignored_columns_by_type.append(col_name)
+                continue
+
+            columns_to_profile.append(col_name)
+
+        # Report ignored columns
+        if ignored_columns_by_pattern:
+            self.report.report_dropped(
+                f"The profile of columns by pattern {dataset_name}({', '.join(sorted(ignored_columns_by_pattern))})"
+            )
+        if ignored_columns_by_type:
+            self.report.report_dropped(
+                f"The profile of columns by type {dataset_name}({', '.join(sorted(ignored_columns_by_type))})"
+            )
+
+        # Apply max_number_of_fields_to_profile limit
+        if self.config.max_number_of_fields_to_profile is not None:
+            if len(columns_to_profile) > self.config.max_number_of_fields_to_profile:
+                columns_being_dropped = columns_to_profile[
+                    self.config.max_number_of_fields_to_profile :
+                ]
+                columns_to_profile = columns_to_profile[
+                    : self.config.max_number_of_fields_to_profile
+                ]
+                if self.config.report_dropped_profiles:
+                    self.report.report_dropped(
+                        f"The max_number_of_fields_to_profile={self.config.max_number_of_fields_to_profile} "
+                        f"reached. Profile of columns {dataset_name}({', '.join(sorted(columns_being_dropped))})"
+                    )
+
+        return columns_to_profile
+
+    def _should_ignore_column(
+        self, sqlalchemy_type: sa_types.TypeEngine, column_name: str
+    ) -> bool:
+        """Check if column should be ignored based on type."""
+        if str(sqlalchemy_type) == "NULL":
+            return True
+
+        # Get type name - prefer class name over string representation
+        # Class name is more reliable (e.g., "GEOGRAPHY" vs "geography")
+        type_name = type(sqlalchemy_type).__name__
+
+        # Normalize the type string from str() representation
+        sql_type = str(sqlalchemy_type)
+        match = re.match(NORMALIZE_TYPE_PATTERN, sql_type)
+        if match:
+            sql_type = match.group(1)
+
+        # Check both type class name and string representation (case-insensitive)
+        # Some dialects return lowercase (e.g., BigQuery GEOGRAPHY returns "geography")
+        types_to_ignore = _get_column_types_to_ignore(self.platform)
+        return (
+            type_name.upper() in types_to_ignore or sql_type.upper() in types_to_ignore
+        )
+
+    def _maybe_add_distinct_value_frequencies(
+        self,
+        runner: "QueryCombinerRunner",
+        sql_table: "sa.Table",
+        col_name: str,
+        column_profile: DatasetFieldProfileClass,
+        cardinality: Optional["Cardinality"],
+        allowed_cardinalities: set,
+        pretty_name: str,
+    ) -> None:
+        """
+        Add distinct value frequencies if configured and cardinality is in allowed set.
+
+        This helper method reduces code duplication for adding distinct value frequencies
+        across different column types (numeric, string, datetime, other).
+
+        Args:
+            runner: Query combiner runner for executing queries
+            sql_table: SQLAlchemy table object
+            col_name: Column name
+            column_profile: Profile object to update
+            cardinality: Column cardinality (ONE, TWO, VERY_FEW, FEW, etc.)
+            allowed_cardinalities: Set of cardinalities for which to add frequencies
+            pretty_name: Table name for error reporting
+        """
+        if (
+            self.config.include_field_distinct_value_frequencies
+            and cardinality
+            and cardinality in allowed_cardinalities
+        ):
+            try:
+                frequencies = runner.get_column_distinct_value_frequencies(
+                    sql_table, col_name
+                )
+                column_profile.distinctValueFrequencies = [
+                    ValueFrequencyClass(value=str(value), frequency=freq)
+                    for value, freq in frequencies
+                ]
+            except Exception as e:
+                logger.debug(
+                    f"Caught exception while attempting to get distinct value frequencies for column {col_name}. {e}"
+                )
+                self.report.warning(
+                    title="Profiling: Unable to Calculate Distinct Value Frequencies",
+                    message="Distinct value frequencies for the column will not be accessible",
+                    context=f"{pretty_name}.{col_name}",
+                    exc=e,
+                )
+
+    def _add_sample_values(
+        self,
+        runner: "QueryCombinerRunner",
+        sql_table: "sa.Table",
+        col_name: str,
+        column_profile: DatasetFieldProfileClass,
+        non_null_count: Optional[int],
+        row_count: Optional[int],
+        pretty_name: str,
+    ) -> None:
+        """
+        Add sample values to column profile.
+
+        Args:
+            runner: Query combiner runner for executing queries
+            sql_table: SQLAlchemy table object
+            col_name: Column name
+            column_profile: Profile object to update
+            non_null_count: Number of non-null values (None if unavailable)
+            row_count: Total row count in table
+            pretty_name: Table name for error reporting
+        """
+        try:
+            sample_values = runner.get_column_sample_values(
+                sql_table,
+                col_name,
+                limit=self.config.field_sample_values_limit,
+            )
+            sample_list = [str(value) for value in sample_values if value is not None]
+            if sample_list:
+                column_profile.sampleValues = sample_list
+            # For null-only columns (rows exist but all null), set empty list.
+            # Don't set it for empty tables (row_count == 0).
+            elif (
+                non_null_count is not None
+                and non_null_count == 0
+                and row_count is not None
+                and row_count > 0
+            ):
+                column_profile.sampleValues = []
+        except Exception as e:
+            logger.debug(
+                f"Caught exception while attempting to get sample values for column {col_name}. {e}"
+            )
+            self.report.warning(
+                title="Profiling: Unable to Calculate Sample Values",
+                message="The sample values for the column will not be accessible",
+                context=f"{pretty_name}.{col_name}",
+                exc=e,
+            )
+
+    def _process_numeric_column_stats(  # noqa: C901
+        self,
+        runner: "QueryCombinerRunner",
+        sql_table: "sa.Table",
+        col_name: str,
+        column_profile: DatasetFieldProfileClass,
+        col_type: "ProfilerDataType",
+        cardinality: Optional["Cardinality"],
+        non_null_count: Optional[int],
+        numeric_stats_futures: Dict[str, Dict[str, "FutureResult"]],
+        pretty_name: str,
+    ) -> None:
+        """
+        Process numeric column statistics (int/float).
+
+        Extracts batched numeric stats results and executes non-batchable complex queries.
+
+        Args:
+            runner: Query combiner runner for executing queries
+            sql_table: SQLAlchemy table object
+            col_name: Column name
+            column_profile: Profile object to update
+            col_type: Column data type (INT or FLOAT)
+            cardinality: Column cardinality
+            numeric_stats_futures: Dictionary of scheduled futures for numeric stats
+            pretty_name: Pretty name for error reporting
+        """
+        # Extract batched numeric stats results
+        if col_name in numeric_stats_futures:
+            futures = numeric_stats_futures[col_name]
+
+            # Process all numeric stats with unified error handling
+            if "min" in futures:
+                try:
+                    min_val = futures["min"].result()
+                    column_profile.min = format_profile_value(min_val, col_type)
+                except Exception as e:
+                    self.report.warning(
+                        title="Profiling: Unable to Calculate Min",
+                        message="The min for the column will not be accessible",
+                        context=f"{pretty_name}.{col_name}",
+                        exc=e,
+                    )
+
+            if "max" in futures:
+                try:
+                    max_val = futures["max"].result()
+                    column_profile.max = format_profile_value(max_val, col_type)
+                except Exception as e:
+                    self.report.warning(
+                        title="Profiling: Unable to Calculate Max",
+                        message="The max for the column will not be accessible",
+                        context=f"{pretty_name}.{col_name}",
+                        exc=e,
+                    )
+
+            if "mean" in futures:
+                try:
+                    mean_val = futures["mean"].result()
+                    column_profile.mean = format_profile_value(
+                        mean_val, col_type, as_stat=True
+                    )
+                except Exception as e:
+                    self.report.warning(
+                        title="Profiling: Unable to Calculate Mean",
+                        message="The mean for the column will not be accessible",
+                        context=f"{pretty_name}.{col_name}",
+                        exc=e,
+                    )
+
+            if "stdev" in futures:
+                try:
+                    stdev_val = futures["stdev"].result()
+                    if stdev_val is None:
+                        # NULL is ambiguous; the non-null count we already have
+                        # settles it without a second query.
+                        stdev_val = runner.adapter.resolve_stdev_null(non_null_count)
+                    column_profile.stdev = format_profile_value(
+                        stdev_val, col_type, as_stat=True
+                    )
+                except Exception as e:
+                    self.report.warning(
+                        title="Profiling: Unable to Calculate Standard Deviation",
+                        message="The stdev for the column will not be accessible",
+                        context=f"{pretty_name}.{col_name}",
+                        exc=e,
+                    )
+
+            if "median" in futures:
+                try:
+                    median_val = futures["median"].result()
+                    column_profile.median = format_profile_value(
+                        median_val, col_type, as_stat=True
+                    )
+                except Exception as e:
+                    self.report.warning(
+                        title="Profiling: Unable to Calculate Median",
+                        message="The median for the column will not be accessible",
+                        context=f"{pretty_name}.{col_name}",
+                        exc=e,
+                    )
+
+        # Non-batchable complex queries for numeric columns with sufficient cardinality
+        if self.config.include_field_quantiles:
+            if cardinality and cardinality in {
+                Cardinality.FEW,
+                Cardinality.MANY,
+                Cardinality.VERY_MANY,
+            }:
+                try:
+                    quantiles = runner.get_column_quantiles(
+                        sql_table,
+                        col_name,
+                        [0.05, 0.25, 0.5, 0.75, 0.95],
+                    )
+                    logger.debug(
+                        f"Quantiles for {col_name}: type={type(quantiles)}, "
+                        f"len={len(quantiles) if quantiles else 0}, value={quantiles}"
+                    )
+                    # Build the filtered list first; only assign if non-empty.
+                    # Adapters that don't support quantiles (e.g. MySQL has no
+                    # PERCENTILE_CONT) return [None, None, ...], which would
+                    # otherwise leak through as `"quantiles": []` in the JSON
+                    # output.
+                    quantiles_list = []
+                    for q, v in zip(
+                        [0.05, 0.25, 0.5, 0.75, 0.95],
+                        quantiles,
+                        strict=False,
+                    ):
+                        if v is None:
+                            continue
+                        formatted = format_profile_value(v, col_type, as_stat=True)
+                        assert formatted is not None
+                        quantiles_list.append(
+                            QuantileClass(quantile=str(q), value=formatted)
+                        )
+                    if quantiles_list:
+                        column_profile.quantiles = quantiles_list
+                except Exception as e:
+                    logger.debug(
+                        f"Caught exception while attempting to get column quantiles for column {col_name}. {e}"
+                    )
+                    self.report.warning(
+                        title="Profiling: Unable to Calculate Quantiles",
+                        message="The quantiles for the column will not be accessible",
+                        context=f"{pretty_name}.{col_name}",
+                        exc=e,
+                    )
+            else:
+                logger.info(
+                    f"Skipping quantiles for {pretty_name}.{col_name}: "
+                    f"cardinality {cardinality.name if cardinality else 'None'} "
+                    f"is too low (requires FEW/MANY/VERY_MANY)"
+                )
+
+        # Add histogram for numeric columns with high cardinality
+        if self.config.include_field_histogram:
+            if cardinality and cardinality in {
+                Cardinality.FEW,
+                Cardinality.MANY,
+                Cardinality.VERY_MANY,
+            }:
+                try:
+                    histogram = runner.get_column_histogram(sql_table, col_name)
+                    if histogram:
+                        # Convert to HistogramClass format
+                        # boundaries: bucket boundaries (k+1 values for k buckets)
+                        # heights: counts per bucket (k values)
+                        # Boundaries are interpolated floats (min + i * bucket_size),
+                        # so always format as float regardless of column type.
+                        boundaries = [
+                            _format_as_float(start) for start, _, _ in histogram
+                        ]
+                        # Add the last bucket end as final boundary
+                        if histogram:
+                            boundaries.append(_format_as_float(histogram[-1][1]))
+                        heights = [float(count) for _, _, count in histogram]
+                        column_profile.histogram = HistogramClass(
+                            boundaries=boundaries, heights=heights
+                        )
+                except Exception as e:
+                    logger.debug(
+                        f"Caught exception while attempting to get column histogram for column {col_name}. {e}"
+                    )
+                    self.report.warning(
+                        title="Profiling: Unable to Calculate Histogram",
+                        message="The histogram for the column will not be accessible",
+                        context=f"{pretty_name}.{col_name}",
+                        exc=e,
+                    )
+            else:
+                logger.info(
+                    f"Skipping histogram for {pretty_name}.{col_name}: "
+                    f"cardinality {cardinality.name if cardinality else 'None'} "
+                    f"is too low (requires FEW/MANY/VERY_MANY)"
+                )
+
+        # Add distinct value frequencies for low cardinality numeric columns
+        self._maybe_add_distinct_value_frequencies(
+            runner=runner,
+            sql_table=sql_table,
+            col_name=col_name,
+            column_profile=column_profile,
+            cardinality=cardinality,
+            allowed_cardinalities={
+                Cardinality.ONE,
+                Cardinality.TWO,
+                Cardinality.VERY_FEW,
+            },
+            pretty_name=pretty_name,
+        )
+
+    def _process_string_column_stats(
+        self,
+        runner: "QueryCombinerRunner",
+        sql_table: "sa.Table",
+        col_name: str,
+        column_profile: DatasetFieldProfileClass,
+        cardinality: Optional["Cardinality"],
+        pretty_name: str,
+    ) -> None:
+        """
+        Process string column statistics.
+
+        Args:
+            runner: Query combiner runner for executing queries
+            sql_table: SQLAlchemy table object
+            col_name: Column name
+            column_profile: Profile object to update
+            cardinality: Column cardinality
+            pretty_name: Table name for error reporting
+        """
+        # For string columns, add distinct value frequencies for low cardinality
+        self._maybe_add_distinct_value_frequencies(
+            runner=runner,
+            sql_table=sql_table,
+            col_name=col_name,
+            column_profile=column_profile,
+            cardinality=cardinality,
+            allowed_cardinalities={
+                Cardinality.ONE,
+                Cardinality.TWO,
+                Cardinality.VERY_FEW,
+                Cardinality.FEW,
+            },
+            pretty_name=pretty_name,
+        )
+
+    def _process_datetime_column_stats(
+        self,
+        runner: "QueryCombinerRunner",
+        sql_table: "sa.Table",
+        col_name: str,
+        column_profile: DatasetFieldProfileClass,
+        cardinality: Optional["Cardinality"],
+        numeric_stats_futures: Dict[str, Dict[str, "FutureResult"]],
+        pretty_name: str,
+    ) -> None:
+        """
+        Process datetime column statistics.
+
+        Args:
+            runner: Query combiner runner for executing queries
+            sql_table: SQLAlchemy table object
+            col_name: Column name
+            column_profile: Profile object to update
+            cardinality: Column cardinality
+            numeric_stats_futures: Dictionary of scheduled futures for datetime min/max
+            pretty_name: Pretty name for error reporting
+        """
+        # Extract batched min/max results for datetime columns
+        if col_name in numeric_stats_futures:
+            futures = numeric_stats_futures[col_name]
+
+            if "min" in futures:
+                try:
+                    min_val = futures["min"].result()
+                    column_profile.min = format_profile_value(
+                        min_val, ProfilerDataType.DATETIME
+                    )
+                except Exception as e:
+                    self.report.warning(
+                        title="Profiling: Unable to Calculate Min",
+                        message="The min for the column will not be accessible",
+                        context=f"{pretty_name}.{col_name}",
+                        exc=e,
+                    )
+
+            if "max" in futures:
+                try:
+                    max_val = futures["max"].result()
+                    column_profile.max = format_profile_value(
+                        max_val, ProfilerDataType.DATETIME
+                    )
+                except Exception as e:
+                    self.report.warning(
+                        title="Profiling: Unable to Calculate Max",
+                        message="The max for the column will not be accessible",
+                        context=f"{pretty_name}.{col_name}",
+                        exc=e,
+                    )
+
+        # Add distinct value frequencies for low cardinality datetime columns
+        self._maybe_add_distinct_value_frequencies(
+            runner=runner,
+            sql_table=sql_table,
+            col_name=col_name,
+            column_profile=column_profile,
+            cardinality=cardinality,
+            allowed_cardinalities={
+                Cardinality.ONE,
+                Cardinality.TWO,
+                Cardinality.VERY_FEW,
+                Cardinality.FEW,
+            },
+            pretty_name=pretty_name,
+        )
+
+    def _process_other_column_stats(
+        self,
+        runner: "QueryCombinerRunner",
+        sql_table: "sa.Table",
+        col_name: str,
+        column_profile: DatasetFieldProfileClass,
+        cardinality: Optional["Cardinality"],
+        pretty_name: str,
+    ) -> None:
+        """
+        Process statistics for other column types (boolean, binary, etc.).
+
+        Args:
+            runner: Query combiner runner for executing queries
+            sql_table: SQLAlchemy table object
+            col_name: Column name
+            column_profile: Profile object to update
+            cardinality: Column cardinality
+            pretty_name: Table name for error reporting
+        """
+        # For other types, add distinct value frequencies for low cardinality
+        self._maybe_add_distinct_value_frequencies(
+            runner=runner,
+            sql_table=sql_table,
+            col_name=col_name,
+            column_profile=column_profile,
+            cardinality=cardinality,
+            allowed_cardinalities={
+                Cardinality.ONE,
+                Cardinality.TWO,
+                Cardinality.VERY_FEW,
+                Cardinality.FEW,
+            },
+            pretty_name=pretty_name,
+        )
+
+    def generate_profiles(
+        self,
+        requests: List["ProfilerRequest"],
+        max_workers: int,
+        platform: Optional[str] = None,
+        profiler_args: Optional[Dict] = None,
+    ) -> Iterable[Tuple["ProfilerRequest", Optional[DatasetProfileClass]]]:
+        """
+        Generate dataset profiles for a list of requests.
+
+        This is the main entry point for profiling a batch of requests.
+        """
+        max_workers = min(max_workers, len(requests)) if requests else max_workers
+        if max_workers <= 0:
+            max_workers = 1
+        logger.info(
+            f"Will profile {len(requests)} table(s) with {max_workers} worker(s) - this may take a while"
+        )
+
+        with (
+            PerfTimer() as timer,
+            concurrent.futures.ThreadPoolExecutor(
+                max_workers=max_workers
+            ) as async_executor,
+            SQLAlchemyQueryCombiner(
+                enabled=self.config.query_combiner_enabled,
+                catch_exceptions=self.config.catch_exceptions,
+                serial_execution_fallback_enabled=True,
+                flatten_enabled=self.config.query_combiner_flatten_enabled,
+                max_distinct_per_statement=self.config.max_distinct_per_statement,
+                max_queries_to_combine=self.config.max_queries_to_combine,
+                # A pure predicate on the exception, so the calling thread's
+                # adapter answers for every worker's.
+                is_query_timeout=self._thread_adapter(self.platform).is_query_timeout,
+            ).activate() as query_combiner,
+        ):
+            # Submit the profiling requests to the thread pool executor.
+            async_profiles = collections.deque(
+                async_executor.submit(
+                    self._generate_profile_from_request,
+                    query_combiner,
+                    request,
+                    platform=platform,
+                    profiler_args=profiler_args,
+                )
+                for request in requests
+            )
+
+            # Avoid using as_completed so that the results are yielded in the
+            # same order as the requests.
+            while len(async_profiles) > 0:
+                async_profile = async_profiles.popleft()
+                yield async_profile.result()
+
+        total_time_taken = timer.elapsed_seconds()
+        logger.info(
+            f"Profiling {len(requests)} table(s) finished in {total_time_taken:.3f} seconds"
+        )
+
+        time_percentiles: Dict[str, float] = {}
+
+        if len(self.times_taken) > 0:
+            percentiles = [50, 75, 95, 99]
+            percentile_values = stats.calculate_percentiles(
+                self.times_taken, percentiles
+            )
+
+            time_percentiles = {
+                f"table_time_taken_p{percentile}": stats.discretize(
+                    percentile_values[percentile]
+                )
+                for percentile in percentiles
+            }
+
+        telemetry.telemetry_instance.ping(
+            "sql_profiling_summary",
+            {
+                "total_time_taken": stats.discretize(total_time_taken),
+                "count": stats.discretize(len(self.times_taken)),
+                "total_row_count": stats.discretize(self.total_row_count),
+                "platform": self.platform,
+                **time_percentiles,
+            },
+        )
+
+        self.report.report_from_query_combiner(query_combiner.report)
+
+    def _generate_profile_from_request(
+        self,
+        query_combiner: SQLAlchemyQueryCombiner,
+        request: "ProfilerRequest",
+        platform: Optional[str] = None,
+        profiler_args: Optional[Dict] = None,
+    ) -> Tuple["ProfilerRequest", Optional[DatasetProfileClass]]:
+        return request, self._generate_single_profile(
+            query_combiner=query_combiner,
+            pretty_name=request.pretty_name,
+            platform=platform,
+            profiler_args=profiler_args,
+            **request.batch_kwargs,
+        )
+
+    def _uses_row_count_estimate(self, adapter: PlatformAdapter) -> bool:
+        return (
+            self.config.profile_table_row_count_estimate_only
+            and adapter.supports_row_count_estimation()
+        )
+
+    def _warn_if_batch_exceeds_join_limit(self) -> None:
+        """
+        Above the dialect's join limit every merged statement fails.
+
+        The combined statement cross-joins one subquery per query, so a batch
+        larger than the limit cannot be parsed and the whole batch is retried
+        one query at a time -- slower than not combining at all, and the only
+        visible sign is `query_exceptions`. Flattening does not join, so it is
+        bounded only through its re-route onto the joining path.
+        """
+        if not self.config.query_combiner_enabled:
+            return
+        limit = MAX_JOINED_TABLES.get(self.platform)
+        if limit is None or self.config.max_queries_to_combine <= limit:
+            return
+        self.report.warning(
+            title="Profiling: max_queries_to_combine above the join limit",
+            message=(
+                "A combined statement above the limit fails to parse and is "
+                "retried one query at a time, which is slower than leaving the "
+                "queries uncombined. With flattening on this hits the re-route "
+                "rather than the normal path, since a flat statement does not "
+                "join. Lower max_queries_to_combine to the limit or below."
+            ),
+            context=(
+                f"Platform: {self.platform}; "
+                f"max_queries_to_combine={self.config.max_queries_to_combine}; "
+                f"join limit={limit}"
+            ),
+        )
+
+    def _rollback_quietly(self, conn: Connection) -> None:
+        try:
+            conn.rollback()
+        except Exception:
+            logger.debug("Rollback failed", exc_info=True)
+
+    def _warn_if_timeout_needs_autocommit(
+        self, conn: Connection, pretty_name: str
+    ) -> None:
+        """
+        A per-statement limit does not do its job on every isolation level.
+
+        The reason differs by platform, so the warning does too. On Postgres a
+        timed-out statement leaves the transaction aborted and the per-column
+        queries that follow fail with it, which is true at every level below
+        AUTOCOMMIT. On MySQL nothing is lost that way, but REPEATABLE READ and
+        SERIALIZABLE hold one read view from the first statement until the
+        commit, so a per-statement limit does not bound it; READ COMMITTED
+        takes a fresh view per statement and is as sound as AUTOCOMMIT here.
+        """
+        if self._timeout_isolation_warning_logged:
+            return
+        requested = (
+            conn.get_execution_options().get("isolation_level")
+            or self._profiling_isolation_level
+        )
+        if requested == ProfilingIsolationLevel.AUTOCOMMIT.value:
+            return
+        try:
+            # The driver's own state, not get_isolation_level(), which reports
+            # the server's level and so never says AUTOCOMMIT. It is also the
+            # only thing that sees an engine built with
+            # isolation_level=AUTOCOMMIT, which is how the Postgres source
+            # connects by default.
+            #
+            # psycopg2 exposes it as a bool attribute; PyMySQL and mysqlclient
+            # expose get_autocommit() and leave `autocommit` a method, which is
+            # always truthy.
+            dbapi = conn.connection.dbapi_connection
+            getter = getattr(dbapi, "get_autocommit", None)
+            flag = getter() if callable(getter) else getattr(dbapi, "autocommit", None)
+            if not isinstance(flag, bool):
+                # An unknown driver shape. Say nothing rather than guess.
+                return
+            if flag:
+                return
+            level = requested or conn.get_isolation_level()
+        except Exception:
+            # Cannot tell, so say nothing rather than warn on a healthy setup.
+            logger.debug("Could not read the isolation level", exc_info=True)
+            return
+
+        if self.platform in MYSQL_FAMILY_PLATFORMS:
+            if str(level).upper().replace("_", " ") not in LEVELS_HOLDING_ONE_READ_VIEW:
+                return
+            reason = (
+                "the server holds one read view from the first statement until "
+                "the commit at this level, so a per-statement limit does not "
+                "bound the view this option exists to bound. Set "
+                "profiling_isolation_level: AUTOCOMMIT or READ COMMITTED."
+            )
+        else:
+            reason = (
+                "a statement that hits the limit leaves the transaction "
+                "aborted, so the table loses every per-column metric that runs "
+                "after it -- quantiles, histograms, value frequencies, sample "
+                "values. Set profiling_isolation_level: AUTOCOMMIT."
+            )
+
+        self._timeout_isolation_warning_logged = True
+        self.report.warning(
+            title="Profiling: query timeout set on a transactional connection",
+            message=f"query_timeout_seconds is set, but {reason}",
+            context=f"Asset: {pretty_name}; isolation_level={level}",
+        )
+
+    def _warn_query_timeout_unavailable(
+        self, pretty_name: str, seconds: int, e: Exception
+    ) -> None:
+        self.report.warning(
+            title="Profiling: query timeout unavailable",
+            message=(
+                "The database did not accept the requested statement timeout. "
+                "Profiling may run without one, so a single aggregate over a "
+                "large table can hold a read view for as long as it takes. On "
+                "MySQL the SET is not transactional, so a limit that applied "
+                "but failed to commit is still in effect."
+            ),
+            context=f"Asset: {pretty_name}; query_timeout_seconds={seconds}",
+            exc=e,
+            log=not self._query_timeout_warning_logged,
+        )
+        self._query_timeout_warning_logged = True
+        if not self.config.catch_exceptions:
+            raise e
+
+    def _install_query_timeout(
+        self,
+        stack: contextlib.ExitStack,
+        conn: Connection,
+        adapter: PlatformAdapter,
+        pretty_name: str,
+    ) -> None:
+        """
+        Put a per-statement time limit on the profiling connection, and arrange
+        for it to come back off before the connection returns to the pool.
+        """
+        seconds = self.config.query_timeout_seconds
+        if seconds is None:
+            return
+        timeout = adapter.get_query_timeout_statements(seconds)
+        if timeout is None:
+            if not self._query_timeout_warning_logged:
+                logger.info(
+                    f"query_timeout_seconds is set but {self.platform} has no "
+                    f"session statement timeout; profiling will run without one."
+                )
+                self._query_timeout_warning_logged = True
+            return
+        # After the support check: a platform that ignores the option has no
+        # timeout to warn about the consequences of.
+        self._warn_if_timeout_needs_autocommit(conn, pretty_name)
+
+        # Driver-level, so the combiner's patched Connection.execute does not
+        # count session bookkeeping as profiling queries, and so a restored
+        # value containing ':' is not read as a bind parameter.
+        try:
+            # Put back what was there, not the server default: the session may
+            # already carry a limit from init_command or a connect listener.
+            previous = conn.exec_driver_sql(timeout.read).scalar()
+            conn.exec_driver_sql(timeout.apply)
+        except Exception as e:
+            # A rejected SET leaves Postgres in an aborted transaction, which
+            # would cost the table every query that follows.
+            self._rollback_quietly(conn)
+            self._warn_query_timeout_unavailable(pretty_name, seconds, e)
+            return
+
+        # Registered before the commit, not after: SET SESSION is not
+        # transactional on MySQL, so a commit that fails still leaves the limit
+        # on a connection the pool shares with metadata extraction.
+        clear = timeout.restore.format(value=previous)
+        stack.callback(self._clear_query_timeout, conn, clear)
+
+        # Commit the SET itself. On Postgres a non-LOCAL SET belongs to the
+        # open transaction, and the serial fallback rolls back before every
+        # retry -- which would drop the limit exactly when a query has already
+        # proved slow enough to need it.
+        try:
+            conn.commit()
+        except Exception as e:
+            self._rollback_quietly(conn)
+            self._warn_query_timeout_unavailable(pretty_name, seconds, e)
+
+    def _clear_query_timeout(self, conn: Connection, clear: str) -> None:
+        """
+        Take the time limit back off the connection, whatever else went wrong.
+
+        Runs as the table's profile is finishing, when the transaction may be
+        aborted, so it rolls back first and never raises: the profile is already
+        built and must not be discarded over cleanup. If the limit cannot be
+        removed the connection is discarded instead of returned to the pool,
+        which metadata extraction shares.
+        """
+        try:
+            conn.rollback()
+            conn.exec_driver_sql(clear)
+            conn.commit()
+        except Exception as e:
+            logger.warning(
+                f"Could not clear the profiling query timeout ({type(e).__name__}); "
+                f"discarding the connection so the limit cannot leak to the pool."
+            )
+            logger.debug("Could not clear the profiling query timeout", exc_info=e)
+            try:
+                conn.invalidate()
+            except Exception:
+                logger.debug("Could not invalidate the connection", exc_info=True)
+
+    def _schedule_row_count(
+        self,
+        batch: QueryCombinerRunner,
+        sql_table: sa.Table,
+        adapter: PlatformAdapter,
+        pretty_name: str,
+    ) -> FutureResult[int]:
+        use_estimation = self._uses_row_count_estimate(adapter)
+        logger.debug(
+            f"Getting row count for {pretty_name}: use_estimation={use_estimation}"
+        )
+        return batch.get_row_count(sql_table, use_estimation=use_estimation)
+
+    def _extract_row_count(
+        self,
+        row_count_future: FutureResult[int],
+        profile: DatasetProfileClass,
+        context: ProfilingContext,
+        pretty_name: str,
+    ) -> Optional[int]:
+        """
+        Extract the row count and update the partition spec if sampling was applied.
+
+        Returns:
+            Row count (or None if unavailable)
+        """
+        # Extract row count result with exception handling
+        try:
+            profile.rowCount = row_count_future.result()
+            row_count = profile.rowCount
+            logger.debug(
+                f"Row count result for {pretty_name}: {row_count}, type: {type(row_count)}"
+            )
+            self.total_row_count += row_count if row_count is not None else 0
+        except Exception as e:
+            logger.debug(
+                f"Caught exception while attempting to get row count for {pretty_name}. {e}"
+            )
+            self.report.warning(
+                title="Profiling: Unable to Get Row Count",
+                message="Row count for the table will not be accessible",
+                context=pretty_name,
+                exc=e,
+            )
+            profile.rowCount = None
+            row_count = None
+
+        # Record that sampling happened, never the sample's size: a BERNOULLI
+        # sample lands on a different row count every run, and partitionSpec is
+        # emitted, so a size would change the profile for an unchanged table.
+        if context.is_sampled:
+            if (
+                profile.partitionSpec
+                and profile.partitionSpec.type == PartitionTypeClass.FULL_TABLE
+            ):
+                profile.partitionSpec = PartitionSpecClass(
+                    type=PartitionTypeClass.QUERY, partition="SAMPLE"
+                )
+            elif (
+                profile.partitionSpec
+                and profile.partitionSpec.type == PartitionTypeClass.PARTITION
+            ):
+                profile.partitionSpec.partition += " SAMPLE"
+
+        return row_count
+
+    def _resolve_sampling_ignore_list(
+        self,
+        sql_table: sa.Table,
+        adapter: PlatformAdapter,
+        conn: Connection,
+        pretty_name: str,
+        platform: str,
+    ) -> Tuple[bool, List[str]]:
+        """Which columns opt out of sampling, per tags_to_ignore_sampling.
+
+        The tag lookup is non-fatal by design: it reaches the DataHub server,
+        and a failure there used to cost the whole profile -- including the
+        rowCount -- in exchange for a sampling hint.
+
+        It fails closed. The option names columns whose values must not reach
+        DataHub, so a lookup failure is answered with "treat the whole table as
+        tagged": counts and the row count still go out, sample values and
+        min/max do not. Answering "nothing is tagged" would publish values for
+        exactly the columns the option exists to protect, behind a warning.
+
+        Only the lookup is caught. Mapping the result onto stored column names
+        is local work against the schema, so a failure there is a real defect
+        and belongs with the caller's error handling, not under this title.
+        """
+        try:
+            ignore_table_sampling, ignore_list = _get_columns_to_ignore_sampling(
+                pretty_name,
+                self.config.tags_to_ignore_sampling,
+                platform,
+                self.env,
+            )
+        except Exception as e:
+            if not self.config.catch_exceptions:
+                raise
+            self.report.warning(
+                title="Profiling: sampling tags unavailable",
+                message=(
+                    "Could not resolve tags_to_ignore_sampling, so the whole "
+                    "table is treated as tagged: the row count and the null "
+                    "and unique counts are profiled; column values (sample "
+                    "values, min/max/mean, stddev, median, histograms, "
+                    "quantiles and distinct value frequencies) are not."
+                ),
+                context=pretty_name,
+                exc=e,
+            )
+            return True, []
+
+        return ignore_table_sampling, self._ignore_list_as_stored_names(
+            ignore_list, sql_table, adapter, conn
+        )
+
+    def _ignore_list_as_stored_names(
+        self,
+        ignore_paths: List[str],
+        sql_table: sa.Table,
+        adapter: "PlatformAdapter",
+        conn: Connection,
+    ) -> List[str]:
+        """Translate tag-derived field paths into the names profiling uses.
+
+        `tags_to_ignore_sampling` is resolved against the dataset in DataHub, so
+        it comes back as emitted field paths. Profiling addresses columns by
+        their stored name, which on a normalizing dialect is a different string,
+        and the membership tests downstream would simply never hit.
+
+        Compared exactly. Two columns differing only by case are two columns, and
+        on a platform where both can exist, tagging one must not silence the other.
+        """
+        if not ignore_paths:
+            return ignore_paths
+        wanted = set(ignore_paths)
+        return [
+            str(column.name)
+            for column in sql_table.columns
+            if self._emitted_field_path(str(column.name), adapter, conn) in wanted
+        ]
+
+    def _emitted_field_path(
+        self, stored_name: str, adapter: "PlatformAdapter", conn: Connection
+    ) -> str:
+        """The field path the source emitted for a column profiling addresses.
+
+        str() sheds sqlalchemy's quoted_name, a str subclass whose .lower() and
+        .upper() return self when the identifier is quoted -- right for SQL, but
+        it makes every downstream fold silently do nothing.
+        """
+        stored_name = str(stored_name)
+        if self.field_path_transform is not None:
+            return self.field_path_transform(stored_name)
+        return adapter.field_path_for(stored_name, conn)
+
+    def _to_emitted_field_paths(
+        self,
+        field_profiles: List[DatasetFieldProfileClass],
+        adapter: "PlatformAdapter",
+        conn: Connection,
+        pretty_name: str,
+    ) -> List[DatasetFieldProfileClass]:
+        """Translate stored column names into the paths the source emitted.
+
+        Profiling addresses columns by their stored identifier so that two columns
+        differing only by case stay distinct all the way through. A profile has to
+        attach to schemaMetadata, though, so the identifier becomes a field path
+        exactly once, here, at the boundary.
+
+        Two stored names can translate to one path — that is what a case collision
+        looks like once folded — and the schema declares a single field for them.
+        Keep the first, since a second profile on one field path is dropped
+        downstream anyway, and report it: the surviving profile carries whichever
+        column came first, so the statistics under the folded path may belong to
+        the other column, and which one wins moves with column order.
+        """
+        translated: List[DatasetFieldProfileClass] = []
+        seen: Set[str] = set()
+        collapsed: List[str] = []
+        for field_profile in field_profiles:
+            stored_name = str(field_profile.fieldPath)
+            field_profile.fieldPath = self._emitted_field_path(
+                stored_name, adapter, conn
+            )
+            if field_profile.fieldPath in seen:
+                collapsed.append(f"{stored_name} -> {field_profile.fieldPath}")
+                continue
+            seen.add(field_profile.fieldPath)
+            translated.append(field_profile)
+        if collapsed:
+            self.report.warning(
+                title="Column statistics dropped for a case-folded column",
+                message="Columns differing only by case fold to one field path, "
+                "which the schema declares once, so only the first column's "
+                "statistics are kept. The statistics under that path may belong "
+                "to either column, and which one survives depends on column "
+                "order. Enable the source's case-preserving option, if it has "
+                "one, to keep the columns distinct.",
+                context=f"{pretty_name}: {sorted(collapsed)}",
+            )
+        return translated
+
+    def _create_field_profiles(
+        self, all_columns: List[str], columns_to_profile_set: set
+    ) -> List[DatasetFieldProfileClass]:
+        """
+        Create empty field profiles for all columns.
+
+        Field profiles are created for ALL columns in the table,
+        but stats will only be calculated for columns in columns_to_profile_set.
+        Returns:
+            List of empty DatasetFieldProfileClass objects
+        """
+        field_profiles = []
+        if columns_to_profile_set:
+            for col_name in all_columns:
+                field_profile = DatasetFieldProfileClass(fieldPath=col_name)
+                field_profiles.append(field_profile)
+        return field_profiles
+
+    def _prepare_column_setup(
+        self,
+        sql_table: sa.Table,
+        adapter: PlatformAdapter,
+        conn: Connection,
+        pretty_name: str,
+        platform: str,
+    ) -> _ColumnSetup:
+        """Everything the column queries need, from the schema and the tags.
+
+        Issues no query against the table, but the tag lookup reaches the
+        DataHub server, so this runs where the column queries are scheduled
+        rather than at the top of the profile.
+
+        That still puts it ahead of the row count whenever the count is folded
+        in -- the default -- because scheduling a column query needs the column
+        list first. Only the unfolded path, with the combiner off, gets to skip
+        it on an empty or unreadable table.
+        """
+        columns_to_profile = self._get_columns_to_profile(sql_table, pretty_name)
+        ignore_table_sampling, columns_list_to_ignore_sampling = (
+            self._resolve_sampling_ignore_list(
+                sql_table, adapter, conn, pretty_name, platform
+            )
+        )
+
+        columns_to_profile_set = set(columns_to_profile)
+        return _ColumnSetup(
+            field_profiles=self._create_field_profiles(
+                [col.name for col in sql_table.columns], columns_to_profile_set
+            ),
+            column_types=self._resolve_column_types(
+                sql_table=sql_table,
+                columns_to_profile_set=columns_to_profile_set,
+                platform=platform,
+            ),
+            ignore_table_sampling=ignore_table_sampling,
+            columns_list_to_ignore_sampling=columns_list_to_ignore_sampling,
+        )
+
+    def _schedule_cardinality_queries(
+        self,
+        batch: QueryCombinerRunner,
+        sql_table: sa.Table,
+        column_types: Dict[str, ProfilerDataType],
+        pretty_name: str,
+    ) -> Dict[str, Dict[str, FutureResult[Any]]]:
+        """
+        Schedule non-null and unique count queries for all columns to profile.
+
+        Returns:
+            Dict mapping column name to dict of FutureResults
+        """
+        cardinality_futures = {}
+        for col_name in column_types:
+            cardinality_futures[col_name] = {
+                "non_null": batch.get_column_non_null_count(sql_table, col_name)
+            }
+
+            if self.config.include_field_distinct_count:
+                cardinality_futures[col_name]["unique"] = batch.get_column_unique_count(
+                    sql_table, col_name
+                )
+
+        logger.debug(
+            f"profiling {pretty_name}: scheduled cardinality "
+            f"({len(cardinality_futures)} columns)"
+        )
+
+        return cardinality_futures
+
+    def _resolve_column_types(
+        self,
+        sql_table: sa.Table,
+        columns_to_profile_set: Set[str],
+        platform: str,
+    ) -> Dict[str, ProfilerDataType]:
+        """
+        Map each profiled column to its profiler type, from the schema alone.
+
+        Every column-query helper walks this mapping, so they all cover the
+        same columns in the same order.
+        """
+        column_types: Dict[str, ProfilerDataType] = {}
+        for column in sql_table.columns:
+            if column.name not in columns_to_profile_set:
+                continue
+            col_type = get_column_profiler_type(column.type, platform)
+            if col_type == ProfilerDataType.UNKNOWN:
+                col_type = resolve_profiler_type_with_fallback(
+                    column.type, platform, str(column.type)
+                )
+            column_types[column.name] = col_type
+        return column_types
+
+    def _extract_cardinality_results(
+        self,
+        field_profiles: List[DatasetFieldProfileClass],
+        cardinality_futures: Dict[str, Dict[str, FutureResult[Any]]],
+        column_types: Dict[str, ProfilerDataType],
+        row_count: Optional[int],
+        pretty_name: str,
+    ) -> Dict[
+        str,
+        Tuple[
+            DatasetFieldProfileClass,
+            ProfilerDataType,
+            Optional[Cardinality],
+            Optional[int],
+        ],
+    ]:
+        """
+        Extract cardinality results.
+
+        Extracts non-null and unique counts, calculates null counts and
+        proportions, and prepares column metadata for the per-column queries.
+
+        Returns:
+            Dict mapping column name to (column_profile, col_type, cardinality, non_null_count)
+        """
+        columns_with_types = {}
+
+        for col_name, col_type in column_types.items():
+            # Find the corresponding column_profile we created
+            column_profile: Optional[DatasetFieldProfileClass] = next(
+                (p for p in field_profiles if p.fieldPath == col_name), None
+            )
+            if column_profile is None:
+                continue
+
+            # Extract non-null count from FutureResult with exception handling
+            try:
+                non_null_count = cardinality_futures[col_name]["non_null"].result()
+            except Exception as e:
+                logger.debug(
+                    f"Caught exception while attempting to get non-null count for column {col_name}. {e}"
+                )
+                self.report.warning(
+                    title="Profiling: Unable to Calculate Non-Null Count",
+                    message="The non-null count for the column will not be accessible",
+                    context=f"{pretty_name}.{col_name}",
+                    exc=e,
+                )
+                non_null_count = None
+
+            # Calculate null_count
+            null_count = (
+                max(0, row_count - non_null_count)
+                if row_count is not None and non_null_count is not None
+                else None
+            )
+            if self.config.include_field_null_count:
+                column_profile.nullCount = null_count
+                if row_count is not None and row_count > 0 and null_count is not None:
+                    column_profile.nullProportion = min(1, null_count / row_count)
+
+            # Extract unique count from FutureResult if we scheduled it with exception handling
+            unique_count = None
+            cardinality = None
+            if self.config.include_field_distinct_count:
+                try:
+                    unique_count = cardinality_futures[col_name]["unique"].result()
+                    column_profile.uniqueCount = unique_count
+                    if (
+                        non_null_count is not None
+                        and non_null_count > 0
+                        and unique_count is not None
+                    ):
+                        unique_proportion = min(1, unique_count / non_null_count)
+                        column_profile.uniqueProportion = unique_proportion
+                except Exception as e:
+                    logger.debug(
+                        f"Caught exception while attempting to get unique count for column {col_name}. {e}"
+                    )
+                    self.report.warning(
+                        title="Profiling: Unable to Calculate Unique Count",
+                        message="The unique count for the column will not be accessible",
+                        context=f"{pretty_name}.{col_name}",
+                        exc=e,
+                    )
+                cardinality = convert_to_cardinality(
+                    unique_count,
+                    float(unique_count) / non_null_count
+                    if non_null_count is not None
+                    and non_null_count > 0
+                    and unique_count is not None
+                    else None,
+                )
+
+            # Store metadata for the per-column queries
+            columns_with_types[col_name] = (
+                column_profile,
+                col_type,
+                cardinality,
+                non_null_count,
+            )
+
+        return columns_with_types
+
+    def _schedule_numeric_queries(
+        self,
+        batch: QueryCombinerRunner,
+        sql_table: sa.Table,
+        column_types: Dict[str, ProfilerDataType],
+        ignore_table_sampling: bool,
+        columns_list_to_ignore_sampling: List[str],
+        pretty_name: str,
+    ) -> Dict[str, Dict[str, FutureResult[Any]]]:
+        """
+        Schedule min/max/mean/stdev/median queries for numeric and datetime columns.
+
+        Returns:
+            Dict mapping column name to dict of FutureResults
+        """
+        numeric_stats_futures: Dict[str, Dict[str, FutureResult[Any]]] = {}
+        for col_name, col_type in column_types.items():
+            # Only calculate stats if not ignoring sampling for this column
+            if ignore_table_sampling or col_name in columns_list_to_ignore_sampling:
+                continue
+
+            # Schedule numeric stats for numeric columns (INT, FLOAT, NUMERIC)
+            # All three numeric types get the same statistics
+            if col_type in (
+                ProfilerDataType.INT,
+                ProfilerDataType.FLOAT,
+                ProfilerDataType.NUMERIC,
+            ):
+                numeric_stats_futures[col_name] = {}
+                if self.config.include_field_min_value:
+                    numeric_stats_futures[col_name]["min"] = batch.get_column_min(
+                        sql_table, col_name
+                    )
+                if self.config.include_field_max_value:
+                    numeric_stats_futures[col_name]["max"] = batch.get_column_max(
+                        sql_table, col_name
+                    )
+                if self.config.include_field_mean_value:
+                    numeric_stats_futures[col_name]["mean"] = batch.get_column_mean(
+                        sql_table, col_name
+                    )
+                if self.config.include_field_stddev_value:
+                    numeric_stats_futures[col_name]["stdev"] = batch.get_column_stdev(
+                        sql_table, col_name
+                    )
+                if self.config.include_field_median_value:
+                    numeric_stats_futures[col_name]["median"] = batch.get_column_median(
+                        sql_table, col_name
+                    )
+
+            # Schedule min/max for datetime columns
+            elif col_type == ProfilerDataType.DATETIME:
+                numeric_stats_futures[col_name] = {}
+                if self.config.include_field_min_value:
+                    numeric_stats_futures[col_name]["min"] = batch.get_column_min(
+                        sql_table, col_name
+                    )
+                if self.config.include_field_max_value:
+                    numeric_stats_futures[col_name]["max"] = batch.get_column_max(
+                        sql_table, col_name
+                    )
+
+        if numeric_stats_futures:
+            logger.debug(
+                f"profiling {pretty_name}: scheduled numeric stats "
+                f"({len(numeric_stats_futures)} columns)"
+            )
+
+        return numeric_stats_futures
+
+    def _extract_and_process_stats(
+        self,
+        runner: QueryCombinerRunner,
+        sql_table: sa.Table,
+        columns_with_types: Dict[
+            str,
+            Tuple[
+                DatasetFieldProfileClass,
+                ProfilerDataType,
+                Optional[Cardinality],
+                Optional[int],
+            ],
+        ],
+        numeric_stats_futures: Dict[str, Dict[str, FutureResult[Any]]],
+        ignore_table_sampling: bool,
+        columns_list_to_ignore_sampling: List[str],
+        row_count: Optional[int],
+        pretty_name: str,
+    ) -> None:
+        """
+        Extract numeric stats and process column stats.
+
+        Extracts min/max/mean/stdev/median from FutureResults and runs
+        non-batchable complex queries (sample values, histograms, frequencies).
+        """
+        for col_name, (
+            column_profile,
+            col_type,
+            cardinality,
+            non_null_count,
+        ) in columns_with_types.items():
+            # Only calculate stats if not ignoring sampling for this column
+            if ignore_table_sampling or col_name in columns_list_to_ignore_sampling:
+                continue
+
+            # Add sample values for all types (non-batchable)
+            if self.config.include_field_sample_values:
+                self._add_sample_values(
+                    runner=runner,
+                    sql_table=sql_table,
+                    col_name=col_name,
+                    column_profile=column_profile,
+                    non_null_count=non_null_count,
+                    row_count=row_count,
+                    pretty_name=pretty_name,
+                )
+
+            # Process column stats by type
+            # INT, FLOAT, and NUMERIC all get the same numeric statistics
+            if col_type in (
+                ProfilerDataType.INT,
+                ProfilerDataType.FLOAT,
+                ProfilerDataType.NUMERIC,
+            ):
+                self._process_numeric_column_stats(
+                    runner=runner,
+                    sql_table=sql_table,
+                    col_name=col_name,
+                    column_profile=column_profile,
+                    col_type=col_type,
+                    cardinality=cardinality,
+                    non_null_count=non_null_count,
+                    numeric_stats_futures=numeric_stats_futures,
+                    pretty_name=pretty_name,
+                )
+            elif col_type == ProfilerDataType.STRING:
+                self._process_string_column_stats(
+                    runner=runner,
+                    sql_table=sql_table,
+                    col_name=col_name,
+                    column_profile=column_profile,
+                    cardinality=cardinality,
+                    pretty_name=pretty_name,
+                )
+            elif col_type == ProfilerDataType.DATETIME:
+                self._process_datetime_column_stats(
+                    runner=runner,
+                    sql_table=sql_table,
+                    col_name=col_name,
+                    column_profile=column_profile,
+                    cardinality=cardinality,
+                    numeric_stats_futures=numeric_stats_futures,
+                    pretty_name=pretty_name,
+                )
+            else:
+                self._process_other_column_stats(
+                    runner=runner,
+                    sql_table=sql_table,
+                    col_name=col_name,
+                    column_profile=column_profile,
+                    cardinality=cardinality,
+                    pretty_name=pretty_name,
+                )
+
+    def _thread_adapter(self, platform: str) -> PlatformAdapter:
+        """The calling thread's adapter, built once and reused across its tables.
+
+        An adapter's only state is the Inspector it caches, and dialects memoize
+        a whole schema's columns on that Inspector. Built per table, the cache
+        never outlives its first use and every table on a normalizing dialect
+        pays a schema-wide get_columns. Built per thread, the pool's workers pay
+        one apiece.
+
+        Per thread rather than per profiler because tables are profiled
+        concurrently and an Inspector's info cache is a plain dict.
+        """
+        adapter = getattr(self._adapter_local, platform, None)
+        if adapter is None:
+            adapter = get_adapter(platform, self.config, self.report, self.base_engine)
+            setattr(self._adapter_local, platform, adapter)
+        return adapter
+
+    def _generate_single_profile(
+        self,
+        query_combiner: SQLAlchemyQueryCombiner,
+        pretty_name: str,
+        schema: Optional[str] = None,
+        table: Optional[str] = None,
+        partition: Optional[str] = None,
+        custom_sql: Optional[str] = None,
+        platform: Optional[str] = None,
+        profiler_args: Optional[Dict] = None,
+        row_count: Optional[int] = None,
+        **kwargs: Any,
+    ) -> Optional[DatasetProfileClass]:
+        """Generate a single dataset profile."""
+        logger.debug(
+            f"Received single profile request for {pretty_name} for {schema}, {table}, {custom_sql}"
+        )
+        platform = platform or self.platform
+
+        # Validate table parameter
+        if not table:
+            raise ValueError(
+                f"Cannot profile {pretty_name}: table parameter is required"
+            )
+
+        # Create profiling context to track state
+        context = ProfilingContext(
+            schema=schema,
+            table=table,
+            custom_sql=custom_sql,
+            pretty_name=pretty_name,
+            partition=partition,
+            row_count=row_count,
+        )
+
+        # Get platform-specific adapter
+        adapter = self._thread_adapter(platform)
+
+        with PerfTimer() as timer:
+            try:
+                logger.info(f"Profiling {pretty_name}")
+                with contextlib.ExitStack() as stack:
+                    conn = stack.enter_context(self.base_engine.connect())
+                    isolation_level = self._profiling_isolation_level
+                    if isolation_level is not None:
+                        # Must be the first operation on this connection — the
+                        # isolation level cannot be changed once a transaction is in
+                        # progress. Re-applied on every checkout because SQLAlchemy
+                        # reverts it on pool return. SA 2.0's
+                        # Connection.execution_options mutates and returns self;
+                        # the rebind is kept so the code does not depend on that.
+                        try:
+                            conn = conn.execution_options(
+                                isolation_level=isolation_level
+                            )
+                        except Exception as e:
+                            # Broad by necessity: execution_options calls
+                            # dialect.set_isolation_level directly, bypassing
+                            # SQLAlchemy's DBAPI exception wrapping, so a server or
+                            # proxy refusal arrives as a raw driver error. Warn and
+                            # continue with the original (transactional) connection.
+                            # The structured report dedups by title+message; the
+                            # logger does not, so gate it on a per-run flag to emit
+                            # one line per run. Profiling runs in a ThreadPoolExecutor
+                            # so a race may emit two — acceptable, no lock.
+                            self.report.warning(
+                                title="Profiling: isolation level unavailable",
+                                message=(
+                                    "The database or SQLAlchemy dialect did "
+                                    "not accept the requested session "
+                                    "isolation level. Profiling will run one "
+                                    "transaction per table, which can block "
+                                    "VACUUM (Postgres) or grow the InnoDB undo "
+                                    "log (MySQL) for the duration of each "
+                                    "table's profile."
+                                ),
+                                context=(
+                                    f"Asset: {pretty_name}; "
+                                    f"isolation_level={isolation_level}"
+                                ),
+                                exc=e,
+                                log=not self._isolation_level_warning_logged,
+                            )
+                            self._isolation_level_warning_logged = True
+                            if not self.config.catch_exceptions:
+                                raise
+
+                    self._install_query_timeout(stack, conn, adapter, pretty_name)
+
+                    # Setup profiling using platform adapter
+                    # This handles temp tables, sampling, and creates sql_table
+                    # Takes the real Connection: setup does DDL and reflection
+                    # (autoload_with), and runs on the main greenlet where the
+                    # query combiner never applies.
+                    try:
+                        context = adapter.setup_profiling(context, conn)
+                    except Exception as e:
+                        self.report.warning(
+                            title="Profiling setup failed",
+                            message="Failed to setup profiling using platform adapter",
+                            context=f"{pretty_name}: {type(e).__name__}: {str(e)}",
+                        )
+                        if not self.config.catch_exceptions:
+                            raise
+                        return None
+
+                    # Validate that we have a sql_table to profile
+                    if context.sql_table is None:
+                        self.report.warning(
+                            title="Profiling setup incomplete",
+                            message="No table available for profiling after setup",
+                            context=pretty_name,
+                        )
+                        return None
+
+                    sql_table = context.sql_table
+
+                    # Initialize query combiner runner with adapter
+                    # Statistic queries go through the facade so each one
+                    # declares its row shape for the query combiner.
+                    runner = QueryCombinerRunner(
+                        conn=ProfilingConnection(conn),
+                        platform=platform,
+                        adapter=adapter,
+                        query_combiner=query_combiner,
+                    )
+
+                    # Create profile
+                    profile = DatasetProfileClass(timestampMillis=get_sys_time())
+                    profile.columnCount = len(sql_table.columns)
+
+                    # Handle partition spec
+                    if partition:
+                        profile.partitionSpec = PartitionSpecClass(partition=partition)
+                    elif self.config.limit:
+                        profile.partitionSpec = PartitionSpecClass(
+                            type=PartitionTypeClass.QUERY,
+                            partition=json.dumps(
+                                dict(limit=self.config.limit, offset=self.config.offset)
+                            ),
+                        )
+                    elif custom_sql or context.is_sampled:
+                        # custom_sql or adapter-driven sampling via temp table
+                        profile.partitionSpec = PartitionSpecClass(
+                            type=PartitionTypeClass.QUERY, partition="SAMPLE"
+                        )
+
+                    # ================================================================
+                    # QUERY BATCHING PATTERN
+                    # ================================================================
+                    # Each flush is a round trip, and with flattening on it is
+                    # also a table scan, so there are as few as the data
+                    # dependencies allow:
+                    #
+                    # BATCH 1: row count, null and distinct counts, and the
+                    #   numeric stats. One batch, not three: which stats a column
+                    #   needs follows from its schema type, not from the counts,
+                    #   and over an empty table the column queries scan nothing.
+                    #   The setup they need rides along with them, which means
+                    #   a folded count cannot skip it -- scheduling a column
+                    #   query needs the column list first. Only the unfolded
+                    #   path, below, gets to skip it.
+                    #
+                    # PER-COLUMN QUERIES: not batched -- value frequencies need
+                    #   cardinality, histograms need min/max, and sample values
+                    #   return many rows.
+                    # ================================================================
+
+                    # ----------------------------------------------------------------
+                    # BATCH 1: Row count + column counts + numeric stats
+                    # ----------------------------------------------------------------
+                    # Folding the row count in only pays when scheduling defers.
+                    # With the combiner off every call runs where it is written,
+                    # so the column queries would all execute before the count
+                    # could skip them -- 73 statements on an empty 12-column
+                    # table instead of 1, and 73 failures on an unreadable one.
+                    folded = runner.defers_queries
+
+                    setup: Optional[_ColumnSetup] = None
+
+                    def _schedule_columns(
+                        batch: QueryCombinerRunner,
+                    ) -> Tuple[
+                        _ColumnSetup,
+                        Dict[str, Dict[str, FutureResult[Any]]],
+                        Dict[str, Dict[str, FutureResult[Any]]],
+                    ]:
+                        # The setup is computed here rather than above, so that
+                        # the unfolded path pays for it only once the row count
+                        # has said there is something to profile. It costs no
+                        # query against the table, but the sampling tags are a
+                        # lookup against the DataHub server.
+                        prepared = self._prepare_column_setup(
+                            sql_table, adapter, conn, pretty_name, platform
+                        )
+                        return (
+                            prepared,
+                            self._schedule_cardinality_queries(
+                                batch=batch,
+                                sql_table=sql_table,
+                                column_types=prepared.column_types,
+                                pretty_name=pretty_name,
+                            ),
+                            self._schedule_numeric_queries(
+                                batch=batch,
+                                sql_table=sql_table,
+                                column_types=prepared.column_types,
+                                ignore_table_sampling=prepared.ignore_table_sampling,
+                                columns_list_to_ignore_sampling=prepared.columns_list_to_ignore_sampling,
+                                pretty_name=pretty_name,
+                            ),
+                        )
+
+                    cardinality_futures: Dict[str, Dict[str, FutureResult[Any]]] = {}
+                    numeric_stats_futures: Dict[str, Dict[str, FutureResult[Any]]] = {}
+                    with runner.batch() as batch:
+                        row_count_future = self._schedule_row_count(
+                            batch=batch,
+                            sql_table=sql_table,
+                            adapter=adapter,
+                            pretty_name=pretty_name,
+                        )
+                        if folded:
+                            (
+                                setup,
+                                cardinality_futures,
+                                numeric_stats_futures,
+                            ) = _schedule_columns(batch)
+
+                    row_count = self._extract_row_count(
+                        row_count_future=row_count_future,
+                        profile=profile,
+                        context=context,
+                        pretty_name=pretty_name,
+                    )
+
+                    # Emit no field profiles when the row count says there is no
+                    # data to profile:
+                    # - row_count is None: the query failed (permission error etc.)
+                    # - row_count == 0 AND the count was EXACT: genuinely empty.
+                    #
+                    # The column queries already ran alongside the count, so their
+                    # results are dropped here rather than skipped.
+                    #
+                    # With profile_table_row_count_estimate_only the count comes from
+                    # the catalog, which can report 0 for a table that has rows --
+                    # never analyzed, or stale statistics -- so an estimate of 0 must
+                    # not drop the column profiles.
+                    if row_count is None or (
+                        row_count == 0 and not self._uses_row_count_estimate(adapter)
+                    ):
+                        reason = (
+                            "empty table (rowCount=0)"
+                            if row_count == 0
+                            else "row count unavailable (permission error or query failure)"
+                        )
+                        logger.info(
+                            f"Skipping column profiling for {pretty_name}: {reason}"
+                        )
+                        return profile
+
+                    if not folded:
+                        with runner.batch() as batch:
+                            (
+                                setup,
+                                cardinality_futures,
+                                numeric_stats_futures,
+                            ) = _schedule_columns(batch)
+
+                    assert setup is not None
+
+                    columns_with_types = self._extract_cardinality_results(
+                        field_profiles=setup.field_profiles,
+                        cardinality_futures=cardinality_futures,
+                        column_types=setup.column_types,
+                        row_count=row_count,
+                        pretty_name=pretty_name,
+                    )
+
+                    # ----------------------------------------------------------------
+                    # PER-COLUMN QUERIES (not batched; need batch 1's results)
+                    # ----------------------------------------------------------------
+                    self._extract_and_process_stats(
+                        runner=runner,
+                        sql_table=sql_table,
+                        columns_with_types=columns_with_types,
+                        numeric_stats_futures=numeric_stats_futures,
+                        ignore_table_sampling=setup.ignore_table_sampling,
+                        columns_list_to_ignore_sampling=setup.columns_list_to_ignore_sampling,
+                        row_count=row_count,
+                        pretty_name=pretty_name,
+                    )
+
+                    profile.fieldProfiles = self._to_emitted_field_paths(
+                        setup.field_profiles, adapter, conn, pretty_name
+                    )
+
+                    time_taken = timer.elapsed_seconds()
+                    logger.info(
+                        f"Finished profiling {pretty_name}; took {time_taken:.3f} seconds"
+                    )
+                    self.times_taken.append(time_taken)
+                    return profile
+
+            except (
+                sa.exc.SQLAlchemyError,
+                ConnectionError,
+                PermissionError,
+            ) as e:
+                # Handle expected database and connection errors
+                if not self.config.catch_exceptions:
+                    raise
+
+                error_message = str(e).lower()
+                if "permission denied" in error_message or isinstance(
+                    e, PermissionError
+                ):
+                    self.report.warning(
+                        title="Unauthorized to extract data profile statistics",
+                        message="We were denied access while attempting to generate profiling statistics for some assets. Please ensure the provided user has permission to query these tables and views.",
+                        context=f"Asset: {pretty_name}",
+                        exc=e,
+                    )
+                else:
+                    self.report.warning(
+                        title="Failed to extract statistics for some assets",
+                        message="Caught exception while attempting to extract profiling statistics for some assets.",
+                        context=f"Asset: {pretty_name}",
+                        exc=e,
+                    )
+                return None
+            except Exception as e:
+                # Unexpected errors - only catch if catch_exceptions is True
+                if not self.config.catch_exceptions:
+                    raise
+
+                self.report.warning(
+                    title="Unexpected error during profiling",
+                    message="Caught unexpected exception while attempting to extract profiling statistics for some assets.",
+                    context=f"Asset: {pretty_name}",
+                    exc=e,
+                )
+                return None
+            finally:
+                # Record elapsed for every table, including failures: the most expensive
+                # tables are precisely those that OOM/timeout/raise — which exit via the
+                # except branches above and would otherwise never be recorded. `timer`
+                # started at the top of this `with PerfTimer()` block, so elapsed here
+                # covers the full attempt regardless of exit path. Recorded before
+                # adapter.cleanup so a raising cleanup cannot lose the entry.
+                self.report.profiling_time_taken_per_table_secs[pretty_name] = (
+                    timer.elapsed_seconds()
+                )
+                # Cleanup temp resources using adapter
+                adapter.cleanup(context)

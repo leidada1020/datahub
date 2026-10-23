@@ -1,0 +1,64 @@
+import { Popover, Text } from '@components';
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { ExpandedActor } from '@app/entityV2/shared/components/styled/ExpandedActor';
+
+import { OwnerType } from '@types';
+
+const PopoverActors = styled.div`
+    max-width: 600px;
+`;
+
+const ActorsContainer = styled.div`
+    display: flex;
+    justify-content: right;
+    flex-wrap: wrap;
+    align-items: center;
+`;
+
+const RemainderText = styled(Text)`
+    display: flex;
+    justify-content: right;
+    margin-right: 8px;
+`;
+
+type Props = {
+    actors: Array<OwnerType>;
+    max: number;
+    onClose?: (actor: OwnerType) => void;
+    containerStyle?: any;
+};
+
+const DEFAULT_MAX = 10;
+
+export const ExpandedActorGroup = ({ actors, max = DEFAULT_MAX, onClose, containerStyle }: Props) => {
+    const { t } = useTranslation('entity.shared.components');
+    const finalActors = actors.length > max ? actors.slice(0, max) : actors;
+    const remainder = actors.length > max ? actors.length - max : undefined;
+
+    return (
+        <Popover
+            placement="left"
+            content={
+                <PopoverActors>
+                    {actors.map((actor) => (
+                        <ExpandedActor key={actor.urn} actor={actor} onClose={() => onClose?.(actor)} />
+                    ))}
+                </PopoverActors>
+            }
+        >
+            <ActorsContainer style={containerStyle}>
+                {finalActors.map((actor) => (
+                    <ExpandedActor key={actor.urn} actor={actor} onClose={() => onClose?.(actor)} />
+                ))}
+            </ActorsContainer>
+            {remainder && (
+                <RemainderText type="span" color="textSecondary">
+                    {t('expandedActor.moreCount', { count: remainder })}
+                </RemainderText>
+            )}
+        </Popover>
+    );
+};

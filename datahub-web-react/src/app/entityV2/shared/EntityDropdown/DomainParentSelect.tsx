@@ -1,0 +1,114 @@
+import { XCircle } from '@phosphor-icons/react/dist/csr/XCircle';
+import { Empty, Select } from 'antd';
+import React, { MouseEvent } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useTheme } from 'styled-components';
+
+import domainAutocompleteOptions from '@app/domainV2/DomainAutocompleteOptions';
+import DomainNavigator from '@app/domainV2/nestedDomains/domainNavigator/DomainNavigator';
+import useParentSelector from '@app/entityV2/shared/EntityDropdown/useParentSelector';
+import ClickOutside from '@app/sharedV2/ClickOutside';
+import { BrowserWrapper } from '@app/sharedV2/tags/BrowserWrapper';
+import { useEntityRegistry } from '@app/useEntityRegistry';
+import { useDomainsContext } from '@src/app/domainV2/DomainsContext';
+
+import { Domain, EntityType } from '@types';
+
+// filter out entity itself and its children
+function filterResultsForMove(entity: Domain, entityUrn: string) {
+    return (
+        entity.urn !== entityUrn &&
+        entity.__typename === 'Domain' &&
+        !entity.parentDomains?.domains?.some((node) => node.urn === entityUrn)
+    );
+}
+
+interface Props {
+    selectedParentUrn: string;
+    setSelectedParentUrn: (parent: string) => void;
+    isMoving?: boolean;
+}
+
+export default function DomainParentSelect({ selectedParentUrn, setSelectedParentUrn, isMoving }: Props) {
+    const theme = useTheme();
+    const { t } = useTranslation('entity.shared.entityDropdown');
+    const entityRegistry = useEntityRegistry();
+    const { entityData } = useDomainsContext();
+    const domainUrn = entityData?.urn;
+
+    const {
+        searchResults,
+        searchQuery,
+        isFocusedOnInput,
+        selectedParentName,
+        selectParentFromBrowser,
+        onSelectParent,
+        handleSearch,
+        clearSelectedParent,
+        setIsFocusedOnInput,
+        autoCompleteResultsLoading,
+    } = useParentSelector({
+        entityType: EntityType.Domain,
+        entityData,
+        selectedParentUrn,
+        setSelectedParentUrn,
+    });
+    const domainSearchResultsFiltered =
+        isMoving && domainUrn
+            ? searchResults.filter((r) => filterResultsForMove(r as Domain, domainUrn))
+            : searchResults;
+
+    function selectDomain(domain: Domain) {
+        selectParentFromBrowser(domain.urn, entityRegistry.getDisplayName(EntityType.Domain, domain));
+    }
+
+    const isShowingDomainNavigator = !searchQuery && isFocusedOnInput;
+
+    const handleFocus = () => setIsFocusedOnInput(true);
+    const handleClickOutside = () => setIsFocusedOnInput(false);
+
+    const handleClear = (event: MouseEvent) => {
+        // Prevent, otherwise antd will close the select menu but leaves it focused
+        event.stopPropagation();
+        clearSelectedParent();
+    };
+
+    return (
+        <ClickOutside onClickOutside={handleClickOutside}>
+            <Select
+                autoFocus
+                showSearch
+                allowClear
+                clearIcon={<XCircle weight="fill" onClick={handleClear} />}
+                filterOption={false}
+                defaultActiveFirstOption={false}
+                placeholder={t('domainSelect.placeholder')}
+                value={selectedParentName}
+                onSelect={onSelectParent}
+                onSearch={handleSearch}
+                onFocus={handleFocus}
+                dropdownStyle={isShowingDomainNavigator || !searchQuery ? { display: 'none' } : {}}
+                notFoundContent={
+                    <Empty
+                        description={t('domainSelect.notFound')}
+                        image={Empty.PRESENTED_IMAGE_SIMPLE}
+                        style={{ color: theme.colors.textTertiary }}
+                    />
+                }
+                options={domainAutocompleteOptions(
+                    domainSearchResultsFiltered,
+                    autoCompleteResultsLoading,
+                    entityRegistry,
+                )}
+                data-testid="parent-domain-select"
+            />
+            <BrowserWrapper isHidden={!isShowingDomainNavigator}>
+                <DomainNavigator
+                    domainUrnToHide={isMoving ? domainUrn : undefined}
+                    selectDomainOverride={selectDomain}
+                    isCollapsed={false}
+                />
+            </BrowserWrapper>
+        </ClickOutside>
+    );
+}

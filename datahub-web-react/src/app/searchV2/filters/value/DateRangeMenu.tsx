@@ -1,0 +1,89 @@
+import React, { useCallback, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { FilterField } from '@app/searchV2/filters/types';
+import { useFilterDisplayName } from '@app/searchV2/filters/utils';
+import useDateRangeFilterValues from '@app/searchV2/filters/value/useDateRangeFilterValues';
+import { Text } from '@src/alchemy-components';
+import { Datetime } from '@src/app/lineageV3/LineageTimeSelector';
+import { FacetFilterInput, FacetMetadata, FilterOperator } from '@src/types.generated';
+import DatePicker from '@utils/DayjsDatePicker';
+
+const DAYJS_DISPLAY_FORMAT = 'll';
+const { RangePicker } = DatePicker;
+
+const Container = styled.div`
+    padding: 16px;
+    background-color: ${(props) => props.theme.colors.bg};
+    box-shadow: ${(props) => props.theme.colors.shadowLg};
+    border-radius: 8px;
+    min-width: 225px;
+`;
+
+interface Props {
+    field: FilterField | FacetMetadata;
+    manuallyUpdateFilters: (newValues: FacetFilterInput[]) => void;
+}
+
+export default function DateRangeMenu({ field, manuallyUpdateFilters }: Props) {
+    const { t } = useTranslation('search');
+    const displayName = useFilterDisplayName(field);
+
+    const [startDate, setStartDate] = useState<Datetime>(null);
+    const [endDate, setEndDate] = useState<Datetime>(null);
+    const [isOpen, setIsOpen] = useState<boolean>(false);
+    const ref = useRef<any>(null);
+
+    useDateRangeFilterValues({ filterField: field.field, setStartDate, setEndDate });
+
+    const handleOpenChange = useCallback(
+        (open: boolean) => {
+            setIsOpen(open);
+            if (!open) {
+                ref.current?.blur();
+                if (startDate && endDate) {
+                    manuallyUpdateFilters([
+                        {
+                            field: field.field,
+                            values: [startDate.valueOf().toString()],
+                            condition: FilterOperator.GreaterThan,
+                        },
+                        {
+                            field: field.field,
+                            values: [endDate.valueOf().toString()],
+                            condition: FilterOperator.LessThan,
+                        },
+                    ]);
+                }
+            }
+        },
+        [startDate, endDate, field.field, manuallyUpdateFilters],
+    );
+
+    const handleRangeChange = useCallback((dates: [Datetime, Datetime] | null) => {
+        const [start, end] = dates || [null, null];
+
+        setStartDate(start?.startOf('day') ?? null);
+        setEndDate(end?.endOf('day') ?? null);
+    }, []);
+
+    return (
+        <Container>
+            <Text weight="bold">{t('filters.filterBy', { name: displayName })}</Text>
+            <RangePicker
+                ref={ref}
+                open={isOpen}
+                allowClear
+                allowEmpty={[true, true]}
+                bordered={false}
+                value={[startDate, endDate]}
+                format={DAYJS_DISPLAY_FORMAT}
+                onChange={handleRangeChange}
+                onOpenChange={handleOpenChange}
+                onCalendarChange={() => handleOpenChange(true)}
+                style={{ paddingLeft: 0, paddingRight: 0 }}
+            />
+        </Container>
+    );
+}

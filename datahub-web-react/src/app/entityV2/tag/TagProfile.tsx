@@ -1,0 +1,44 @@
+import React, { useContext } from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import CompactTagProfile from '@app/entityV2/tag/CompactTagProfile';
+import CompactContext from '@app/sharedV2/CompactContext';
+import { Message } from '@app/sharedV2/Message';
+import TagStyleEntity from '@app/sharedV2/TagStyleEntity';
+
+import { useGetTagQuery } from '@graphql/tag.generated';
+
+const PageContainer = styled.div`
+    padding: 32px 100px;
+    background-color: ${(props) => props.theme.colors.bg};
+    border-radius: 8px;
+`;
+
+const LoadingMessage = styled(Message)`
+    margin-top: 10%;
+`;
+
+interface Props {
+    urn: string;
+}
+
+/**
+ * Responsible for displaying metadata about a tag
+ */
+export default function TagProfile({ urn }: Props) {
+    const { t: tf } = useTranslation('common.feedback');
+    const { loading } = useGetTagQuery({ variables: { urn } });
+    const isCompact = useContext(CompactContext);
+
+    if (isCompact) {
+        return <CompactTagProfile urn={urn} />;
+    }
+
+    return (
+        <PageContainer>
+            {loading && <LoadingMessage type="loading" content={tf('loading')} />}
+            <TagStyleEntity urn={urn} />
+        </PageContainer>
+    );
+}

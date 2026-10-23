@@ -1,0 +1,95 @@
+import { CaretDown } from '@phosphor-icons/react/dist/csr/CaretDown';
+import { CaretUp } from '@phosphor-icons/react/dist/csr/CaretUp';
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { ExtendedSchemaFields } from '@app/entityV2/dataset/profile/schema/utils/types';
+
+const HeaderWrapper = styled.div`
+    position: absolute;
+    align-self: flex-end;
+    display: flex;
+    justify-content: center;
+    align-self: center;
+    margin-bottom: 16px;
+    padding: 2px 4px;
+    background: ${(props) => props.theme.colors.bgSurface};
+    opacity: 0.8;
+    border-radius: 15.5px;
+    width: max-content;
+    color: ${(props) => props.theme.colors.textSecondary};
+    bottom: 0px;
+`;
+
+const StyledIcon = styled.div`
+    font-size: 12px;
+    padding: 0;
+    height: 26px;
+    width: 26px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: none;
+
+    &&:hover {
+        cursor: pointer;
+        stroke: ${(props) => props.theme.colors.textSecondary};
+        stroke-width: 1px;
+    }
+
+    svg {
+        height: 20px;
+        width: 20px;
+        color: ${(props) => props.theme.colors.textSecondary};
+    }
+`;
+
+const FieldIndexText = styled.span`
+    font-size: 12px;
+    font-weight: 800;
+    color: ${(props) => props.theme.colors.text};
+    margin: 0 8px;
+`;
+
+const ButtonsWrapper = styled.div`
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+`;
+
+interface Props {
+    expandedFieldIndex?: number;
+    selectPreviousField: () => void;
+    selectNextField: () => void;
+    displayedRows: ExtendedSchemaFields[];
+}
+
+export default function DrawerFooter({
+    expandedFieldIndex = 0,
+    selectPreviousField,
+    selectNextField,
+    displayedRows,
+}: Props) {
+    const { t } = useTranslation('entity.profile.schema');
+    return (
+        <HeaderWrapper>
+            <ButtonsWrapper>
+                <StyledIcon onClick={selectPreviousField}>
+                    <CaretUp />
+                </StyledIcon>
+                <FieldIndexText>
+                    {t('fieldDrawer.fieldNavigation', {
+                        count: displayedRows.length,
+                        current: expandedFieldIndex + 1,
+                        total: displayedRows.length,
+                    })}
+                </FieldIndexText>
+                <StyledIcon onClick={selectNextField}>
+                    <CaretDown />
+                </StyledIcon>
+            </ButtonsWrapper>
+        </HeaderWrapper>
+    );
+}

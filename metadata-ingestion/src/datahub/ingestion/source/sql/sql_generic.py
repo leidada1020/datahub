@@ -1,0 +1,103 @@
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Optional
+
+from pydantic.fields import Field
+
+from datahub.ingestion.api.common import PipelineContext
+from datahub.ingestion.api.decorators import (
+    SourceCapability,
+    SupportStatus,
+    capability,
+    config_class,
+    platform_name,
+    support_status,
+)
+from datahub.ingestion.source.sql.sql_common import SQLAlchemySource
+from datahub.ingestion.source.sql.sql_config import SQLCommonConfig
+
+# DataHub's Hive and Presto dialects register their URL schemes (hive://, hive+http://,
+# sparksql://, presto://) on import. Their drivers come with the hive / presto extras,
+# without which those URIs can't work anyway.
+try:
+    import datahub.ingestion.source.sql.hive.hive_dialect
+except ImportError:
+    pass
+try:
+    import datahub.ingestion.source.sql.presto_dialect  # noqa: F401
+except ImportError:
+    pass
+
+
+@dataclass
+class BaseColumn:
+    name: str
+    ordinal_position: int
+    is_nullable: bool
+    data_type: str
+    comment: Optional[str]
+
+
+@dataclass
+class BaseTable:
+    name: str
+    comment: Optional[str]
+    created: Optional[datetime]
+    last_altered: Optional[datetime]
+    size_in_bytes: Optional[int]
+    rows_count: Optional[int]
+    column_count: Optional[int] = None
+    ddl: Optional[str] = None
+
+
+@dataclass
+class BaseView:
+    name: str
+    comment: Optional[str]
+    created: Optional[datetime]
+    last_altered: Optional[datetime]
+    view_definition: Optional[str]
+    size_in_bytes: Optional[int] = None
+    rows_count: Optional[int] = None
+    column_count: Optional[int] = None
+
+
+class SQLAlchemyGenericConfig(SQLCommonConfig):
+    platform: str = Field(
+        description="Name of platform being ingested, used in constructing URNs."
+    )
+    connect_uri: str = Field(
+        description="URI of database to connect to. See https://docs.sqlalchemy.org/en/20/core/engines.html#database-urls"
+    )
+
+    def get_sql_alchemy_url(self):
+        return self.connect_uri
+
+
+@platform_name("SQLAlchemy", id="sqlalchemy")
+@config_class(SQLAlchemyGenericConfig)
+@support_status(SupportStatus.GA)
+@capability(SourceCapability.DOMAINS, "Supported via the `domain` config field")
+@capability(SourceCapability.DATA_PROFILING, "Optionally enabled via configuration")
+@capability(
+    SourceCapability.PROBE,
+    "Check what a recipe would ingest before running it, with `datahub recipe probe`",
+)
+class SQLAlchemyGenericSource(SQLAlchemySource):
+    """
+    Generic source for databases with SQLAlchemy dialect support but no dedicated connector.
+
+    Implementation notes:
+    - Uses SQLAlchemy reflection to discover schema metadata
+    - Requires user to install appropriate dialect package separately
+    - Platform name is configurable via config.platform parameter
+    - Inherits all SQLAlchemySource capabilities (profiling, filtering, domains)
+    """
+
+    def __init__(self, config: SQLAlchemyGenericConfig, ctx: PipelineContext):
+        super().__init__(config, ctx, config.platform)
+
+    @classmethod
+    def create(cls, config_dict, ctx):
+        config = SQLAlchemyGenericConfig.model_validate(config_dict)
+        return cls(config, ctx)

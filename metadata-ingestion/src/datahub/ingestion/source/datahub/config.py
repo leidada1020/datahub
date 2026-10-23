@@ -1,0 +1,172 @@
+import os
+from typing import Optional, Set
+
+import pydantic
+from pydantic import Field, model_validator
+
+from datahub.configuration.common import AllowDenyPattern, HiddenFromDocs
+from datahub.configuration.kafka import KafkaConsumerConnectionConfig
+from datahub.ingestion.source.sql.sql_config import SQLAlchemyConnectionConfig
+from datahub.ingestion.source.state.stateful_ingestion_base import (
+    StatefulIngestionConfig,
+    StatefulIngestionConfigBase,
+)
+
+DEFAULT_DATABASE_TABLE_NAME = "metadata_aspect_v2"
+DEFAULT_KAFKA_TOPIC_NAME = "MetadataChangeLog_Timeseries_v1"
+DEFAULT_DATABASE_BATCH_SIZE = 10_000
+
+DEFAULT_URN_DENY_PATTERNS = [
+    "urn:li:dataHubIngestionSource:.*",
+    "urn:li:dataHubSecret:.*",
+    "urn:li:globalSettings:.*",
+    "urn:li:dataHubExecutionRequest:.*",
+]
+
+DEFAULT_EXCLUDE_ASPECTS = {
+    "datahubIngestionRunSummary",
+    "datahubIngestionCheckpoint",
+    "testResults",
+}
+
+
+class DataHubSourceConfig(StatefulIngestionConfigBase):
+    database_connection: Optional[SQLAlchemyConnectionConfig] = Field(
+        default=None,
+        description="Database connection config",
+    )
+
+    kafka_connection: Optional[KafkaConsumerConnectionConfig] = Field(
+        default=None,
+        description="Kafka connection config",
+    )
+
+    include_all_versions: bool = Field(
+        default=False,
+        description=(
+            "If enabled, include all versions of each aspect. "
+            "Otherwise, only include the latest version of each aspect. "
+        ),
+    )
+
+    include_soft_deleted_entities: bool = Field(
+        default=True,
+        description=(
+            "If enabled, include entities that have been soft deleted. "
+            "Otherwise, include all entities regardless of removal status. "
+        ),
+    )
+
+    exclude_aspects: Set[str] = Field(
+        default=DEFAULT_EXCLUDE_ASPECTS,
+        description=(
+            "Aspect names to exclude from entities that are being ingested. "
+            "Note: This only makes sense for entities you want to ingest but without certain aspects. "
+            "To completely exclude entity types, use 'urn_pattern.deny' instead. "
+            "Warning: Excluding key aspects while keeping others can create invalid entities."
+        ),
+    )
+
+    database_query_batch_size: int = Field(
+        default=DEFAULT_DATABASE_BATCH_SIZE,
+        description="Number of records to fetch from the database at a time",
+    )
+
+    database_table_name: str = Field(
+        default=DEFAULT_DATABASE_TABLE_NAME,
+        description="Name of database table containing all versioned aspects",
+    )
+
+    kafka_topic_name: str = Field(
+        default=DEFAULT_KAFKA_TOPIC_NAME,
+        description="Name of kafka topic containing timeseries MCLs",
+    )
+
+    # Override from base class to make this enabled by default
+    stateful_ingestion: StatefulIngestionConfig = Field(
+        default=StatefulIngestionConfig(enabled=True),
+        description="Stateful Ingestion Config",
+    )
+
+    commit_state_interval: Optional[int] = Field(
+        default=1000,
+        description="Number of records to process before committing state",
+    )
+
+    commit_with_parse_errors: bool = Field(
+        default=False,
+        description=(
+            "Whether to update createdon timestamp and kafka offset despite parse errors. "
+            "Enable if you want to ignore the errors."
+        ),
+    )
+
+    pull_from_datahub_api: HiddenFromDocs[bool] = Field(
+        default=False,
+        description="Use the DataHub API to fetch versioned aspects.",
+    )
+
+    max_workers: HiddenFromDocs[int] = Field(
+        default=5 * (os.cpu_count() or 4),
+        description="Number of worker threads to use for datahub api ingestion.",
+    )
+
+    urn_pattern: AllowDenyPattern = Field(
+        default=AllowDenyPattern(deny=DEFAULT_URN_DENY_PATTERNS),
+        description=(
+            "URN patterns to filter entities. Defaults exclude environment-specific entities "
+            "(ingestion sources, secrets, settings) to prevent copying encrypted credentials and creating "
+            "broken entities. Recommended to keep these defaults when customizing."
+        ),
+    )
+
+    drop_duplicate_schema_fields: bool = Field(
+        default=False,
+        description="Whether to drop duplicate schema fields in the schemaMetadata aspect. "
+        "Useful if the source system has duplicate field paths in the db, but we're pushing to a system with server-side duplicate checking.",
+    )
+
+    structured_properties_template_cache_invalidation_interval: HiddenFromDocs[int] = (
+        Field(
+            default=1,
+            description="Interval in seconds to invalidate the structured properties template cache.",
+        )
+    )
+
+    query_timeout: Optional[int] = Field(
+        default=None,
+        description="Timeout for each query in seconds. ",
+    )
+
+    preserve_system_metadata: bool = Field(
+        default=True, description="Copy system metadata from the source system"
+    )
+
+    _urn_pattern_was_set: bool = False
+
+    @model_validator(mode="after")
+    def check_ingesting_data(self):
+        if (
+            not self.database_connection
+            and not self.kafka_connection
+            and not self.pull_from_datahub_api
+        ):
+            raise ValueError(
+                "Your current config will not ingest any data."
+                " Please specify at least one of `database_connection` or `kafka_connection`, ideally both."
+            )
+
+        # Track if user explicitly set urn_pattern
+        if "urn_pattern" in self.model_fields_set:
+            self._urn_pattern_was_set = True
+
+        return self
+
+    @pydantic.field_validator("database_connection")
+    def validate_mysql_scheme(
+        cls, v: SQLAlchemyConnectionConfig
+    ) -> SQLAlchemyConnectionConfig:
+        if "mysql" in v.scheme:
+            if v.scheme != "mysql+pymysql":
+                raise ValueError("For MySQL, the scheme must be mysql+pymysql.")
+        return v

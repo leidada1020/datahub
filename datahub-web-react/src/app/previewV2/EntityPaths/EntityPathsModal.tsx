@@ -1,0 +1,107 @@
+import { Modal, Skeleton } from 'antd';
+import React, { useContext } from 'react';
+import { Trans, useTranslation } from 'react-i18next';
+import styled from 'styled-components/macro';
+
+import { LineageTabContext } from '@app/entityV2/shared/tabs/Lineage/LineageTabContext';
+import { getDisplayedColumns } from '@app/previewV2/EntityPaths/ColumnPathsText';
+import ColumnsRelationshipText from '@app/previewV2/EntityPaths/ColumnsRelationshipText';
+import { CompactEntityNameList } from '@app/recommendations/renderer/component/CompactEntityNameList';
+import { useGetEntitiesQuery } from '@src/graphql/entity.generated';
+
+import { Entity, EntityPath, LineageDirection } from '@types';
+
+const PathWrapper = styled.div`
+    display: inline-block;
+    margin: 15px 0 15px -4px;
+    padding: 20px;
+    border: 1px solid ${(props) => props.theme.colors.border};
+    border-radius: 8px;
+    box-shadow: ${(props) => props.theme.colors.shadowSm};
+    width: 100%;
+`;
+
+const Header = styled.div`
+    font-size: 16px;
+    padding-top: 8px;
+`;
+
+const ErrorContainer = styled.div`
+    font-size: 14px;
+    padding: 8px 0px;
+    color: ${(props) => props.theme.colors.textTertiary};
+`;
+
+interface Props {
+    paths: EntityPath[];
+    resultEntityUrn: string;
+    hideModal: () => void;
+}
+
+export default function EntityPathsModal({ paths, resultEntityUrn, hideModal }: Props) {
+    const { t } = useTranslation('entity.preview');
+    const { lineageDirection } = useContext(LineageTabContext);
+    const displayedColumns = getDisplayedColumns(paths, resultEntityUrn);
+
+    // We need to fetch the below urns before loading the content of this modal
+    const entityUrnsToFetch: string[] = paths
+        .flatMap((path) => path.path ?? [])
+        .map((entity) => entity?.urn)
+        .filter((urn): urn is string => !!urn);
+    const {
+        data: result,
+        loading,
+        error,
+    } = useGetEntitiesQuery({
+        variables: { urns: entityUrnsToFetch },
+    });
+    const fetchedEntities = result?.entities;
+
+    const loadedState = error ? (
+        <ErrorContainer>{t('columnPaths.error')}</ErrorContainer>
+    ) : (
+        paths.map((path, i) => {
+            const entities: Entity[] = (
+                lineageDirection === LineageDirection.Upstream ? [...path.path].reverse() : path.path
+            )
+                .map(
+                    (bareEntity) =>
+                        fetchedEntities?.find(
+                            (hydratedEntity) => hydratedEntity && hydratedEntity.urn === bareEntity?.urn,
+                        ) as Entity | undefined,
+                )
+                .filter((entity): entity is Entity => !!entity);
+            const key = `${i}`;
+            return (
+                <PathWrapper key={key}>
+                    <CompactEntityNameList entities={entities} showArrows />
+                </PathWrapper>
+            );
+        })
+    );
+    return (
+        <Modal
+            data-testid="entity-paths-modal"
+            title={
+                <Header>
+                    <Trans
+                        t={t}
+                        i18nKey="columnPaths.modalTitle"
+                        count={paths.length}
+                        components={{
+                            relationship: <ColumnsRelationshipText displayedColumns={displayedColumns} />,
+                        }}
+                    />
+                </Header>
+            }
+            width="75vw"
+            open
+            onCancel={hideModal}
+            onOk={hideModal}
+            footer={null}
+            bodyStyle={{ padding: '16px 24px' }}
+        >
+            {loading ? <Skeleton /> : loadedState}
+        </Modal>
+    );
+}

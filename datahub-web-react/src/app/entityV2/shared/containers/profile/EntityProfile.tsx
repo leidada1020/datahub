@@ -1,0 +1,482 @@
+import { MutationHookOptions, MutationTuple, QueryHookOptions, QueryResult } from '@apollo/client/react/types/types';
+import { Loader } from '@components';
+import { Alert } from 'antd';
+import React, { useCallback, useContext, useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useHistory, useLocation } from 'react-router';
+import { matchPath } from 'react-router-dom';
+import styled from 'styled-components/macro';
+
+import analytics, { EventType } from '@app/analytics';
+import { useUpdateDomainEntityDataOnChange as useUpdateDomainEntityDataOnChangeV2 } from '@app/domainV2/utils';
+import { EntityContext } from '@app/entity/shared/EntityContext';
+import {
+    DrawerType,
+    EntitySubHeaderSection,
+    GenericEntityProperties,
+    GenericEntityUpdate,
+} from '@app/entity/shared/types';
+import { EntityCapabilityType } from '@app/entityV2/Entity';
+import { EntityMenuItems } from '@app/entityV2/shared/EntityDropdown/EntityMenuActions';
+import { getEntityPath } from '@app/entityV2/shared/containers/profile/entityData';
+import { EntityHeader } from '@app/entityV2/shared/containers/profile/header/EntityHeader';
+import { EntityTabs } from '@app/entityV2/shared/containers/profile/header/EntityTabs';
+import EntityProfileSidebar from '@app/entityV2/shared/containers/profile/sidebar/EntityProfileSidebar';
+import useGetDataForProfile from '@app/entityV2/shared/containers/profile/useGetDataForProfile';
+import {
+    defaultTabDisplayConfig,
+    getOnboardingStepIdsForEntityType,
+    useFinalSidebarTabs,
+    useRoutedTab,
+    useUpdateGlossaryEntityDataOnChange,
+} from '@app/entityV2/shared/containers/profile/utils';
+import { EntityActionItem } from '@app/entityV2/shared/entity/EntityActions';
+import NonExistentEntityPage from '@app/entityV2/shared/entity/NonExistentEntityPage';
+import { lazyProfileComponent } from '@app/entityV2/shared/lazyEntityProfile';
+import HistorySidebar from '@app/entityV2/shared/tabs/Dataset/Schema/history/HistorySidebar';
+import { EntitySidebarSection, EntitySidebarTab, EntityTab, TabContextType } from '@app/entityV2/shared/types';
+import { useIsSeparateSiblingsMode } from '@app/entityV2/shared/useIsSeparateSiblingsMode';
+import VersionsDrawer from '@app/entityV2/shared/versioning/VersionsDrawer';
+import useIsLineageMode from '@app/lineage/utils/useIsLineageMode';
+import { useUpdateMarketplaceEntityDataOnChange } from '@app/marketplace/useUpdateMarketplaceEntityDataOnChange';
+import { useUpdateMetricsEntityDataOnChange } from '@app/metrics/useUpdateMetricsEntityDataOnChange';
+import { OnboardingTour } from '@app/onboarding/OnboardingTour';
+import {
+    LINEAGE_GRAPH_INTRO_ID,
+    LINEAGE_GRAPH_TIME_FILTER_ID,
+} from '@app/onboarding/config/LineageGraphOnboardingConfig';
+import CompactContext from '@app/sharedV2/CompactContext';
+import { EntityHead } from '@app/sharedV2/EntityHead';
+import EntitySidebarContext from '@app/sharedV2/EntitySidebarContext';
+import TabFullsizeContext from '@app/sharedV2/TabFullsizedContext';
+import { ErrorSection } from '@app/sharedV2/error/ErrorSection';
+import { useEntityRegistry } from '@app/useEntityRegistry';
+import { PageRoutes } from '@conf/Global';
+import useEntityState from '@src/app/entity/shared/useEntityState';
+import { useShowNavBarRedesign } from '@src/app/useShowNavBarRedesign';
+
+import { useGetFormsForEntityQuery } from '@graphql/form.generated';
+import { EntityType, Exact } from '@types';
+
+const FullscreenLineageLoader = styled.div`
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    width: 100%;
+`;
+
+// Fullscreen lineage is a mode switch, not part of the profile shell. The lineage tab
+// already loads the graph on its own chunk.
+const LineageGraph = lazyProfileComponent('LineageGraph', () => import('@app/lineageV3/LineageGraph'), {
+    fallback: () => (
+        <FullscreenLineageLoader>
+            <Loader />
+        </FullscreenLineageLoader>
+    ),
+});
+const DynamicTab = lazyProfileComponent(
+    'DynamicTab',
+    () => import('@app/entityV2/shared/tabs/Entity/weaklyTypedAspects/DynamicTab'),
+);
+
+type Props<T, U> = {
+    urn: string;
+    entityType: EntityType;
+    useEntityQuery: (
+        baseOptions: QueryHookOptions<
+            T,
+            Exact<{
+                urn: string;
+            }>
+        >,
+    ) => QueryResult<
+        T,
+        Exact<{
+            urn: string;
+        }>
+    >;
+    useUpdateQuery?: (
+        baseOptions?:
+            | MutationHookOptions<
+                  U,
+                  {
+                      urn: string;
+                      input: GenericEntityUpdate;
+                  }
+              >
+            | undefined,
+    ) => MutationTuple<U, { urn: string; input: GenericEntityUpdate }>;
+    getOverrideProperties?: (T) => GenericEntityProperties;
+    tabs: EntityTab[];
+    sidebarTabs?: EntitySidebarTab[];
+    sidebarSections?: EntitySidebarSection[]; // Deprecated.
+    subHeader?: EntitySubHeaderSection;
+    headerDropdownItems?: Set<EntityMenuItems>;
+    headerActionItems?: Set<EntityActionItem>;
+    isNameEditable?: boolean;
+    isIconEditable?: boolean;
+    isColorEditable?: boolean;
+};
+
+const ContentContainer = styled.div`
+    display: flex;
+    height: 100%;
+`;
+
+const StyledEntityProfileSidebar = styled(EntityProfileSidebar)<{ $isShowNavBarRedesign?: boolean }>`
+    ${(props) => !props.$isShowNavBarRedesign && 'padding-bottom: 12px;'}
+`;
+
+const HeaderAndTabsFlex = styled.div`
+    flex-grow: 1;
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    max-height: 100%;
+    overflow: hidden;
+    min-height: 0;
+    overflow-y: auto;
+    /* Hide scrollbar for Chrome, Safari, and Opera */
+
+    &::-webkit-scrollbar {
+        display: none;
+    }
+`;
+
+const Header = styled.div<{ $isShowNavBarRedesign?: boolean }>`
+    padding: ${(props) => (props.$isShowNavBarRedesign ? '0' : '0px 16px 0px 16px')};
+    display: flex;
+    align-items: center;
+`;
+
+const HeaderContent = styled.div<{ $isShowNavBarRedesign?: boolean }>`
+    background-color: ${(props) => props.theme.colors.bg};
+    border-radius: ${(props) =>
+        props.$isShowNavBarRedesign ? props.theme.styles['border-radius-navbar-redesign'] : '8px'};
+    box-shadow: ${(props) => props.theme.colors.shadowSm};
+    flex: 1;
+    flex-shrink: 0;
+    padding: 0;
+    overflow: hidden;
+`;
+
+const Body = styled.div<{ $isShowNavBarRedesign?: boolean }>`
+    padding: ${(props) => (props.$isShowNavBarRedesign ? '8px 0 0 0' : '12px 16px 12px 16px')};
+    height: 100%;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+`;
+
+const BodyContent = styled.div<{ $isShowNavBarRedesign?: boolean }>`
+    padding-top: 12px;
+    background-color: ${(props) => props.theme.colors.bg};
+    border-radius: ${(props) =>
+        props.$isShowNavBarRedesign ? props.theme.styles['border-radius-navbar-redesign'] : '8px'};
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    box-shadow: ${(props) => props.theme.colors.shadowSm};
+    height: 100%;
+    overflow: hidden;
+`;
+
+const StyledAlert = styled(Alert)`
+    box-sizing: border-box;
+    position: fixed;
+    width: calc(100% - 70px);
+    z-index: 1000;
+`;
+
+const Wrapper = styled.div<{ showAlert: boolean }>`
+    flex-grow: 1;
+    min-width: 0;
+    height: 100%;
+    margin-top: ${({ showAlert }) => (showAlert ? '2.5rem' : '0')};
+`;
+
+/**
+ * Container for display of the Entity Page
+ */
+export const EntityProfile = <T, U>({
+    urn,
+    useEntityQuery,
+    useUpdateQuery,
+    entityType,
+    getOverrideProperties,
+    tabs,
+    sidebarTabs = [],
+    sidebarSections,
+    headerDropdownItems,
+    headerActionItems,
+    isNameEditable,
+    isColorEditable,
+    isIconEditable,
+    subHeader,
+}: Props<T, U>): JSX.Element => {
+    const { isTabFullsize, setTabFullsize } = useContext(TabFullsizeContext);
+    const isLineageMode = useIsLineageMode();
+    const { t } = useTranslation('entity.shared.containers');
+    const isHideSiblingMode = useIsSeparateSiblingsMode();
+    const entityRegistry = useEntityRegistry();
+    const history = useHistory();
+    const location = useLocation();
+    const isInSearch = matchPath(location.pathname, PageRoutes.SEARCH_RESULTS) !== null;
+    const [showAlert, setShowAlert] = useState(true);
+    const entityState = useEntityState();
+    const isShowNavBarRedesign = useShowNavBarRedesign();
+    const [drawer, setDrawer] = useState<DrawerType | undefined>(undefined);
+
+    const { width } = React.useContext(EntitySidebarContext);
+    const isCompact = React.useContext(CompactContext);
+
+    const tabsWithDefaults = tabs.map((tab) => ({ ...tab, display: { ...defaultTabDisplayConfig, ...tab.display } }));
+
+    const [shouldRefetchEmbeddedListSearch, setShouldRefetchEmbeddedListSearch] = useState(false);
+    const entityStepIds: string[] = getOnboardingStepIdsForEntityType(entityType);
+    const lineageGraphStepIds: string[] = [LINEAGE_GRAPH_INTRO_ID, LINEAGE_GRAPH_TIME_FILTER_ID];
+    const stepIds = isLineageMode ? lineageGraphStepIds : entityStepIds;
+
+    const routeToTab = useCallback(
+        ({
+            tabName,
+            tabParams,
+            method = 'replace',
+        }: {
+            tabName: string;
+            tabParams?: Record<string, any>;
+            method?: 'push' | 'replace';
+        }) => {
+            analytics.event({
+                type: EventType.EntitySectionViewEvent,
+                entityType,
+                entityUrn: urn,
+                section: tabName.toLowerCase(),
+            });
+            history[method](
+                getEntityPath(entityType, urn, entityRegistry, false, isHideSiblingMode, tabName, tabParams),
+            );
+        },
+        [history, entityType, urn, entityRegistry, isHideSiblingMode],
+    );
+
+    const { data: formsData, refetch: refetchForms } = useGetFormsForEntityQuery({
+        variables: { urn },
+        fetchPolicy: 'cache-first',
+        skip: !entityRegistry.getSupportedEntityCapabilities(entityType).has(EntityCapabilityType.FORMS),
+    });
+
+    const {
+        entityData,
+        rootEntityData,
+        dataPossiblyCombinedWithSiblings,
+        dataNotCombinedWithSiblings,
+        loading,
+        error,
+        refetch,
+    } = useGetDataForProfile({ urn, entityType, useEntityQuery, getOverrideProperties, formsData });
+
+    useUpdateGlossaryEntityDataOnChange(entityData, entityType);
+    useUpdateDomainEntityDataOnChangeV2(entityData, entityType);
+    useUpdateMetricsEntityDataOnChange(entityData, entityType);
+    useUpdateMarketplaceEntityDataOnChange(entityData, entityType);
+
+    const maybeUpdateEntity = useUpdateQuery?.({
+        onCompleted: () => refetch(),
+    });
+
+    let updateEntity;
+    if (maybeUpdateEntity) {
+        [updateEntity] = maybeUpdateEntity;
+    }
+
+    const lineage = entityData ? entityRegistry.getLineageVizConfig(entityType, entityData) : undefined;
+
+    const autoRenderTabs: EntityTab[] =
+        entityData?.autoRenderAspects?.map((aspect) => ({
+            name: aspect.renderSpec?.displayName || aspect.aspectName,
+            path: aspect.renderSpec?.key || aspect.renderSpec?.displayName || aspect.aspectName,
+            component: () => (
+                <DynamicTab
+                    renderSpec={aspect.renderSpec}
+                    type={aspect.renderSpec?.displayType}
+                    payload={aspect.payload}
+                />
+            ),
+            display: {
+                visible: () => true,
+                enabled: () => true,
+            },
+        })) || [];
+
+    const visibleTabs = [...tabsWithDefaults, ...autoRenderTabs].filter((tab) =>
+        tab.display?.visible(entityData, dataPossiblyCombinedWithSiblings),
+    );
+
+    const enabledAndVisibleTabs = visibleTabs.filter((tab) =>
+        tab.display?.enabled(entityData, dataPossiblyCombinedWithSiblings),
+    );
+
+    const routedTab = useRoutedTab(enabledAndVisibleTabs);
+
+    useEffect(() => {
+        if (!routedTab?.supportsFullsize) {
+            setTabFullsize?.(false);
+        }
+    }, [routedTab?.supportsFullsize, setTabFullsize]);
+
+    // Different contexts require different sidebar behaviors (e.g., search results need compact views,
+    // lineage views have space constraints, profile sidebars support full feature sets)
+    let contextType = TabContextType.PROFILE_SIDEBAR;
+    if (isInSearch) {
+        contextType = TabContextType.SEARCH_SIDEBAR;
+    } else if (isCompact) {
+        contextType = TabContextType.LINEAGE_SIDEBAR;
+    }
+
+    const finalTabs = useFinalSidebarTabs(sidebarTabs, sidebarSections || [], contextType);
+
+    if (entityData?.exists === false) {
+        return <NonExistentEntityPage />;
+    }
+
+    if (isCompact) {
+        return (
+            <EntityContext.Provider
+                value={{
+                    urn,
+                    entityType,
+                    entityData,
+                    rootEntityData,
+                    loading,
+                    baseEntity: dataPossiblyCombinedWithSiblings,
+                    dataNotCombinedWithSiblings,
+                    updateEntity,
+                    routeToTab,
+                    refetch,
+                    refetchForms,
+                    lineage,
+                    shouldRefetchEmbeddedListSearch,
+                    setShouldRefetchEmbeddedListSearch,
+                    entityState,
+                }}
+            >
+                <>
+                    {(error && <ErrorSection />) || (
+                        <EntityProfileSidebar
+                            type={isInSearch ? 'card' : undefined}
+                            focused={isInSearch}
+                            tabs={finalTabs}
+                            contextType={contextType}
+                            width={width}
+                            headerDropdownItems={headerDropdownItems}
+                        />
+                    )}
+                </>
+            </EntityContext.Provider>
+        );
+    }
+
+    const showError = error;
+    const showFullScreen = !error && isLineageMode;
+
+    return (
+        <EntityContext.Provider
+            value={{
+                urn,
+                entityType,
+                entityData,
+                rootEntityData,
+                loading,
+                baseEntity: dataPossiblyCombinedWithSiblings,
+                dataNotCombinedWithSiblings,
+                updateEntity,
+                routeToTab,
+                refetch,
+                refetchForms,
+                lineage,
+                shouldRefetchEmbeddedListSearch,
+                setShouldRefetchEmbeddedListSearch,
+                entityState,
+                setDrawer,
+            }}
+        >
+            {entityData?.status?.removed && (
+                <StyledAlert
+                    message={t('profile.notDiscoverableAlert')}
+                    banner
+                    closable
+                    onClose={() => setShowAlert(false)}
+                />
+            )}
+            <Wrapper showAlert={showAlert && !!entityData?.status?.removed}>
+                <OnboardingTour stepIds={stepIds} />
+                <EntityHead />
+                {showError && <ErrorSection />}
+                {showFullScreen && <LineageGraph isFullscreen />}
+                {!showFullScreen && (
+                    <ContentContainer>
+                        {!isLineageMode && (
+                            <>
+                                <HeaderAndTabsFlex>
+                                    {!isTabFullsize && (
+                                        <Header $isShowNavBarRedesign={isShowNavBarRedesign}>
+                                            <HeaderContent $isShowNavBarRedesign={isShowNavBarRedesign}>
+                                                <EntityHeader
+                                                    headerDropdownItems={headerDropdownItems}
+                                                    headerActionItems={headerActionItems}
+                                                    isNameEditable={isNameEditable}
+                                                    isIconEditable={isIconEditable}
+                                                    isColorEditable={isColorEditable}
+                                                    displayProperties={entityData?.displayProperties || undefined}
+                                                    subHeader={subHeader}
+                                                />
+                                            </HeaderContent>
+                                        </Header>
+                                    )}
+                                    <Body $isShowNavBarRedesign={isShowNavBarRedesign}>
+                                        <BodyContent $isShowNavBarRedesign={isShowNavBarRedesign}>
+                                            <EntityTabs tabs={visibleTabs} selectedTab={routedTab} />
+                                        </BodyContent>
+                                    </Body>
+                                </HeaderAndTabsFlex>
+                                {!isTabFullsize && (
+                                    <StyledEntityProfileSidebar
+                                        tabs={finalTabs}
+                                        type="card"
+                                        width={width}
+                                        contextType={TabContextType.PROFILE_SIDEBAR}
+                                        headerDropdownItems={headerDropdownItems}
+                                        flushOuterMargin={isShowNavBarRedesign}
+                                        $isShowNavBarRedesign={isShowNavBarRedesign}
+                                    />
+                                )}
+                            </>
+                        )}
+                    </ContentContainer>
+                )}
+            </Wrapper>
+            {!!entityData?.versionProperties?.versionSet && (
+                <VersionsDrawer
+                    versionSetUrn={entityData.versionProperties?.versionSet.urn}
+                    open={drawer === DrawerType.VERSIONS}
+                />
+            )}
+            {drawer === DrawerType.CHANGE_HISTORY && (
+                <HistorySidebar
+                    open
+                    onClose={() => setDrawer(undefined)}
+                    urn={urn}
+                    versionList={[]}
+                    hideSemanticVersions
+                    entityType={entityType}
+                    versionSetUrn={entityData?.versionProperties?.versionSet?.urn}
+                    currentVersionUrn={entityData?.versionProperties?.versionSet?.urn ? urn : undefined}
+                    defaultShowAllVersions={!!entityData?.versionProperties?.versionSet?.urn}
+                />
+            )}
+        </EntityContext.Provider>
+    );
+};

@@ -1,0 +1,74 @@
+import { StructuredPopover, Text } from '@components';
+import React from 'react';
+import styled from 'styled-components/macro';
+
+import { useMutationUrn, useRefetch } from '@app/entity/shared/EntityContext';
+import { ExpandedOwner } from '@app/entityV2/shared/components/styled/ExpandedOwner/ExpandedOwner';
+import { getOwnershipTypeDescription } from '@app/entityV2/shared/components/styled/ExpandedOwner/OwnerUtils';
+import { getOwnershipTypeName } from '@app/entityV2/shared/containers/profile/sidebar/Ownership/ownershipUtils';
+
+import { Owner, OwnershipTypeEntity } from '@types';
+
+const OwnershipTypeContainer = styled.div`
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-width: inherit;
+`;
+
+const OwnershipTypeNameText = styled.span`
+    font-family: 'Mulish', sans-serif;
+    font-weight: 500;
+    font-size: 12px;
+    color: ${(props) => props.theme.colors.textSecondary};
+`;
+
+const OwnersContainer = styled.div`
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    max-width: inherit;
+    gap: 4px;
+`;
+
+interface Props {
+    ownershipType: OwnershipTypeEntity;
+    owners: Owner[];
+    readOnly?: boolean;
+}
+
+export const OwnershipTypeSection = ({ ownershipType, owners, readOnly }: Props) => {
+    const mutationUrn = useMutationUrn();
+    const refetch = useRefetch();
+    const ownershipTypeName = getOwnershipTypeName(ownershipType);
+    const ownershipTypeDescription = getOwnershipTypeDescription(ownershipType);
+
+    return (
+        <OwnershipTypeContainer>
+            <StructuredPopover
+                placement="topLeft"
+                sections={
+                    ownershipTypeDescription && [
+                        {
+                            title: ownershipTypeName,
+                            content: <Text>{ownershipTypeDescription}</Text>,
+                        },
+                    ]
+                }
+            >
+                <OwnershipTypeNameText>{ownershipTypeName}</OwnershipTypeNameText>
+            </StructuredPopover>
+            <OwnersContainer>
+                {owners.map((owner) => (
+                    <ExpandedOwner
+                        key={owner.owner.urn}
+                        entityUrn={owner.associatedUrn || mutationUrn}
+                        owner={owner}
+                        refetch={refetch}
+                        readOnly={readOnly}
+                    />
+                ))}
+            </OwnersContainer>
+        </OwnershipTypeContainer>
+    );
+};

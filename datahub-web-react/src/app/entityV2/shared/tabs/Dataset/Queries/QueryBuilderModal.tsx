@@ -1,0 +1,180 @@
+import { toast } from '@components';
+import React, { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import analytics, { EventType } from '@app/analytics';
+import QueryBuilderForm from '@app/entityV2/shared/tabs/Dataset/Queries/QueryBuilderForm';
+import { QueryBuilderState } from '@app/entityV2/shared/tabs/Dataset/Queries/types';
+import ClickOutside from '@app/sharedV2/ClickOutside';
+import { ConfirmationModal } from '@app/sharedV2/modals/ConfirmationModal';
+import { Modal } from '@src/alchemy-components';
+
+import { useCreateQueryMutation, useUpdateQueryMutation } from '@graphql/query.generated';
+import { QueryLanguage } from '@types';
+
+const StyledModal = styled(Modal)`
+    top: 4vh;
+    max-width: 1200px;
+`;
+
+const MODAL_WIDTH = '80vw';
+
+const MODAL_BODY_STYLE = {
+    height: '74vh',
+    overflow: 'auto',
+};
+
+const PLACEHOLDER_QUERY = `-- SELECT sum(price)
+-- FROM transactions
+-- WHERE user_id = "john_smith"
+--  AND product_id IN [1, 2, 3]`;
+
+const DEFAULT_STATE = {
+    query: PLACEHOLDER_QUERY,
+};
+
+type Props = {
+    initialState?: QueryBuilderState;
+    datasetUrn?: string;
+    onClose?: () => void;
+    onSubmit?: (newQuery: any) => void;
+};
+
+export default function QueryBuilderModal({ initialState, datasetUrn, onClose, onSubmit }: Props) {
+    const { t } = useTranslation('entity.profile.queries');
+    const { t: tc } = useTranslation('common.actions');
+    const isUpdating = initialState?.urn !== undefined;
+
+    const [showConfirmationModal, setShowConfirmationModal] = useState(false);
+    const [isSaving, setIsSaving] = useState(false);
+    const [builderState, setBuilderState] = useState<QueryBuilderState>(initialState || DEFAULT_STATE);
+    const [createQueryMutation] = useCreateQueryMutation();
+    const [updateQueryMutation] = useUpdateQueryMutation();
+
+    const createQuery = () => {
+        if (datasetUrn) {
+            setIsSaving(true);
+            createQueryMutation({
+                variables: {
+                    input: {
+                        properties: {
+                            name: builderState.title,
+                            description: builderState.description,
+                            statement: {
+                                value: builderState.query as string,
+                                language: QueryLanguage.Sql,
+                            },
+                        },
+                        subjects: [{ datasetUrn }],
+                    },
+                },
+            })
+                .then(({ data, errors }) => {
+                    if (!errors) {
+                        analytics.event({
+                            type: EventType.CreateQueryEvent,
+                        });
+                        toast.success(t('queryBuilderModal.createSuccess'), { duration: 3 });
+                        onSubmit?.(data?.createQuery);
+                        setBuilderState(DEFAULT_STATE);
+                    }
+                })
+                .catch(() => {
+                    toast.destroy();
+                    toast.error(t('queryBuilderModal.createError'));
+                })
+                .finally(() => setIsSaving(false));
+        }
+    };
+
+    const updateQuery = () => {
+        if (initialState) {
+            setIsSaving(true);
+            updateQueryMutation({
+                variables: {
+                    urn: initialState?.urn as string,
+                    input: {
+                        properties: {
+                            name: builderState.title,
+                            description: builderState.description,
+                            statement: {
+                                value: builderState.query as string,
+                                language: QueryLanguage.Sql,
+                            },
+                        },
+                    },
+                },
+            })
+                .then(({ data, errors }) => {
+                    if (!errors) {
+                        analytics.event({
+                            type: EventType.UpdateQueryEvent,
+                        });
+                        toast.success(t('queryBuilderModal.editSuccess'), { duration: 3 });
+                        onSubmit?.(data?.updateQuery);
+                        setBuilderState(DEFAULT_STATE);
+                    }
+                })
+                .catch(() => {
+                    toast.destroy();
+                    toast.error(t('queryBuilderModal.editError'));
+                })
+                .finally(() => setIsSaving(false));
+        }
+    };
+
+    const saveQuery = () => {
+        if (isUpdating) {
+            updateQuery();
+        } else {
+            createQuery();
+        }
+    };
+
+    return (
+        <ClickOutside onClickOutside={() => setShowConfirmationModal(true)} wrapperClassName="query-builder-modal">
+            <StyledModal
+                width={MODAL_WIDTH}
+                bodyStyle={MODAL_BODY_STYLE}
+                title={isUpdating ? t('queryBuilderModal.editTitle') : t('queryBuilderModal.newTitle')}
+                className="query-builder-modal"
+                open
+                onCancel={() => setShowConfirmationModal(true)}
+                buttons={[
+                    {
+                        text: tc('cancel'),
+                        variant: 'text',
+                        onClick: () => onClose?.(),
+                        buttonDataTestId: 'query-builder-cancel-button',
+                    },
+                    {
+                        text: tc('save'),
+                        variant: 'filled',
+                        id: 'createQueryButton',
+                        buttonDataTestId: 'query-builder-save-button',
+                        onClick: saveQuery,
+                        // The mutation takes long enough to click Save again, which would create
+                        // duplicate queries. isLoading is cosmetic — Button still forwards onClick
+                        // while loading — so the disabled flag is what actually blocks the retry.
+                        isLoading: isSaving,
+                        disabled: isSaving,
+                    },
+                ]}
+                data-testid="query-builder-modal"
+            >
+                <QueryBuilderForm state={builderState} updateState={setBuilderState} />
+            </StyledModal>
+            <ConfirmationModal
+                isOpen={showConfirmationModal}
+                handleClose={() => setShowConfirmationModal(false)}
+                handleConfirm={() => {
+                    setBuilderState(DEFAULT_STATE);
+                    onClose?.();
+                }}
+                modalTitle={t('queryBuilderModal.exitConfirmTitle')}
+                modalText={t('queryBuilderModal.exitConfirmBody')}
+            />
+        </ClickOutside>
+    );
+}

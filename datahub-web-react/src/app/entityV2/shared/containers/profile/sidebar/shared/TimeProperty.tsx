@@ -1,0 +1,42 @@
+import { Tooltip } from '@components';
+import React from 'react';
+import styled from 'styled-components';
+
+import { LabelText } from '@app/entityV2/shared/containers/profile/sidebar/shared/styledComponents';
+import { toLocalDateString, toRelativeTimeString } from '@app/sharedV2/time/timeUtils';
+import dayjs from '@utils/dayjs';
+
+const PropertyContainer = styled.div`
+    display: flex;
+    gap: 5px;
+    margin-bottom: 6px;
+`;
+
+const UpdatedTime = styled.span`
+    font-weight: 700;
+    color: ${(props) => props.theme.colors.textSecondary};
+`;
+
+interface Props {
+    labelText: string;
+    time?: number | null;
+    titleTip?: React.ReactNode;
+}
+
+const TimeProperty = ({ labelText, time, titleTip }: Props) => {
+    const timeFormatted = dayjs(time).format('hh:mm A');
+    return (
+        <PropertyContainer>
+            <Tooltip showArrow={false} title={titleTip}>
+                <LabelText>{labelText}</LabelText>
+            </Tooltip>
+            {!!time && (
+                <Tooltip showArrow={false} title={`${toLocalDateString(time)} at ${timeFormatted}`}>
+                    <UpdatedTime>{toRelativeTimeString(time)}</UpdatedTime>
+                </Tooltip>
+            )}
+        </PropertyContainer>
+    );
+};
+
+export default TimeProperty;

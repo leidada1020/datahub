@@ -1,0 +1,217 @@
+import datetime
+import logging
+from abc import ABCMeta, abstractmethod
+from dataclasses import dataclass, field
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Generic,
+    List,
+    Optional,
+    Type,
+    TypeVar,
+    cast,
+)
+
+from typing_extensions import Self
+
+from datahub.configuration.common import ConfigModel
+from datahub.configuration.env_vars import (
+    get_report_failure_sample_size,
+    get_report_warning_sample_size,
+)
+from datahub.ingestion.api.closeable import Closeable
+from datahub.ingestion.api.common import PipelineContext, RecordEnvelope, WorkUnit
+from datahub.ingestion.api.report import Report
+from datahub.utilities.lossy_collections import LossyList
+from datahub.utilities.type_annotations import get_class_from_annotation
+
+if TYPE_CHECKING:
+    from datahub.ingestion.graph.client import DataHubGraph
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SinkReport(Report):
+    total_records_written: int = 0
+    records_written_per_second: int = 0
+    warnings: LossyList[Any] = field(
+        default_factory=lambda: LossyList(max_elements=get_report_warning_sample_size())
+    )
+    failures: LossyList[Any] = field(
+        default_factory=lambda: LossyList(max_elements=get_report_failure_sample_size())
+    )
+    start_time: datetime.datetime = field(default_factory=datetime.datetime.now)
+    current_time: Optional[datetime.datetime] = None
+    total_duration_in_seconds: Optional[float] = None
+
+    def report_record_written(self, record_envelope: RecordEnvelope) -> None:
+        self.total_records_written += 1
+
+    def report_warning(self, info: Any) -> None:
+        self.warnings.append(info)
+
+    def report_failure(self, info: Any) -> None:
+        self.failures.append(info)
+
+    def compute_stats(self) -> None:
+        super().compute_stats()
+        self.current_time = datetime.datetime.now()
+        if self.start_time:
+            self.total_duration_in_seconds = round(
+                (self.current_time - self.start_time).total_seconds(), 2
+            )
+            if self.total_duration_in_seconds > 0:
+                self.records_written_per_second = int(
+                    self.total_records_written / self.total_duration_in_seconds
+                )
+
+
+class WriteCallback(metaclass=ABCMeta):
+    @abstractmethod
+    def on_success(
+        self, record_envelope: RecordEnvelope, success_metadata: dict
+    ) -> None:
+        pass
+
+    @abstractmethod
+    def on_failure(
+        self,
+        record_envelope: RecordEnvelope,
+        failure_exception: Exception,
+        failure_metadata: dict,
+    ) -> None:
+        pass
+
+
+class NoopWriteCallback(WriteCallback):
+    """Convenience WriteCallback class to support noop"""
+
+    def on_success(
+        self, record_envelope: RecordEnvelope, success_metadata: dict
+    ) -> None:
+        pass
+
+    def on_failure(
+        self,
+        record_envelope: RecordEnvelope,
+        failure_exception: Exception,
+        failure_metadata: dict,
+    ) -> None:
+        pass
+
+
+SinkReportType = TypeVar("SinkReportType", bound=SinkReport, covariant=True)
+SinkConfig = TypeVar("SinkConfig", bound=ConfigModel, covariant=True)
+
+
+class Sink(Generic[SinkConfig, SinkReportType], Closeable, metaclass=ABCMeta):
+    """All Sinks must inherit this base class."""
+
+    ctx: PipelineContext
+    config: SinkConfig
+    report: SinkReportType
+    _pre_shutdown_callbacks: List[Callable[[], None]]
+
+    @classmethod
+    def get_config_class(cls) -> Type[SinkConfig]:
+        config_class = get_class_from_annotation(cls, Sink, ConfigModel)
+        assert config_class, "Sink subclasses must define a config class"
+        return cast(Type[SinkConfig], config_class)
+
+    @classmethod
+    def get_report_class(cls) -> Type[SinkReportType]:
+        report_class = get_class_from_annotation(cls, Sink, SinkReport)
+        assert report_class, "Sink subclasses must define a report class"
+        return cast(Type[SinkReportType], report_class)
+
+    def __init__(self, ctx: PipelineContext, config: SinkConfig):
+        self.ctx = ctx
+        self.config = config
+        self.report = self.get_report_class()()
+        self._pre_shutdown_callbacks = []
+
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        """Hook called after the sink's main initialization is complete.
+
+        Sink subclasses can override this method to customize initialization.
+        """
+        pass
+
+    @classmethod
+    def create(cls, config_dict: dict, ctx: PipelineContext) -> "Self":
+        return cls(ctx, cls.get_config_class().model_validate(config_dict))
+
+    def handle_work_unit_start(self, workunit: WorkUnit) -> None:
+        """Called at the start of each new workunit.
+
+        This method is deprecated and will be removed in a future release.
+        """
+        pass
+
+    def handle_work_unit_end(self, workunit: WorkUnit) -> None:
+        """Called at the end of each workunit.
+
+        This method is deprecated and will be removed in a future release.
+        """
+        pass
+
+    @abstractmethod
+    def write_record_async(
+        self, record_envelope: RecordEnvelope, write_callback: WriteCallback
+    ) -> None:
+        # must call callback when done.
+        pass
+
+    def flush(self) -> None:
+        """Block until all buffered/in-flight writes are delivered.
+
+        Called by the pipeline before committing state, so that async sinks can
+        confirm delivery (and record any failures on their report) before the
+        commit gate reads sink failures. Default is a no-op for synchronous
+        sinks; async sinks (e.g. datahub-kafka) should override.
+        """
+        pass
+
+    def to_graph(self) -> Optional["DataHubGraph"]:
+        """Return a DataHubGraph for features that need a GMS client (e.g.
+        stateful ingestion) when this sink is the injected default.
+
+        Default None (no graph -> such features are disabled). Sinks that can
+        provide one (e.g. datahub-kafka via its REST fallback) should override.
+        """
+        return None
+
+    def get_report(self) -> SinkReportType:
+        return self.report
+
+    def register_pre_shutdown_callback(self, callback: Callable[[], None]) -> None:
+        """Register a callback to be executed before the sink shuts down.
+
+        This is useful for components that need to send final reports or cleanup
+        operations before the sink's resources are released.
+        """
+        self._pre_shutdown_callbacks.append(callback)
+
+    def close(self) -> None:
+        """Close the sink and clean up resources.
+
+        This method executes any registered pre-shutdown callbacks before
+        performing the actual shutdown. Subclasses should override this method
+        to provide sink-specific cleanup logic while calling super().close()
+        to ensure callbacks are executed.
+        """
+        # Execute pre-shutdown callbacks before shutdown
+        for callback in self._pre_shutdown_callbacks:
+            try:
+                callback()
+            except Exception as e:
+                logger.warning(f"Pre-shutdown callback failed: {e}", exc_info=True)
+
+    def configured(self) -> str:
+        """Override this method to output a human-readable and scrubbed version of the configured sink"""
+        return ""

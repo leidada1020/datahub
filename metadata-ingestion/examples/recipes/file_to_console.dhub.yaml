@@ -1,0 +1,10 @@
+---
+# see https://docs.datahub.com/docs/generated/ingestion/sources/file for complete documentation
+source:
+  type: "file"
+  config:
+    filename: "./examples/mce_files/single_mce.json"
+
+# see https://docs.datahub.com/docs/metadata-ingestion/sink_docs/console for complete documentation
+sink:
+  type: "console"

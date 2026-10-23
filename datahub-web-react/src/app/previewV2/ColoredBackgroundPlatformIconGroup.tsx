@@ -1,0 +1,105 @@
+import { Tooltip } from '@components';
+import { ArrowSquareOut } from '@phosphor-icons/react/dist/csr/ArrowSquareOut';
+import { Maybe } from 'graphql/jsutils/Maybe';
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import styled, { useTheme } from 'styled-components';
+
+import ImageWithColoredBackground, { Icon } from '@app/previewV2/ImageWIthColoredBackground';
+import { useIsShowSeparateSiblingsEnabled } from '@app/useAppConfig';
+
+const LogoIcon = styled.span`
+    display: flex;
+    gap: 5px;
+    margin-right: 8px;
+`;
+
+export const PlatformContentWrapper = styled.div`
+    display: flex;
+    align-items: center;
+    margin: 0 8px 8px 0;
+    flex-wrap: nowrap;
+    flex: 1;
+`;
+
+interface Props {
+    platformName?: string;
+    platformLogoUrl?: Maybe<string>;
+    platformNames?: Maybe<string>[];
+    platformLogoUrls?: Maybe<string>[];
+    entityLogoComponent?: JSX.Element;
+    isOutputPort?: boolean;
+    icon?: React.ReactNode;
+    backgroundSize?: number;
+    imgSize?: number;
+    className?: string;
+}
+
+export default function ColoredBackgroundPlatformIconGroup(props: Props) {
+    const {
+        platformName,
+        platformLogoUrl,
+        platformNames,
+        platformLogoUrls,
+        entityLogoComponent,
+        isOutputPort,
+        icon,
+        imgSize = 18,
+        backgroundSize = 32,
+        className,
+    } = props;
+
+    const theme = useTheme();
+    const { t } = useTranslation('entity.preview');
+    const shouldShowSeparateSiblings = useIsShowSeparateSiblingsEnabled();
+    const showSiblingPlatformLogos = !shouldShowSeparateSiblings && !!platformLogoUrls;
+
+    const renderLogoIcon = () => {
+        if (icon) {
+            // Render only the provided icon
+            return <LogoIcon>{icon}</LogoIcon>;
+        }
+
+        // Render other icons
+        return (
+            <>
+                {platformName && (
+                    <LogoIcon>
+                        {!platformLogoUrl && !showSiblingPlatformLogos && entityLogoComponent}
+                        {!!platformLogoUrl && !showSiblingPlatformLogos && (
+                            <ImageWithColoredBackground
+                                src={platformLogoUrl}
+                                alt={platformName || ''}
+                                borderRadius={10}
+                                backgroundSize={backgroundSize}
+                                imgSize={imgSize}
+                            />
+                        )}
+                        {!!showSiblingPlatformLogos &&
+                            [...new Set(platformLogoUrls)]
+                                .slice(0, 2)
+                                .map((url, idx) => (
+                                    <ImageWithColoredBackground
+                                        key={url}
+                                        borderRadius={10}
+                                        backgroundSize={backgroundSize}
+                                        imgSize={imgSize}
+                                        src={url || ''}
+                                        alt={platformNames?.[idx] || ''}
+                                    />
+                                ))}
+                        {isOutputPort && (
+                            <Tooltip title={t('outputPortTooltip')} placement="topLeft">
+                                <Icon size={backgroundSize} background={theme.colors.bgSurface} borderRadius={10}>
+                                    <ArrowSquareOut size={imgSize} color={theme.colors.textSecondary} />
+                                </Icon>
+                            </Tooltip>
+                        )}
+                    </LogoIcon>
+                )}
+            </>
+        );
+    };
+
+    return <PlatformContentWrapper className={className}>{renderLogoIcon()}</PlatformContentWrapper>;
+}

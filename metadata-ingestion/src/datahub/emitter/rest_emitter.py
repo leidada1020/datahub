@@ -1,0 +1,1398 @@
+from __future__ import annotations
+
+import functools
+import json
+import logging
+import os
+import re
+import socket
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import auto
+from json.decoder import JSONDecodeError
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    cast,
+    overload,
+)
+
+import pydantic
+import requests
+from requests.adapters import HTTPAdapter, Retry
+from requests.exceptions import HTTPError, RequestException
+from typing_extensions import deprecated
+from urllib3 import HTTPResponse
+
+from datahub._version import nice_version_name
+from datahub.cli import config_utils
+from datahub.cli.cli_utils import ensure_has_system_metadata, fixup_gms_url, get_or_else
+from datahub.configuration.common import (
+    ConfigEnum,
+    ConfigModel,
+    ConfigurationError,
+    OperationalError,
+    TraceTimeoutError,
+    TraceValidationError,
+)
+from datahub.configuration.env_vars import (
+    get_emit_mode,
+    get_emitter_trace,
+    get_rest_emitter_429_retry_multiplier,
+    get_rest_emitter_batch_max_payload_bytes,
+    get_rest_emitter_batch_max_payload_length,
+    get_rest_emitter_default_endpoint,
+    get_rest_emitter_default_pool_connections,
+    get_rest_emitter_default_pool_maxsize,
+    get_rest_emitter_default_retry_max_times,
+    get_rest_sink_default_tcp_keepalive,
+)
+
+# Re-exported (`as EmitMode`) so existing `from datahub.emitter.rest_emitter import
+# EmitMode` imports keep working; the class now lives in its own leaf module so
+# graph.config can reference it for the default_emit_mode field without a cycle.
+from datahub.emitter.emit_mode import EmitMode as EmitMode
+from datahub.emitter.generic_emitter import Emitter
+from datahub.emitter.mcp import MetadataChangeProposalWrapper
+from datahub.emitter.request_helper import (
+    OpenApiRequest,
+    has_sync_emit_marker,
+    make_curl_command,
+)
+from datahub.emitter.response_helper import (
+    TraceData,
+    extract_trace_data,
+    extract_trace_data_from_mcps,
+)
+from datahub.emitter.serialization_helper import pre_json_transform
+from datahub.emitter.token_provider import TokenProviderAuth
+from datahub.ingestion.api.closeable import Closeable
+from datahub.ingestion.auth.env import build_auth_config_from_env
+from datahub.ingestion.auth.registry import build_token_provider
+from datahub.ingestion.graph.config import (
+    DATAHUB_COMPONENT_ENV,
+    ClientMode,
+)
+from datahub.metadata.com.linkedin.pegasus2avro.mxe import (
+    MetadataChangeEvent,
+    MetadataChangeProposal,
+)
+from datahub.metadata.com.linkedin.pegasus2avro.usage import UsageAggregation
+from datahub.metadata.schema_classes import (
+    KEY_ASPECT_NAMES,
+    ChangeTypeClass,
+)
+from datahub.utilities.caller_context import identify_caller
+from datahub.utilities.server_config_util import RestServiceConfig, ServiceFeature
+
+if TYPE_CHECKING:
+    from datahub.ingestion.graph.client import DataHubGraph
+
+logger = logging.getLogger(__name__)
+
+
+_DEFAULT_TIMEOUT_SEC = 30  # 30 seconds should be plenty to connect
+_TIMEOUT_LOWER_BOUND_SEC = 1  # if below this, we log a warning
+_DEFAULT_RETRY_STATUS_CODES = [  # Additional status codes to retry on
+    429,
+    500,
+    502,
+    503,
+    504,
+]
+_DEFAULT_RETRY_METHODS = ["HEAD", "GET", "POST", "PUT", "DELETE", "OPTIONS", "TRACE"]
+_DEFAULT_RETRY_MAX_TIMES = int(get_rest_emitter_default_retry_max_times())
+_DEFAULT_POOL_CONNECTIONS = get_rest_emitter_default_pool_connections()
+_DEFAULT_POOL_MAXSIZE = get_rest_emitter_default_pool_maxsize()
+_DEFAULT_TCP_KEEPALIVE = get_rest_sink_default_tcp_keepalive()
+
+# Multiplier to increase number of retries on 429s
+_429_RETRY_MULTIPLIER = get_rest_emitter_429_retry_multiplier()
+
+_DATAHUB_EMITTER_TRACE = get_emitter_trace()
+
+_DEFAULT_CLIENT_MODE: ClientMode = ClientMode.SDK
+
+TRACE_PENDING_STATUS = "PENDING"
+TRACE_INITIAL_BACKOFF = 1.0  # Start with 1 second
+TRACE_MAX_BACKOFF = 300.0  # Cap at 5 minutes
+TRACE_BACKOFF_FACTOR = 2.0  # Double the wait time each attempt
+
+# The limit is 16,000,000 bytes. We will use a max of 15mb to have some space
+# for overhead like request headers.
+# This applies to pretty much all calls to GMS.
+INGEST_MAX_PAYLOAD_BYTES = get_rest_emitter_batch_max_payload_bytes()
+
+# This limit is somewhat arbitrary. All GMS endpoints will timeout
+# and return a 500 if processing takes too long. To avoid sending
+# too much to the backend and hitting a timeout, we try to limit
+# the number of MCPs we send in a batch.
+BATCH_INGEST_MAX_PAYLOAD_LENGTH = get_rest_emitter_batch_max_payload_length()
+
+
+class _KeepAliveHTTPAdapter(HTTPAdapter):
+    """HTTPAdapter that sets TCP keepalive on pooled connections to prevent SSLEOFError on idle connections.
+
+    Degrades gracefully: if keepalive socket options are unavailable on this platform,
+    the adapter behaves identically to the default HTTPAdapter.
+    """
+
+    # TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT are Linux/macOS only; skipped on other platforms.
+    _TUNING_OPTS = [("TCP_KEEPIDLE", 60), ("TCP_KEEPINTVL", 10), ("TCP_KEEPCNT", 5)]
+
+    @classmethod
+    def _socket_options(cls) -> Optional[List[tuple]]:
+        try:
+            opts: List[tuple] = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+            for attr, val in cls._TUNING_OPTS:
+                if hasattr(socket, attr):
+                    opts.append((socket.IPPROTO_TCP, getattr(socket, attr), val))
+            logger.debug("Resolved %d TCP keepalive socket option(s)", len(opts))
+            return opts
+        except Exception as e:
+            logger.debug(
+                "TCP keepalive unavailable on this platform, idle connections will not be kept alive: %s",
+                e,
+            )
+            return None
+
+    def init_poolmanager(self, *args: Any, **kwargs: Any) -> None:
+        if opts := self._socket_options():
+            kwargs["socket_options"] = opts
+            logger.debug(
+                "Applying %d TCP keepalive socket option(s) to pool manager", len(opts)
+            )
+        else:
+            logger.debug(
+                "No TCP keepalive socket options applied to pool manager (resolution failed)"
+            )
+        super().init_poolmanager(*args, **kwargs)
+
+    def proxy_manager_for(self, proxy: Any, **proxy_kwargs: Any) -> Any:
+        if opts := self._socket_options():
+            proxy_kwargs["socket_options"] = opts
+            logger.debug(
+                "Applying %d TCP keepalive socket option(s) to proxy manager for %s",
+                len(opts),
+                proxy,
+            )
+        else:
+            logger.debug(
+                "No TCP keepalive socket options applied to proxy manager for %s (resolution failed)",
+                proxy,
+            )
+        return super().proxy_manager_for(proxy, **proxy_kwargs)
+
+    def send(self, request: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return super().send(request, *args, **kwargs)
+        except requests.exceptions.SSLError:
+            logger.debug(
+                "SSL error on pooled connection, retrying with fresh connection"
+            )
+            self.close()
+            return super().send(request, *args, **kwargs)
+
+
+class _WeightedRetry(Retry):
+    _429_count: Optional[int]
+
+    def increment(
+        self,
+        method: Optional[str] = None,
+        url: Optional[str] = None,
+        response: Optional[HTTPResponse] = None,
+        error: Optional[Exception] = None,
+        _pool: Any = None,
+        _stacktrace: Any = None,
+    ) -> _WeightedRetry:
+        if handle_429 := (
+            response and response.status == 429 and isinstance(self.total, int)
+        ):
+            _429_count = getattr(self, "_429_count", 0)
+
+            num_retries_left = (self.total - 1) * _429_RETRY_MULTIPLIER + (
+                (_429_RETRY_MULTIPLIER - 1) - (_429_count % _429_RETRY_MULTIPLIER)
+            )
+            logger.debug(
+                f"Retrying after 429, ~{num_retries_left} retries left. "
+                f"total={self.total}, _429_count={_429_count}"
+                + (
+                    f" after {response.headers['Retry-After']}s"
+                    if "Retry-After" in response.headers
+                    else ""
+                )
+            )
+
+        r = cast(
+            _WeightedRetry,
+            super().increment(method, url, response, error, _pool, _stacktrace),
+        )
+
+        if hasattr(self, "_429_count"):
+            r._429_count = self._429_count
+
+        if handle_429:
+            r._429_count = getattr(r, "_429_count", 0) + 1
+            if r._429_count % _429_RETRY_MULTIPLIER != 0 and isinstance(r.total, int):
+                r.total += 1
+
+        return r
+
+
+def preserve_unicode_escapes(obj: Any) -> Any:
+    """Recursively convert unicode characters back to escape sequences"""
+    if isinstance(obj, dict):
+        return {k: preserve_unicode_escapes(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [preserve_unicode_escapes(item) for item in obj]
+    elif isinstance(obj, str):
+        # Convert non-ASCII characters back to \u escapes
+        def escape_unicode(match: Any) -> Any:
+            return f"\\u{ord(match.group(0)):04x}"
+
+        return re.sub(r"[^\x00-\x7F]", escape_unicode, obj)
+    else:
+        return obj
+
+
+_DEFAULT_EMIT_MODE = pydantic.TypeAdapter(EmitMode).validate_python(
+    get_emit_mode() or EmitMode.SYNC_PRIMARY,
+)
+
+
+class RestSinkEndpoint(ConfigEnum):
+    RESTLI = auto()
+    OPENAPI = auto()
+
+
+DEFAULT_REST_EMITTER_ENDPOINT = pydantic.TypeAdapter(RestSinkEndpoint).validate_python(
+    get_rest_emitter_default_endpoint() or RestSinkEndpoint.RESTLI,
+)
+
+
+class RequestsSessionConfig(ConfigModel):
+    timeout: Union[float, Tuple[float, float], None] = _DEFAULT_TIMEOUT_SEC
+
+    retry_status_codes: List[int] = _DEFAULT_RETRY_STATUS_CODES
+    retry_methods: List[str] = _DEFAULT_RETRY_METHODS
+    retry_max_times: int = _DEFAULT_RETRY_MAX_TIMES
+
+    pool_connections: int = _DEFAULT_POOL_CONNECTIONS
+    pool_maxsize: int = _DEFAULT_POOL_MAXSIZE
+
+    extra_headers: Dict[str, str] = {}
+
+    ca_certificate_path: Optional[str] = None
+    client_certificate_path: Optional[str] = None
+    client_key_path: Optional[str] = None
+    disable_ssl_verification: bool = False
+    client_mode: Optional[ClientMode] = _DEFAULT_CLIENT_MODE
+    datahub_component: Optional[str] = None
+
+    tcp_keepalive: bool = _DEFAULT_TCP_KEEPALIVE
+
+    def build_session(self) -> requests.Session:
+        session = requests.Session()
+
+        user_agent = self._get_user_agent_string(session)
+
+        base_headers = {
+            "User-Agent": user_agent,
+            "X-DataHub-Client-Mode": self.client_mode.name
+            if self.client_mode
+            else _DEFAULT_CLIENT_MODE.name,
+            "X-DataHub-Py-Cli-Version": nice_version_name(),
+        }
+
+        headers = {**base_headers, **self.extra_headers}
+        session.headers.update(headers)
+
+        cert_path = self.client_certificate_path or os.environ.get(
+            "DATAHUB_CLIENT_CERT_PATH"
+        )
+        key_path = self.client_key_path or os.environ.get("DATAHUB_CLIENT_KEY_PATH")
+
+        if cert_path:
+            # requests accepts either a single PEM file (cert + key concatenated)
+            # or a (cert_path, key_path) tuple.
+            if key_path:
+                session.cert = (cert_path, key_path)
+            else:
+                session.cert = cert_path
+
+        if self.ca_certificate_path:
+            session.verify = self.ca_certificate_path
+
+        if self.disable_ssl_verification:
+            session.verify = False
+
+        try:
+            # Set raise_on_status to False to propagate errors:
+            # https://stackoverflow.com/questions/70189330/determine-status-code-from-python-retry-exception
+            # Must call `raise_for_status` after making a request, which we do
+            retry_strategy = _WeightedRetry(
+                total=self.retry_max_times,
+                status_forcelist=self.retry_status_codes,
+                backoff_factor=2,
+                allowed_methods=self.retry_methods,
+                raise_on_status=False,
+            )
+        except TypeError:
+            # Prior to urllib3 1.26, the Retry class used `method_whitelist` instead of `allowed_methods`.
+            retry_strategy = _WeightedRetry(
+                total=self.retry_max_times,
+                status_forcelist=self.retry_status_codes,
+                backoff_factor=2,
+                method_whitelist=self.retry_methods,
+                raise_on_status=False,
+            )
+
+        logger.debug(
+            "Building session with tcp_keepalive=%s; using %s",
+            self.tcp_keepalive,
+            "_KeepAliveHTTPAdapter" if self.tcp_keepalive else "HTTPAdapter",
+        )
+        adapter_cls = _KeepAliveHTTPAdapter if self.tcp_keepalive else HTTPAdapter
+        adapter = adapter_cls(
+            pool_connections=self.pool_connections,
+            pool_maxsize=self.pool_maxsize,
+            max_retries=retry_strategy,
+        )
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+
+        if self.timeout is not None:
+            # Shim session.request to apply default timeout values.
+            # Via https://stackoverflow.com/a/59317604.
+            session.request = functools.partial(  # type: ignore
+                session.request,
+                timeout=self.timeout,
+            )
+
+        return session
+
+    @classmethod
+    def get_client_mode_from_session(
+        cls, session: requests.Session
+    ) -> Optional[ClientMode]:
+        """
+        Extract the ClientMode enum from a requests Session by checking the headers.
+
+        Args:
+            session: The requests.Session object to check
+
+        Returns:
+            The corresponding ClientMode enum value if found, None otherwise
+        """
+        # Check if the session has the X-DataHub-Client-Mode header
+        mode_str = session.headers.get("X-DataHub-Client-Mode")
+
+        if not mode_str:
+            return None
+
+        # Try to convert the string value to enum
+        try:
+            # First ensure we're working with a str value
+            if isinstance(mode_str, bytes):
+                mode_str = mode_str.decode("utf-8")
+
+            # Then find the matching enum value
+            for mode in ClientMode:
+                if mode.name == mode_str:
+                    return mode
+
+            # If we got here, no matching enum was found
+            return None
+        except Exception:
+            # Handle any other errors
+            return None
+
+    def _get_user_agent_string(self, session: requests.Session) -> str:
+        """Generate appropriate user agent string based on client mode"""
+        version = nice_version_name()
+        client_mode = self.client_mode if self.client_mode else _DEFAULT_CLIENT_MODE
+
+        if "User-Agent" in session.headers:
+            user_agent = session.headers["User-Agent"]
+            if isinstance(user_agent, bytes):
+                requests_user_agent = " " + user_agent.decode("utf-8")
+            else:
+                requests_user_agent = " " + user_agent
+        else:
+            requests_user_agent = ""
+
+        # 1.0 refers to the user agent string version
+        component = (
+            self.datahub_component if self.datahub_component else DATAHUB_COMPONENT_ENV
+        )
+        caller = identify_caller()
+        return f"DataHub-Client/1.0 ({client_mode.name.lower()}; {component}/{caller}; {version}){requests_user_agent}"
+
+
+@dataclass
+class _ChunkItem:
+    """A single serialized item in a batch chunk."""
+
+    payload: str
+    urn: Optional[str] = None
+    aspect_name: Optional[str] = None
+
+    @property
+    def byte_size(self) -> int:
+        return len(self.payload.encode())
+
+
+@dataclass
+class _Chunk:
+    items: List[_ChunkItem] = field(default_factory=list)
+    total_bytes: int = 0
+
+    def add_item(
+        self,
+        payload: str,
+        urn: Optional[str] = None,
+        aspect_name: Optional[str] = None,
+    ) -> None:
+        item = _ChunkItem(payload=payload, urn=urn, aspect_name=aspect_name)
+        self.items.append(item)
+        self.total_bytes += item.byte_size
+
+    @staticmethod
+    def join(chunk: "_Chunk") -> str:
+        return "[" + ",".join(item.payload for item in chunk.items) + "]"
+
+
+class DataHubRestEmitter(Closeable, Emitter):
+    _gms_server: str
+    _token: Optional[str]
+    _session: requests.Session
+    _openapi_ingestion: Optional[bool]
+    _server_config: Optional[RestServiceConfig]
+
+    def __init__(
+        self,
+        gms_server: str,
+        token: Optional[str] = None,
+        auth: Optional["requests.auth.AuthBase"] = None,
+        timeout_sec: Optional[float] = None,
+        connect_timeout_sec: Optional[float] = None,
+        read_timeout_sec: Optional[float] = None,
+        retry_status_codes: Optional[List[int]] = None,
+        retry_methods: Optional[List[str]] = None,
+        retry_max_times: Optional[int] = None,
+        pool_connections: Optional[int] = None,
+        pool_maxsize: Optional[int] = None,
+        extra_headers: Optional[Dict[str, str]] = None,
+        ca_certificate_path: Optional[str] = None,
+        client_certificate_path: Optional[str] = None,
+        client_key_path: Optional[str] = None,
+        disable_ssl_verification: bool = False,
+        openapi_ingestion: Optional[bool] = None,
+        respect_mcp_sync_marker: Optional[bool] = None,
+        client_mode: Optional[ClientMode] = None,
+        datahub_component: Optional[str] = None,
+        server_config_refresh_interval: Optional[int] = None,
+        tcp_keepalive: Optional[bool] = None,
+        default_emit_mode: Optional[EmitMode] = None,
+    ):
+        if not gms_server:
+            raise ConfigurationError("gms server is required")
+        if gms_server == "__from_env__":
+            # HACK: similar to what we do with system auth, we transparently
+            # inject the config in here. TODO(oauth): relocate this into the
+            # planned shared credential-resolution helper so the emitter stops
+            # reading env vars itself (tracked follow-up; see PR #18144).
+            #
+            # The server always resolves from env — a caller passing explicit
+            # credentials (e.g. a sink that already resolved env OAuth) must not
+            # leave the literal sentinel to hit fixup_gms_url. Env credentials
+            # apply only when the caller supplied none.
+            gms_server, env_token = config_utils.require_config_from_env()
+            if token is None and auth is None:
+                token = env_token
+                # Env-based OAuth (DATAHUB_AUTH_TYPE) must work on this path too —
+                # it is the same "resolve everything from env vars" contract as
+                # load_client_config, and takes the same precedence over a static
+                # DATAHUB_GMS_TOKEN.
+                env_auth_config = build_auth_config_from_env()
+                if env_auth_config is not None:
+                    auth = TokenProviderAuth(build_token_provider(env_auth_config))
+                    token = None
+
+        self._gms_server = fixup_gms_url(gms_server)
+        self._token = token
+        # Per-instance default emit mode. Falls back to the global default
+        # (env-driven _DEFAULT_EMIT_MODE) when not set, so SDK behavior is
+        # unchanged unless a caller (e.g. a high-volume plugin) opts in.
+        self._default_emit_mode = default_emit_mode or _DEFAULT_EMIT_MODE
+        self._session = requests.Session()
+        self._openapi_ingestion = (
+            openapi_ingestion  # Re-evaluated after test connection
+        )
+        # Marker-aware sync routing: enabled only when set explicitly via config
+        # or constructor, never implicit. When enabled, a batch is upgraded to
+        # synchronous if any of its MCPs carries an emit-mode marker requesting
+        # sync (emitModeMarker=sync) in its system metadata; otherwise the
+        # configured emit_mode is honored unchanged. This only ever forces more
+        # synchronicity, never less. The marker is read, not produced, here: a
+        # producer must populate the emitModeMarker system-metadata property on
+        # the MCPs that must remain synchronous (e.g. via a custom aspect
+        # mutator/validator, or an upstream processing step).
+        self.respect_mcp_sync_marker = respect_mcp_sync_marker is True
+        self._server_config_refresh_interval = server_config_refresh_interval
+        self._server_config: Optional[RestServiceConfig] = None
+        self._config_fetch_time: Optional[float] = None
+
+        headers = {
+            "X-RestLi-Protocol-Version": "2.0.0",
+            "Content-Type": "application/json",
+        }
+        if auth is not None:
+            # An AuthBase sets Authorization fresh per request; do not bake a header.
+            pass
+        elif token:
+            headers["Authorization"] = f"Bearer {token}"
+        else:
+            # HACK: When no token is provided but system auth env variables are set, we use them.
+            # Ideally this should simply get passed in as config, instead of being sneakily injected
+            # in as part of this constructor.
+            # It works because everything goes through here. The DatahubGraph inherits from the
+            # rest emitter, and the rest sink uses the rest emitter under the hood.
+            system_auth = config_utils.get_system_auth()
+            if system_auth is not None:
+                headers["Authorization"] = system_auth
+
+        timeout: float | tuple[float, float]
+        if connect_timeout_sec is not None or read_timeout_sec is not None:
+            timeout = (
+                connect_timeout_sec or timeout_sec or _DEFAULT_TIMEOUT_SEC,
+                read_timeout_sec or timeout_sec or _DEFAULT_TIMEOUT_SEC,
+            )
+            if (
+                timeout[0] < _TIMEOUT_LOWER_BOUND_SEC
+                or timeout[1] < _TIMEOUT_LOWER_BOUND_SEC
+            ):
+                logger.warning(
+                    f"Setting timeout values lower than {_TIMEOUT_LOWER_BOUND_SEC} second is not recommended. Your configuration is (connect_timeout, read_timeout) = {timeout} seconds"
+                )
+        else:
+            timeout = get_or_else(timeout_sec, _DEFAULT_TIMEOUT_SEC)
+            if timeout < _TIMEOUT_LOWER_BOUND_SEC:
+                logger.warning(
+                    f"Setting timeout values lower than {_TIMEOUT_LOWER_BOUND_SEC} second is not recommended. Your configuration is timeout = {timeout} seconds"
+                )
+
+        self._session_config = RequestsSessionConfig(
+            timeout=timeout,
+            retry_status_codes=get_or_else(
+                retry_status_codes, _DEFAULT_RETRY_STATUS_CODES
+            ),
+            retry_methods=get_or_else(retry_methods, _DEFAULT_RETRY_METHODS),
+            retry_max_times=get_or_else(retry_max_times, _DEFAULT_RETRY_MAX_TIMES),
+            pool_connections=get_or_else(pool_connections, _DEFAULT_POOL_CONNECTIONS),
+            pool_maxsize=get_or_else(pool_maxsize, _DEFAULT_POOL_MAXSIZE),
+            extra_headers={**headers, **(extra_headers or {})},
+            ca_certificate_path=ca_certificate_path,
+            client_certificate_path=client_certificate_path,
+            client_key_path=client_key_path,
+            disable_ssl_verification=disable_ssl_verification,
+            client_mode=client_mode,
+            datahub_component=datahub_component,
+            tcp_keepalive=get_or_else(tcp_keepalive, _DEFAULT_TCP_KEEPALIVE),
+        )
+
+        self._session = self._session_config.build_session()
+        if auth is not None:
+            self._session.auth = auth
+
+    @property
+    def session(self) -> requests.Session:
+        """The authenticated requests session used by this client.
+
+        Custom REST calls (e.g. polling an endpoint the SDK does not wrap) must
+        go through this session so per-request authentication applies — an OAuth
+        token provider lives in ``session.auth`` and is bypassed by requests
+        built from copied headers.
+        """
+        return self._session
+
+    @property
+    def server_config(self) -> RestServiceConfig:
+        return self.fetch_server_config()
+
+    # TODO: This should move to DataHubGraph once it no longer inherits from DataHubRestEmitter
+    def fetch_server_config(self) -> RestServiceConfig:
+        """
+        Fetch configuration from the server if not already loaded.
+
+        Returns:
+            The configuration dictionary
+
+        Raises:
+            ConfigurationError: If there's an error fetching or validating the configuration
+        """
+
+        if self._server_config is None or (
+            self._server_config_refresh_interval is not None
+            and self._config_fetch_time is not None
+            and (time.time() - self._config_fetch_time)
+            > self._server_config_refresh_interval
+        ):
+            if self._session is None or self._gms_server is None:
+                raise ConfigurationError(
+                    "Session and URL are required to load configuration"
+                )
+
+            url = f"{self._gms_server}/config"
+            response = self._session.get(url)
+
+            if response.status_code == 200:
+                raw_config = response.json()
+
+                # Validate that we're connected to the correct service
+                if not raw_config.get("noCode") == "true":
+                    raise ConfigurationError(
+                        "You seem to have connected to the frontend service instead of the GMS endpoint. "
+                        "The rest emitter should connect to DataHub GMS (usually <datahub-gms-host>:8080) or Frontend GMS API (usually <frontend>:9002/api/gms). "
+                        "For Acryl users, the endpoint should be https://<name>.acryl.io/gms"
+                    )
+
+                self._server_config = RestServiceConfig(raw_config=raw_config)
+                self._config_fetch_time = time.time()
+                self._post_fetch_server_config()
+
+            else:
+                logger.debug(
+                    f"Unable to connect to {url} with status_code: {response.status_code}. Response: {response.text}"
+                )
+
+                if response.status_code == 401:
+                    message = f"Unable to connect to {url} - got an authentication error: {response.text}."
+                else:
+                    message = f"Unable to connect to {url} with status_code: {response.status_code}."
+
+                message += "\nPlease check your configuration and make sure you are talking to the DataHub GMS (usually <datahub-gms-host>:8080) or Frontend GMS API (usually <frontend>:9002/api/gms)."
+                raise ConfigurationError(message)
+
+        return self._server_config
+
+    def _post_fetch_server_config(self) -> None:
+        assert self._server_config is not None
+        # Determine OpenAPI mode
+        if self._openapi_ingestion is None:
+            # No constructor parameter
+            if (
+                not get_rest_emitter_default_endpoint()
+                and self._session_config.client_mode == ClientMode.SDK
+                and self._server_config.supports_feature(ServiceFeature.OPEN_API_SDK)
+            ):
+                # Enable if SDK client and no environment variable specified
+                self._openapi_ingestion = True
+            else:
+                # The system env is specifying the value
+                self._openapi_ingestion = (
+                    DEFAULT_REST_EMITTER_ENDPOINT == RestSinkEndpoint.OPENAPI
+                )
+
+    def test_connection(self) -> None:
+        self.fetch_server_config()
+        logger.debug(
+            f"Using {'OpenAPI' if self._openapi_ingestion else 'Restli'} for ingestion."
+        )
+        logger.debug(
+            f"{EmitMode.ASYNC_WAIT} {'IS' if self._should_trace(emit_mode=EmitMode.ASYNC_WAIT, warn=False) else 'IS NOT'} supported."
+        )
+
+    def get_server_config(self) -> dict:
+        return self.server_config.raw_config
+
+    def invalidate_config_cache(self) -> None:
+        """Manually invalidate the configuration cache."""
+        if (
+            self._server_config is not None
+            and self._server_config_refresh_interval is not None
+        ):
+            # Set fetch time to beyond TTL in the past to force refresh on next access
+            self._config_fetch_time = (
+                time.time() - self._server_config_refresh_interval - 1
+            )
+
+    def to_graph(self) -> "DataHubGraph":
+        from datahub.ingestion.graph.client import DataHubGraph
+
+        return DataHubGraph.from_emitter(self)
+
+    def _is_batch_async(
+        self,
+        mcps: Sequence[Union[MetadataChangeProposal, MetadataChangeProposalWrapper]],
+        emit_mode: EmitMode,
+    ) -> bool:
+        """
+        Resolve the async flag actually sent on the wire. The default is exactly
+        emit_mode.is_async — the historical wire format, unchanged. The one
+        exception: when the client has opted in to marker-aware sync routing and
+        any MCP in this batch carries an emit-mode marker requesting sync, the
+        whole batch is upgraded to synchronous. This only ever forces more
+        synchronicity, never less, so it is safe regardless of the configured
+        emit_mode.
+        """
+        if self.respect_mcp_sync_marker and any(
+            has_sync_emit_marker(mcp) for mcp in mcps
+        ):
+            return False
+        return emit_mode.is_async
+
+    def _to_openapi_request(
+        self,
+        mcp: Union[MetadataChangeProposal, MetadataChangeProposalWrapper],
+        emit_mode: EmitMode,
+        async_flag: Optional[bool] = None,
+    ) -> Optional[OpenApiRequest]:
+        """
+        Convert a MetadataChangeProposal to an OpenAPI request format.
+
+        Args:
+            mcp: The metadata change proposal
+            emit_mode: Client emit mode
+
+        Returns:
+            An OpenApiRequest object or None if the MCP doesn't have required fields
+        """
+        return OpenApiRequest.from_mcp(
+            mcp=mcp,
+            gms_server=self._gms_server,
+            async_flag=async_flag if async_flag is not None else emit_mode.is_async,
+            search_sync_flag=emit_mode == EmitMode.SYNC_WAIT,
+        )
+
+    def emit(
+        self,
+        item: Union[
+            MetadataChangeEvent,
+            MetadataChangeProposal,
+            MetadataChangeProposalWrapper,
+            UsageAggregation,
+        ],
+        callback: Optional[Callable[[Exception, str], None]] = None,
+        emit_mode: Optional[EmitMode] = None,
+    ) -> None:
+        if emit_mode is None:
+            emit_mode = self._default_emit_mode
+        try:
+            if isinstance(item, UsageAggregation):
+                self.emit_usage(item)
+            elif isinstance(
+                item, (MetadataChangeProposal, MetadataChangeProposalWrapper)
+            ):
+                self.emit_mcp(item, emit_mode=emit_mode)
+            else:
+                self.emit_mce(item)
+        except Exception as e:
+            if callback:
+                callback(e, str(e))
+            raise
+        else:
+            if callback:
+                callback(None, "success")  # type: ignore
+
+    def emit_mce(self, mce: MetadataChangeEvent) -> None:
+        url = f"{self._gms_server}/entities?action=ingest"
+
+        raw_mce_obj = mce.proposedSnapshot.to_obj()
+        mce_obj = pre_json_transform(raw_mce_obj)
+        snapshot_fqn = (
+            f"com.linkedin.metadata.snapshot.{mce.proposedSnapshot.RECORD_SCHEMA.name}"
+        )
+        ensure_has_system_metadata(mce)
+        # To make lint happy
+        assert mce.systemMetadata is not None
+        system_metadata_obj = mce.systemMetadata.to_obj()
+        snapshot = {
+            "entity": {"value": {snapshot_fqn: mce_obj}},
+            "systemMetadata": system_metadata_obj,
+        }
+        payload = json.dumps(snapshot)
+        if len(payload) > INGEST_MAX_PAYLOAD_BYTES:
+            logger.warning(
+                f"MCE object has size {len(payload)} that exceeds the max payload size of {INGEST_MAX_PAYLOAD_BYTES}, "
+                "so this metadata will likely fail to be emitted."
+            )
+
+        response = self._emit_generic(url, payload)
+        logger.debug(
+            "Sent MCE successfully urn=%s status=%d",
+            mce.proposedSnapshot.urn,
+            response.status_code,
+        )
+
+    @overload
+    @deprecated("Use emit_mode instead of async_flag")
+    def emit_mcp(
+        self,
+        mcp: Union[MetadataChangeProposal, MetadataChangeProposalWrapper],
+        *,
+        async_flag: Optional[bool] = None,
+    ) -> Optional[TraceData]: ...
+
+    @overload
+    def emit_mcp(
+        self,
+        mcp: Union[MetadataChangeProposal, MetadataChangeProposalWrapper],
+        *,
+        emit_mode: Optional[EmitMode] = None,
+        wait_timeout: Optional[timedelta] = timedelta(seconds=3600),
+    ) -> Optional[TraceData]: ...
+
+    def emit_mcp(
+        self,
+        mcp: Union[MetadataChangeProposal, MetadataChangeProposalWrapper],
+        async_flag: Optional[bool] = None,
+        emit_mode: Optional[EmitMode] = None,
+        wait_timeout: Optional[timedelta] = timedelta(seconds=3600),
+    ) -> Optional[TraceData]:
+        if async_flag is True:
+            emit_mode = EmitMode.ASYNC
+        elif async_flag is False:
+            # Deprecated async_flag takes precedence over the default emit mode, so an
+            # explicit async_flag=False still forces sync even when the emitter's
+            # default is ASYNC (e.g. plugin emitters).
+            emit_mode = EmitMode.SYNC_PRIMARY
+        elif emit_mode is None:
+            emit_mode = self._default_emit_mode
+
+        ensure_has_system_metadata(mcp)
+        effective_async = self._is_batch_async([mcp], emit_mode)
+
+        trace_data: Optional[TraceData] = None
+        response: Optional[requests.Response] = None
+
+        if self._openapi_ingestion:
+            request = self._to_openapi_request(mcp, emit_mode, effective_async)
+            if request:
+                response = self._emit_generic(
+                    request.url, payload=request.payload, method=request.method
+                )
+                trace_data = (
+                    extract_trace_data(
+                        response, warn_on_missing=self._should_trace(emit_mode)
+                    )
+                    if response
+                    else None
+                )
+
+        else:
+            if mcp.changeType == ChangeTypeClass.DELETE:
+                if mcp.aspectName not in KEY_ASPECT_NAMES:
+                    raise OperationalError(
+                        f"Delete not supported for non key aspect: {mcp.aspectName} for urn: "
+                        f"{mcp.entityUrn}"
+                    )
+
+                url = f"{self._gms_server}/entities?action=delete"
+                payload_dict = {
+                    "urn": mcp.entityUrn,
+                }
+            else:
+                url = f"{self._gms_server}/aspects?action=ingestProposal"
+
+                mcp_obj = preserve_unicode_escapes(pre_json_transform(mcp.to_obj()))
+                payload_dict = {
+                    "proposal": mcp_obj,
+                    "async": "true" if effective_async else "false",
+                }
+
+            payload = json.dumps(payload_dict)
+
+            response = self._emit_generic(url, payload)
+            trace_data = (
+                extract_trace_data_from_mcps(
+                    response, [mcp], warn_on_missing=self._should_trace(emit_mode)
+                )
+                if response
+                else None
+            )
+
+        if response is not None:
+            logger.debug(
+                "Sent MCP successfully urn=%s aspect=%s status=%d trace_id=%s",
+                mcp.entityUrn,
+                mcp.aspectName,
+                response.status_code,
+                trace_data.trace_id if trace_data else None,
+            )
+
+        if trace_data:
+            if _DATAHUB_EMITTER_TRACE:
+                try:
+                    logger.info(
+                        f"MCP trace_id={trace_data.trace_id} "
+                        f"timestamp={trace_data.extract_timestamp()} "
+                        f"urn={mcp.entityUrn} aspect={mcp.aspectName}"
+                    )
+                except Exception as e:
+                    logger.debug(f"Failed to log trace data: {e}")
+            if self._should_trace(emit_mode):
+                self._await_status(
+                    [trace_data],
+                    wait_timeout,
+                )
+
+        return trace_data
+
+    def emit_mcps(
+        self,
+        mcps: Sequence[Union[MetadataChangeProposal, MetadataChangeProposalWrapper]],
+        emit_mode: Optional[EmitMode] = None,
+        wait_timeout: Optional[timedelta] = timedelta(seconds=3600),
+    ) -> List[TraceData]:
+        if emit_mode is None:
+            emit_mode = self._default_emit_mode
+        if _DATAHUB_EMITTER_TRACE:
+            logger.debug(f"Attempting to emit MCP batch of size {len(mcps)}")
+
+        for mcp in mcps:
+            ensure_has_system_metadata(mcp)
+
+        if self._openapi_ingestion:
+            return self._emit_openapi_mcps(mcps, emit_mode, wait_timeout)
+        else:
+            return self._emit_restli_mcps(mcps, emit_mode)
+
+    def _emit_openapi_mcps(
+        self,
+        mcps: Sequence[Union[MetadataChangeProposal, MetadataChangeProposalWrapper]],
+        emit_mode: EmitMode,
+        wait_timeout: Optional[timedelta] = timedelta(seconds=3600),
+    ) -> List[TraceData]:
+        """
+        1. Grouping MCPs by their HTTP method and entity URL and HTTP method
+        2. Breaking down large batches into smaller chunks based on both:
+         * Total byte size (INGEST_MAX_PAYLOAD_BYTES)
+         * Maximum number of items (BATCH_INGEST_MAX_PAYLOAD_LENGTH)
+
+        The Chunk class encapsulates both the items and their byte size tracking
+        Serializing the items only once with json.dumps(request.payload) and reusing that
+        The chunking logic handles edge cases (always accepting at least one item per chunk)
+        The joining logic is efficient with a simple string concatenation
+
+        :param mcps: metadata change proposals to transmit
+        :param emit_mode: the mode to emit the MCPs
+        :param wait_timeout: timeout for blocking queue
+        :return: list of TraceData objects for each request
+        """
+        # Group by entity URL and HTTP method
+        batches: Dict[Tuple[str, str], List[_Chunk]] = defaultdict(
+            lambda: [_Chunk()]
+        )  # Initialize with one empty Chunk
+
+        # A single sync-marked MCP upgrades the whole batch to sync, so resolve
+        # the async flag once across all MCPs rather than per-request.
+        batch_async = self._is_batch_async(mcps, emit_mode)
+        for mcp in mcps:
+            request = self._to_openapi_request(mcp, emit_mode, batch_async)
+            if request:
+                # Create a composite key with both method and URL
+                key = (request.method, request.url)
+                current_chunk = batches[key][-1]  # Get the last chunk
+
+                # Only serialize once - we're serializing a single payload item
+                serialized_item = json.dumps(request.payload[0])
+                item_bytes = len(serialized_item.encode())
+
+                # If adding this item would exceed max_bytes, create a new chunk
+                # Unless the chunk is empty (always add at least one item)
+                if current_chunk.items and (
+                    current_chunk.total_bytes + item_bytes > INGEST_MAX_PAYLOAD_BYTES
+                    or len(current_chunk.items) >= BATCH_INGEST_MAX_PAYLOAD_LENGTH
+                ):
+                    new_chunk = _Chunk()
+                    batches[key].append(new_chunk)
+                    current_chunk = new_chunk
+
+                current_chunk.add_item(serialized_item, mcp.entityUrn, mcp.aspectName)
+
+        trace_data: List[TraceData] = []
+        # Chunks are grouped by (method, url), so track a global index/total to
+        # keep chunk=i/total truthful across all groups.
+        total_chunks = sum(len(group) for group in batches.values())
+        chunk_index = 0
+        for (method, url), chunks in batches.items():
+            for chunk in chunks:
+                chunk_index += 1
+                response = self._emit_generic(
+                    url, payload=_Chunk.join(chunk), method=method
+                )
+                data = (
+                    extract_trace_data(
+                        response, warn_on_missing=self._should_trace(emit_mode)
+                    )
+                    if response
+                    else None
+                )
+                logger.debug(
+                    "Sent MCP batch chunk=%d/%d method=%s items=%d status=%d trace_id=%s urns=%s",
+                    chunk_index,
+                    total_chunks,
+                    method,
+                    len(chunk.items),
+                    response.status_code,
+                    data.trace_id if data else None,
+                    [(item.urn, item.aspect_name) for item in chunk.items],
+                )
+                if data is not None:
+                    if _DATAHUB_EMITTER_TRACE:
+                        try:
+                            logger.info(
+                                f"MCP batch trace_id={data.trace_id} "
+                                f"timestamp={data.extract_timestamp()} "
+                                f"urns={list(data.data.keys())}"
+                            )
+                        except Exception as e:
+                            logger.debug(f"Failed to log trace data: {e}")
+                    trace_data.append(data)
+
+        if trace_data and self._should_trace(emit_mode):
+            self._await_status(trace_data, wait_timeout)
+
+        return trace_data
+
+    def _emit_restli_mcps(
+        self,
+        mcps: Sequence[Union[MetadataChangeProposal, MetadataChangeProposalWrapper]],
+        emit_mode: EmitMode,
+    ) -> List[TraceData]:
+        url = f"{self._gms_server}/aspects?action=ingestProposalBatch"
+
+        if len(mcps) == 0:
+            return []
+
+        # As a safety mechanism, we need to make sure we don't exceed the max payload size for GMS.
+        # If we will exceed the limit, we need to break it up into chunks.
+        # Track both the serialized objects and original MCPs for each chunk.
+        chunks: List[
+            Tuple[
+                List[Any],
+                List[Union[MetadataChangeProposal, MetadataChangeProposalWrapper]],
+            ]
+        ] = [([], [])]
+        current_chunk_size = 0
+
+        for mcp in mcps:
+            mcp_obj = pre_json_transform(mcp.to_obj())
+            mcp_identifier = f"{mcp_obj.get('entityUrn')}-{mcp_obj.get('aspectName')}"
+            mcp_obj_size = len(json.dumps(mcp_obj))
+            if _DATAHUB_EMITTER_TRACE:
+                logger.debug(
+                    f"Iterating through object ({mcp_identifier}) with size {mcp_obj_size}"
+                )
+            if mcp_obj_size > INGEST_MAX_PAYLOAD_BYTES:
+                logger.warning(
+                    f"MCP object {mcp_identifier} has size {mcp_obj_size} that exceeds the max payload size of {INGEST_MAX_PAYLOAD_BYTES}, "
+                    "so this metadata will likely fail to be emitted."
+                )
+
+            if (
+                mcp_obj_size + current_chunk_size > INGEST_MAX_PAYLOAD_BYTES
+                or len(chunks[-1][0]) >= BATCH_INGEST_MAX_PAYLOAD_LENGTH
+            ):
+                if _DATAHUB_EMITTER_TRACE:
+                    logger.debug("Decided to create new chunk")
+                chunks.append(([], []))
+                current_chunk_size = 0
+            chunks[-1][0].append(mcp_obj)
+            chunks[-1][1].append(mcp)
+            current_chunk_size += mcp_obj_size
+
+        if len(chunks) > 1 or _DATAHUB_EMITTER_TRACE:
+            logger.debug(
+                f"Decided to send {len(mcps)} MCP batch in {len(chunks)} chunks"
+            )
+
+        trace_data: List[TraceData] = []
+        for chunk_index, (mcp_obj_chunk, mcp_chunk) in enumerate(chunks, start=1):
+            # TODO: We're calling json.dumps on each MCP object twice, once to estimate
+            # the size when chunking, and again for the actual request.
+            payload_dict: dict = {
+                "proposals": mcp_obj_chunk,
+                "async": "true"
+                if self._is_batch_async(mcp_chunk, emit_mode)
+                else "false",
+            }
+
+            payload = json.dumps(payload_dict)
+            response = self._emit_generic(url, payload)
+            data = (
+                extract_trace_data_from_mcps(
+                    response, mcp_chunk, warn_on_missing=self._should_trace(emit_mode)
+                )
+                if response
+                else None
+            )
+            logger.debug(
+                "Sent MCP batch chunk=%d/%d items=%d status=%d trace_id=%s urns=%s",
+                chunk_index,
+                len(chunks),
+                len(mcp_chunk),
+                response.status_code,
+                data.trace_id if data else None,
+                [(mcp.entityUrn, mcp.aspectName) for mcp in mcp_chunk],
+            )
+            if data is not None:
+                trace_data.append(data)
+
+        return trace_data
+
+    @deprecated("Use emit with a datasetUsageStatistics aspect instead")
+    def emit_usage(self, usageStats: UsageAggregation) -> None:
+        url = f"{self._gms_server}/usageStats?action=batchIngest"
+
+        raw_usage_obj = usageStats.to_obj()
+        usage_obj = pre_json_transform(raw_usage_obj)
+
+        snapshot = {"buckets": [usage_obj]}
+        payload = json.dumps(snapshot)
+        response = self._emit_generic(url, payload)
+        logger.debug(
+            "Sent usage stats successfully resource=%s bucket=%s status=%d",
+            usageStats.resource,
+            usageStats.bucket,
+            response.status_code,
+        )
+
+    def _emit_generic(
+        self, url: str, payload: Union[str, Any], method: str = "POST"
+    ) -> requests.Response:
+        if not isinstance(payload, str):
+            payload = json.dumps(payload)
+
+        payload_size = len(payload)
+        if payload_size > INGEST_MAX_PAYLOAD_BYTES:
+            # since we know total payload size here, we could simply avoid sending such payload at all and report a warning, with current approach we are going to cause whole ingestion to fail
+            logger.warning(
+                f"Apparent payload size exceeded {INGEST_MAX_PAYLOAD_BYTES}, might fail with an exception due to the size"
+            )
+        if _DATAHUB_EMITTER_TRACE:
+            logger.debug(
+                "Attempting to emit aspect (size: %s) to DataHub GMS; using curl equivalent to:\n%s",
+                payload_size,
+                make_curl_command(self._session, method, url, payload),
+            )
+        try:
+            method_func = getattr(self._session, method.lower())
+            response = method_func(url, data=payload) if payload else method_func(url)
+            response.raise_for_status()
+            return response
+        except HTTPError as e:
+            # When tracing is on the curl equivalent was already logged before the
+            # request, so only log it here to avoid emitting it twice on failure.
+            if not _DATAHUB_EMITTER_TRACE:
+                logger.debug(
+                    "Failed to emit to DataHub GMS (status=%s, payload_size=%d bytes); curl equivalent:\n%s",
+                    response.status_code,
+                    payload_size,
+                    make_curl_command(self._session, method, url, payload),
+                )
+            try:
+                info: Dict = response.json()
+
+                if info.get("stackTrace"):
+                    logger.debug(
+                        "Full stack trace from DataHub:\n%s", info.get("stackTrace")
+                    )
+                    info.pop("stackTrace", None)
+
+                hint = ""
+                if "unrecognized field found but not allowed" in (
+                    info.get("message") or ""
+                ):
+                    hint = ", likely because the server version is too old relative to the client"
+
+                raise OperationalError(
+                    f"Unable to emit metadata to DataHub GMS{hint}: {info.get('message')}",
+                    info,
+                ) from e
+            except JSONDecodeError:
+                # If we can't parse the JSON, just raise the original error.
+                raise OperationalError(
+                    "Unable to emit metadata to DataHub GMS", {"message": str(e)}
+                ) from e
+        except RequestException as e:
+            if not _DATAHUB_EMITTER_TRACE:
+                logger.debug(
+                    "Failed to emit to DataHub GMS (no response received, payload_size=%d bytes); curl equivalent:\n%s",
+                    payload_size,
+                    make_curl_command(self._session, method, url, payload),
+                )
+            raise OperationalError(
+                "Unable to emit metadata to DataHub GMS", {"message": str(e)}
+            ) from e
+
+    def _await_status(
+        self,
+        trace_data: List[TraceData],
+        wait_timeout: Optional[timedelta] = timedelta(seconds=3600),
+    ) -> None:
+        """Verify the status of asynchronous write operations.
+        Args:
+            trace_data: List of trace data to verify
+            trace_timeout: Maximum time to wait for verification.
+        Raises:
+            TraceTimeoutError: If verification fails or times out
+            TraceValidationError: Expected write was not completed successfully
+        """
+        if wait_timeout is None:
+            raise ValueError("wait_timeout cannot be None")
+
+        try:
+            if not trace_data:
+                logger.debug("No trace data to verify")
+                return
+
+            start_time = datetime.now()
+
+            for trace in trace_data:
+                logger.debug(
+                    "awaiting async write trace_id=%s urns=%d",
+                    trace.trace_id,
+                    len(trace.data),
+                )
+                current_backoff = TRACE_INITIAL_BACKOFF
+
+                while trace.data:
+                    if datetime.now() - start_time > wait_timeout:
+                        raise TraceTimeoutError(
+                            f"Timeout waiting for async write completion after {wait_timeout.total_seconds()} seconds"
+                        )
+
+                    base_url = f"{self._gms_server}/openapi/v1/trace/write"
+                    url = f"{base_url}/{trace.trace_id}?onlyIncludeErrors=false&detailed=true"
+
+                    response = self._emit_generic(url, payload=trace.data)
+                    json_data = response.json()
+
+                    for urn, aspects in json_data.items():
+                        for aspect_name, aspect_status in aspects.items():
+                            if not aspect_status["success"]:
+                                error_msg = (
+                                    f"Unable to validate async write {trace.trace_id} ({trace.extract_timestamp()}) to DataHub GMS: "
+                                    f"Persistence failure for URN '{urn}' aspect '{aspect_name}'. "
+                                    f"Status: {aspect_status}"
+                                )
+                                raise TraceValidationError(error_msg, aspect_status)
+
+                            primary_storage = aspect_status["primaryStorage"][
+                                "writeStatus"
+                            ]
+                            search_storage = aspect_status["searchStorage"][
+                                "writeStatus"
+                            ]
+
+                            # Remove resolved statuses
+                            if (
+                                primary_storage != TRACE_PENDING_STATUS
+                                and search_storage != TRACE_PENDING_STATUS
+                            ):
+                                trace.data[urn].remove(aspect_name)
+
+                        # Remove urns with all statuses resolved
+                        if not trace.data[urn]:
+                            trace.data.pop(urn)
+
+                    # Adjust backoff based on response
+                    if trace.data:
+                        # If we still have pending items, increase backoff
+                        current_backoff = min(
+                            current_backoff * TRACE_BACKOFF_FACTOR, TRACE_MAX_BACKOFF
+                        )
+                        logger.debug(
+                            f"Waiting {current_backoff} seconds before next check"
+                        )
+                        time.sleep(current_backoff)
+
+        except Exception as e:
+            logger.error(f"Error during status verification: {str(e)}")
+            raise
+
+    def get_trace_status(
+        self,
+        trace: TraceData,
+        only_include_errors: bool = False,
+        detailed: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """Query the status of a traced write operation.
+
+        Args:
+            trace: TraceData object returned from emit_mcp() or emit_mcps()
+            only_include_errors: Only return aspects with errors (default: False)
+            detailed: Include detailed status information (default: True)
+
+        Returns:
+            Dict with URN -> aspect -> status structure, or None if server doesn't support tracing
+        """
+        if self._server_config is None or not self._server_config.supports_feature(
+            ServiceFeature.API_TRACING
+        ):
+            logger.warning(
+                "get_trace_status() is only available with a newer GMS version that supports API tracing."
+            )
+            return None
+
+        base_url = f"{self._gms_server}/openapi/v1/trace/write"
+        only_errors_param = "true" if only_include_errors else "false"
+        detailed_param = "true" if detailed else "false"
+        url = f"{base_url}/{trace.trace_id}?onlyIncludeErrors={only_errors_param}&detailed={detailed_param}"
+
+        response = self._emit_generic(url, payload=trace.data)
+        return response.json()
+
+    def _should_trace(self, emit_mode: EmitMode, warn: bool = True) -> bool:
+        if emit_mode == EmitMode.ASYNC_WAIT:
+            if not bool(self._openapi_ingestion):
+                if warn:
+                    logger.warning(
+                        f"{emit_mode} requested but is only available when using OpenAPI."
+                    )
+                return False
+            elif getattr(
+                self, "server_config", None
+            ) is None or not self.server_config.supports_feature(
+                ServiceFeature.API_TRACING
+            ):
+                if warn:
+                    logger.warning(
+                        f"{emit_mode} requested but is only available with a newer GMS version."
+                    )
+                return False
+            else:
+                return True
+        else:
+            return False
+
+    def __repr__(self) -> str:
+        token_str = (
+            f" with token: {self._token[:4]}**********{self._token[-4:]}"
+            if self._token
+            else ""
+        )
+        return f"{self.__class__.__name__}: configured to talk to {self._gms_server}{token_str}"
+
+    def flush(self) -> None:
+        # No-op, but present to keep the interface consistent with the Kafka emitter.
+        pass
+
+    def close(self) -> None:
+        self._session.close()
+
+
+"""This class exists as a pass-through for backwards compatibility"""
+DatahubRestEmitter = DataHubRestEmitter

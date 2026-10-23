@@ -1,0 +1,43 @@
+import i18next from 'i18next';
+import React from 'react';
+
+import { Tab } from '@components/components/Tabs/Tabs';
+
+import { AnnouncementsTab } from '@app/homeV2/content/tabs/announcements/AnnouncementsTab';
+import { DiscoveryTab } from '@app/homeV2/content/tabs/discovery/DiscoveryTab';
+import {
+    V2_HOME_PAGE_ANNOUNCEMENTS_ID,
+    V2_HOME_PAGE_DISCOVER_ID,
+} from '@app/onboarding/configV2/HomePageOnboardingConfig';
+
+enum TabType {
+    Discover = 'Discover',
+    Announcements = 'Announcements',
+}
+
+export const DISCOVER_TAB: Tab = {
+    key: TabType.Discover,
+    get name() {
+        return i18next.t('home.v2:tabs.discover.name');
+    },
+    get tooltip() {
+        return i18next.t('home.v2:tabs.discover.tooltip');
+    }, // icon: CompassOutlined,
+    component: <DiscoveryTab />,
+    id: V2_HOME_PAGE_DISCOVER_ID,
+};
+
+export const ANNOUNCEMENTS_TAB: Tab = {
+    key: TabType.Announcements,
+    get name() {
+        return i18next.t('home.v2:tabs.announcements.name');
+    },
+    get tooltip() {
+        return i18next.t('home.v2:tabs.announcements.tooltip');
+    }, // icon: NotificationOutlined,
+    component: <AnnouncementsTab />,
+    id: V2_HOME_PAGE_ANNOUNCEMENTS_ID,
+    dataTestId: V2_HOME_PAGE_ANNOUNCEMENTS_ID,
+};
+
+export const DEFAULT_TAB = TabType.Discover;

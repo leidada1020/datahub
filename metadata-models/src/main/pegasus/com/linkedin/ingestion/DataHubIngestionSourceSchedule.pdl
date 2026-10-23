@@ -1,0 +1,22 @@
+namespace com.linkedin.ingestion
+
+/**
+ * The schedule associated with an ingestion source.
+ */
+record DataHubIngestionSourceSchedule {
+  /**
+   * A cron-formatted execution interval, as a cron string, e.g. * * * * *
+   */
+  @Searchable = {
+    "fieldType": "KEYWORD",
+    "hasValuesFieldName": "hasScheduleInterval",
+    "addHasValuesToFilters": true,
+    "queryByDefault": false
+  }
+  interval: string
+
+  /**
+   * Timezone in which the cron interval applies, e.g. America/Los Angeles
+   */
+  timezone: string
+}

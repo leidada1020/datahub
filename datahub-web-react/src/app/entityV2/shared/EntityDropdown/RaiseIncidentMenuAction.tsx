@@ -1,0 +1,61 @@
+import { Tooltip } from '@components';
+import { Warning } from '@phosphor-icons/react/dist/csr/Warning';
+import React, { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useHistory } from 'react-router';
+
+import { useEntityData, useRefetch } from '@app/entity/shared/EntityContext';
+import {
+    ActionMenuItem,
+    ENTITY_HEADER_ACTION_ICON_SIZE,
+    ENTITY_HEADER_ACTION_ICON_WEIGHT,
+} from '@app/entityV2/shared/EntityDropdown/styledComponents';
+import { EntityTabPath } from '@app/entityV2/shared/constants';
+import { getEntityPath } from '@app/entityV2/shared/containers/profile/entityData';
+import { IncidentDetailDrawer } from '@app/entityV2/shared/lazyIncidentDetailDrawer';
+import { IncidentAction } from '@app/entityV2/shared/tabs/Incident/constant';
+import { useIsSeparateSiblingsMode } from '@app/entityV2/shared/useIsSeparateSiblingsMode';
+import { useEntityRegistry } from '@app/useEntityRegistry';
+
+// Tab path segment passed to getEntityPath — a route identifier, not user-visible copy.
+
+export default function RaiseIncidentMenuAction() {
+    const { t } = useTranslation('entity.shared.entityDropdown');
+    const { urn, entityType, entityData } = useEntityData();
+    const refetchForEntity = useRefetch();
+    const history = useHistory();
+    const entityRegistry = useEntityRegistry();
+    const isHideSiblingMode = useIsSeparateSiblingsMode();
+    const [isRaiseIncidentModalVisible, setIsRaiseIncidentModalVisible] = useState(false);
+
+    return (
+        <Tooltip placement="bottom" title={t('menuAction.raiseIncidentTooltip')}>
+            <ActionMenuItem key="incident" disabled={false} onClick={() => setIsRaiseIncidentModalVisible(true)}>
+                <Warning size={ENTITY_HEADER_ACTION_ICON_SIZE} weight={ENTITY_HEADER_ACTION_ICON_WEIGHT} />
+            </ActionMenuItem>
+            {isRaiseIncidentModalVisible && (
+                <IncidentDetailDrawer
+                    entity={{ urn, entityType, platform: entityData?.platform ?? undefined }}
+                    mode={IncidentAction.CREATE}
+                    onCancel={() => setIsRaiseIncidentModalVisible(false)}
+                    onSubmit={() => {
+                        setIsRaiseIncidentModalVisible(false);
+                        setTimeout(() => {
+                            refetchForEntity?.();
+                            history.push(
+                                `${getEntityPath(
+                                    entityType,
+                                    urn,
+                                    entityRegistry,
+                                    false,
+                                    isHideSiblingMode,
+                                    EntityTabPath.INCIDENTS,
+                                )}`,
+                            );
+                        }, 3000);
+                    }}
+                />
+            )}
+        </Tooltip>
+    );
+}

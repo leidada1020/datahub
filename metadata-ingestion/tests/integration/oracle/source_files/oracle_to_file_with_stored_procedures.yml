@@ -1,0 +1,41 @@
+run_id: oracle-stored-procedures-test
+
+source:
+  type: oracle
+  config:
+    username: system
+    password: example
+    host_port: "localhost:${ORACLE_PORT}"
+    service_name: XEPDB1
+    options:
+      connect_args:
+        # The published port is TCPS. python-oracledb thin mode uses the
+        # descriptor's protocol; ewallet.pem in the wallet is the server cert.
+        # orapki's self-signed cert has no SAN, so hostname match is off.
+        dsn: "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=localhost)(PORT=${ORACLE_PORT}))(CONNECT_DATA=(SERVICE_NAME=XEPDB1)))"
+        wallet_location: "${ORACLE_WALLET}"
+        ssl_server_dn_match: false
+    include_stored_procedures: true
+    include_materialized_views: true
+    
+    # Enable lineage features to test stored procedure lineage
+    include_view_lineage: true
+    include_view_column_lineage: true
+    
+    data_dictionary_mode: "ALL"  # Use ALL views (SYSTEM user doesn't have DBA access in PDB)
+    schema_pattern:
+      allow:
+        - "^HR_SCHEMA$"
+        - "^SALES_SCHEMA$"
+        - "^ANALYTICS_SCHEMA$"
+        - "^SYSTEM$"
+    procedure_pattern:
+      allow:
+        - ".*"
+    
+    profiling:
+      enabled: false
+sink:
+  type: file
+  config:
+    filename: "oracle_mces.json"

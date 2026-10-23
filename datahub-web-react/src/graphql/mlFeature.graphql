@@ -1,0 +1,25 @@
+query getMLFeature($urn: String!, $skipSiblingsSearch: Boolean = false) {
+    mlFeature(urn: $urn) {
+        urn
+        type
+        ...nonRecursiveMLFeature
+        privileges {
+            ...entityPrivileges
+        }
+        featureTables: relationships(input: { types: ["Contains"], direction: INCOMING, start: 0, count: 100 }) {
+            ...fullRelationshipResults
+        }
+        autoRenderAspects: aspects(input: { autoRenderOnly: true }) {
+            ...autoRenderAspectFields
+        }
+        structuredProperties {
+            properties {
+                ...structuredPropertiesFields
+            }
+        }
+        activeIncidents: incidents(start: 0, count: 1, state: ACTIVE) {
+            total
+        }
+        ...notes
+    }
+}

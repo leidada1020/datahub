@@ -1,0 +1,148 @@
+import { Avatar, toast } from '@components';
+import React, { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import styled from 'styled-components';
+
+import { AvatarType } from '@components/components/AvatarStack/types';
+
+import { useUserContext } from '@app/context/useUserContext';
+import { GroupBasicInfoSection } from '@app/entityV2/group/GroupBasicInfoSection';
+import GroupEditModal from '@app/entityV2/group/GroupEditModal';
+import { GroupInfoHeaderSection } from '@app/entityV2/group/GroupInfoHeaderSection';
+import {
+    CustomAvatarContainer,
+    EditProfileButtonContainer,
+    GroupInfo,
+    WhiteEditOutlinedIconStyle,
+} from '@app/entityV2/shared/SidebarStyledComponents';
+import SectionActionButton from '@app/entityV2/shared/containers/profile/sidebar/SectionActionButton';
+
+import { useUpdateNameMutation } from '@graphql/mutations.generated';
+import { EntityRelationshipsResult, Ownership } from '@types';
+
+export type SidebarData = {
+    photoUrl: string | undefined;
+    avatarName: string | undefined;
+    name: string | undefined;
+    email: string | undefined;
+    slack: string | undefined;
+    aboutText: string | undefined;
+    groupMemberRelationships: EntityRelationshipsResult | undefined;
+    groupOwnership: Ownership;
+    isExternalGroup: boolean;
+    externalGroupType: string | undefined;
+    urn: string;
+};
+
+// Profile header uses "lg" size for 28px circle
+
+const AvatarWithTitleContainer = styled.div`
+    display: flex;
+    padding: 10px;
+    background: ${(props) => props.theme.colors.brandGradient};
+    gap: 0.5rem;
+    align-items: center;
+`;
+
+const AvatarColumn = styled.div`
+    flex: 0 0 auto;
+`;
+
+const InfoColumn = styled.div`
+    flex: 1 1 auto;
+    min-width: 0;
+    padding-right: 28px;
+`;
+
+type Props = {
+    sidebarData: SidebarData;
+    refetch: () => Promise<any>;
+};
+
+export const GroupProfileInfoCard = ({ sidebarData, refetch }: Props) => {
+    const { t } = useTranslation('entity.types');
+    const {
+        avatarName,
+        name,
+        groupMemberRelationships,
+        email,
+        photoUrl,
+        slack,
+        isExternalGroup,
+        externalGroupType,
+        urn,
+    } = sidebarData;
+
+    const [updateName] = useUpdateNameMutation();
+    const [editGroupModal, showEditGroupModal] = useState(false);
+
+    const me = useUserContext();
+    const canEditGroupName = me?.platformPrivileges?.manageIdentities;
+
+    // Update Group Title
+    // eslint-disable-next-line @typescript-eslint/no-shadow
+    const handleTitleUpdate = async (name: string) => {
+        await updateName({ variables: { input: { name, urn } } })
+            .then(() => {
+                toast.success(t('group.nameUpdatedSuccess'), { duration: 2 });
+                refetch();
+            })
+            .catch((e: unknown) => {
+                toast.destroy();
+                if (e instanceof Error) {
+                    toast.error(t('group.updateNameError', { error: e.message || '' }), { duration: 3 });
+                }
+            });
+    };
+
+    const getEditModalData = {
+        name,
+        urn,
+        email,
+        slack,
+    };
+
+    return (
+        <>
+            <CustomAvatarContainer>
+                <GroupInfo>
+                    <AvatarWithTitleContainer>
+                        <AvatarColumn>
+                            <Avatar name={avatarName || ''} imageUrl={photoUrl} type={AvatarType.group} size="xl" />
+                        </AvatarColumn>
+                        <InfoColumn>
+                            <GroupInfoHeaderSection
+                                groupName={name}
+                                groupMemberRelationships={groupMemberRelationships}
+                                isExternalGroup={isExternalGroup}
+                                externalGroupType={externalGroupType}
+                            />
+                        </InfoColumn>
+                        <EditProfileButtonContainer className="edit-button-container">
+                            <SectionActionButton
+                                button={<WhiteEditOutlinedIconStyle />}
+                                onClick={(event) => {
+                                    showEditGroupModal(true);
+                                    event.stopPropagation();
+                                }}
+                                dataTestId="edit-group-profile-button"
+                            />
+                        </EditProfileButtonContainer>
+                    </AvatarWithTitleContainer>
+                    <GroupBasicInfoSection email={email} slack={slack} />
+                </GroupInfo>
+            </CustomAvatarContainer>
+            {/* Modal */}
+            <GroupEditModal
+                canEditGroupName={canEditGroupName}
+                visible={editGroupModal}
+                handleTitleUpdate={handleTitleUpdate}
+                onClose={() => showEditGroupModal(false)}
+                onSave={() => {
+                    refetch();
+                }}
+                editModalData={getEditModalData}
+            />
+        </>
+    );
+};

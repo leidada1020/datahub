@@ -1,0 +1,218 @@
+{
+    "$defs": {
+        "CorpUser": {
+            "additionalProperties": false,
+            "description": "This is a CorpUser class which represents a CorpUser\n\nArgs:\n    id (str): The id of the user\n    display_name (Optional[str]): The name of the user to display in the UI\n    email (Optional[str]): email address of this user\n    title (Optional[str]): title of this user\n    manager_urn (Optional[str]): direct manager of this user\n    department_id (Optional[int]): department id this user belongs to\n    department_name (Optional[str]): department name this user belongs to\n    first_name (Optional[str]): first name of this user\n    last_name (Optional[str]): last name of this user\n    full_name (Optional[str]): Common name of this user, format is firstName + lastName (split by a whitespace)\n    country_code (Optional[str]): two uppercase letters country code. e.g.  US\n    groups (List[str]): List of group ids the user belongs to\n    description (Optional[str]): A description string for the user\n    slack (Optional[str]): Slack handle for the user\n    picture_link (Optional[str]): A resolvable url for the user's picture icon\n    phone (Optional[str]): A phone number for the user",
+            "properties": {
+                "id": {
+                    "title": "Id",
+                    "type": "string"
+                },
+                "display_name": {
+                    "anyOf": [
+                        {
+                            "type": "string"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ],
+                    "default": null,
+                    "title": "Display Name"
+                },
+                "email": {
+                    "anyOf": [
+                        {
+                            "type": "string"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ],
+                    "default": null,
+                    "title": "Email"
+                },
+                "title": {
+                    "anyOf": [
+                        {
+                            "type": "string"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ],
+                    "default": null,
+                    "title": "Title"
+                },
+                "manager_urn": {
+                    "anyOf": [
+                        {
+                            "type": "string"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ],
+                    "default": null,
+                    "title": "Manager Urn"
+                },
+                "department_id": {
+                    "anyOf": [
+                        {
+                            "type": "integer"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ],
+                    "default": null,
+                    "title": "Department Id"
+                },
+                "department_name": {
+                    "anyOf": [
+                        {
+                            "type": "string"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ],
+                    "default": null,
+                    "title": "Department Name"
+                },
+                "first_name": {
+                    "anyOf": [
+                        {
+                            "type": "string"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ],
+                    "default": null,
+                    "title": "First Name"
+                },
+                "last_name": {
+                    "anyOf": [
+                        {
+                            "type": "string"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ],
+                    "default": null,
+                    "title": "Last Name"
+                },
+                "full_name": {
+                    "anyOf": [
+                        {
+                            "type": "string"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ],
+                    "default": null,
+                    "title": "Full Name"
+                },
+                "country_code": {
+                    "anyOf": [
+                        {
+                            "type": "string"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ],
+                    "default": null,
+                    "title": "Country Code"
+                },
+                "groups": {
+                    "anyOf": [
+                        {
+                            "items": {
+                                "type": "string"
+                            },
+                            "type": "array"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ],
+                    "default": null,
+                    "title": "Groups"
+                },
+                "description": {
+                    "anyOf": [
+                        {
+                            "type": "string"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ],
+                    "default": null,
+                    "title": "Description"
+                },
+                "slack": {
+                    "anyOf": [
+                        {
+                            "type": "string"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ],
+                    "default": null,
+                    "title": "Slack"
+                },
+                "picture_link": {
+                    "anyOf": [
+                        {
+                            "type": "string"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ],
+                    "default": null,
+                    "title": "Picture Link"
+                },
+                "phone": {
+                    "anyOf": [
+                        {
+                            "type": "string"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ],
+                    "default": null,
+                    "title": "Phone"
+                }
+            },
+            "required": [
+                "id"
+            ],
+            "title": "CorpUser",
+            "type": "object"
+        },
+        "CorpUserList": {
+            "items": {
+                "$ref": "#/$defs/CorpUser"
+            },
+            "title": "CorpUserList",
+            "type": "array"
+        }
+    },
+    "anyOf": [
+        {
+            "$ref": "#/$defs/CorpUser"
+        },
+        {
+            "$ref": "#/$defs/CorpUserList"
+        }
+    ],
+    "title": "CorpUserFile"
+}

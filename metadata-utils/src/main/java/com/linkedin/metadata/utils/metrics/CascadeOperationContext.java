@@ -1,0 +1,453 @@
+package com.linkedin.metadata.utils.metrics;
+
+import com.linkedin.common.urn.Urn;
+import com.linkedin.mxe.SystemMetadata;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import javax.annotation.Nullable;
+import lombok.extern.slf4j.Slf4j;
+import org.slf4j.MDC;
+
+/**
+ * Tracks cascade operation lifecycle for observability. Provides Micrometer metrics, conditional
+ * logging, and optional MDC context for operations that fan out to many entities (e.g.,
+ * deleteReferencesTo, PropertyDefinitionDeleteSideEffect).
+ *
+ * <p>This class is designed for single-level fan-out cascades (not recursive hierarchies). If
+ * recursive cascading is needed in the future, add depth tracking and a {@code forChild()} pattern.
+ *
+ * <p>Usage with MDC (try-with-resources on the same thread):
+ *
+ * <pre>{@code
+ * try (CascadeOperationContext cascade = CascadeOperationContext.begin(
+ *         metricUtils, "deleteReferencesTo", triggerUrn, estimatedTotal)) {
+ *     for (Entity entity : entities) {
+ *         processEntity(entity);
+ *         cascade.recordEntityProcessed();
+ *     }
+ * } // close() emits metrics, conditional log, restores MDC
+ * }</pre>
+ *
+ * <p>Usage without MDC (for stream-based callers where begin/close may run on different threads):
+ *
+ * <pre>{@code
+ * CascadeOperationContext cascade = CascadeOperationContext.beginWithoutMDC(
+ *         metricUtils, "propertyDefinitionDelete", propertyUrn, -1);
+ * return stream.peek(item -> cascade.recordEntityProcessed())
+ *              .onClose(cascade::close);
+ * }</pre>
+ */
+@Slf4j
+public class CascadeOperationContext implements AutoCloseable {
+
+  private static final long DEFAULT_SLOW_THRESHOLD_MS = 5000;
+
+  /** MDC key for the cascade operation UUID. Public for use by Kafka consumers. */
+  public static final String MDC_CASCADE_OPERATION_ID = "cascade.operation.id";
+
+  public static final String MDC_CASCADE_TRIGGER_URN = "cascade.trigger.urn";
+  public static final String MDC_CASCADE_OPERATION_TYPE = "cascade.operation.type";
+
+  /** SystemMetadata properties key for cross-service correlation via Kafka. */
+  public static final String SYSTEM_METADATA_CASCADE_ID_KEY = "cascadeOperationId";
+
+  private final @Nullable MetricUtils metricUtils;
+  private final String operationType;
+  private final String triggerUrnType;
+  private final String operationId;
+  private final long startNanos;
+  private final long slowThresholdMs;
+  private final boolean manageMDC;
+  private final String metricPrefix;
+  private final AtomicBoolean closed = new AtomicBoolean(false);
+  private final AtomicInteger entitiesProcessed = new AtomicInteger(0);
+  private final AtomicInteger errorCount = new AtomicInteger(0);
+  private final AtomicInteger hopsCompleted = new AtomicInteger(0);
+  private final java.util.concurrent.ConcurrentHashMap<String, AtomicInteger> outcomeCounts =
+      new java.util.concurrent.ConcurrentHashMap<>();
+  // Largest frontier seen by recordHop(int); -1 until a sized hop is recorded
+  private final AtomicInteger maxFrontierSize = new AtomicInteger(-1);
+  private volatile String lastErrorType;
+  // Insertion-ordered so log lines are stable; guarded by itself.
+  private final Map<String, String> tags = new LinkedHashMap<>();
+  // Log-only stage durations; never timer tags, since per-request values would each be a series.
+  // Insertion-ordered and guarded by itself, like tags.
+  private final Map<String, Long> phaseNanos = new LinkedHashMap<>();
+  private volatile boolean logCompletionAtInfo = false;
+
+  // Saved MDC state for restore-on-close (supports nesting)
+  private final @Nullable String prevOperationId;
+  private final @Nullable String prevTriggerUrn;
+  private final @Nullable String prevOperationType;
+
+  private CascadeOperationContext(
+      @Nullable MetricUtils metricUtils,
+      String operationType,
+      @Nullable Urn triggerUrn,
+      int estimatedTotal,
+      long slowThresholdMs,
+      boolean manageMDC,
+      String metricPrefix) {
+    this.metricUtils = metricUtils;
+    this.operationType = operationType;
+    this.triggerUrnType = triggerUrn != null ? triggerUrn.getEntityType() : "unknown";
+    this.operationId = UUID.randomUUID().toString();
+    this.startNanos = System.nanoTime();
+    this.slowThresholdMs = slowThresholdMs;
+    this.manageMDC = manageMDC;
+    this.metricPrefix = metricPrefix;
+
+    if (manageMDC) {
+      // Save previous MDC values to restore on close (supports nesting)
+      this.prevOperationId = MDC.get(MDC_CASCADE_OPERATION_ID);
+      this.prevTriggerUrn = MDC.get(MDC_CASCADE_TRIGGER_URN);
+      this.prevOperationType = MDC.get(MDC_CASCADE_OPERATION_TYPE);
+
+      MDC.put(MDC_CASCADE_OPERATION_ID, operationId);
+      MDC.put(MDC_CASCADE_TRIGGER_URN, triggerUrn != null ? triggerUrn.toString() : "unknown");
+      MDC.put(MDC_CASCADE_OPERATION_TYPE, operationType);
+    } else {
+      this.prevOperationId = null;
+      this.prevTriggerUrn = null;
+      this.prevOperationType = null;
+    }
+
+    log.debug(
+        "Cascade started: type={}, triggerUrn={}, estimatedEntities={}, manageMDC={}",
+        operationType,
+        triggerUrn,
+        estimatedTotal,
+        manageMDC);
+  }
+
+  /**
+   * Begin tracking a cascade operation with MDC context. Use this when begin() and close() are
+   * guaranteed to run on the same thread (i.e., try-with-resources blocks). MDC values from any
+   * outer cascade context are saved and restored on close.
+   *
+   * @param metricUtils Micrometer metric utilities (nullable — metrics become no-ops if null)
+   * @param operationType identifies the cascade type (e.g., "deleteReferencesTo")
+   * @param triggerUrn the URN that triggered the cascade
+   * @param estimatedTotal estimated number of entities to process (for logging only)
+   * @return a new context that should be closed when the cascade completes
+   */
+  public static CascadeOperationContext begin(
+      @Nullable MetricUtils metricUtils,
+      String operationType,
+      @Nullable Urn triggerUrn,
+      int estimatedTotal) {
+    return begin(metricUtils, operationType, triggerUrn, estimatedTotal, "datahub.cascade");
+  }
+
+  /**
+   * Begin tracking a cascade operation with MDC context and a custom metric prefix.
+   *
+   * @param metricUtils Micrometer metric utilities (nullable — metrics become no-ops if null)
+   * @param operationType identifies the cascade type (e.g., "deleteReferencesTo")
+   * @param triggerUrn the URN that triggered the cascade
+   * @param estimatedTotal estimated number of entities to process (for logging only)
+   * @param metricPrefix prefix for all emitted metrics (e.g., "datahub.lineage")
+   * @return a new context that should be closed when the cascade completes
+   */
+  public static CascadeOperationContext begin(
+      @Nullable MetricUtils metricUtils,
+      String operationType,
+      @Nullable Urn triggerUrn,
+      int estimatedTotal,
+      String metricPrefix) {
+    return new CascadeOperationContext(
+        metricUtils,
+        operationType,
+        triggerUrn,
+        estimatedTotal,
+        DEFAULT_SLOW_THRESHOLD_MS,
+        true,
+        metricPrefix);
+  }
+
+  /**
+   * Begin tracking a cascade operation without MDC management. Use this when the context is created
+   * on one thread but closed on another (e.g., stream-based callers using {@code
+   * .onClose(cascade::close)}). Metrics and logging still work; only thread-local MDC is skipped.
+   */
+  public static CascadeOperationContext beginWithoutMDC(
+      @Nullable MetricUtils metricUtils,
+      String operationType,
+      @Nullable Urn triggerUrn,
+      int estimatedTotal) {
+    return beginWithoutMDC(
+        metricUtils, operationType, triggerUrn, estimatedTotal, "datahub.cascade");
+  }
+
+  /**
+   * Begin tracking a cascade operation without MDC management and with a custom metric prefix.
+   *
+   * @param metricUtils Micrometer metric utilities (nullable — metrics become no-ops if null)
+   * @param operationType identifies the cascade type (e.g., "deleteReferencesTo")
+   * @param triggerUrn the URN that triggered the cascade
+   * @param estimatedTotal estimated number of entities to process (for logging only)
+   * @param metricPrefix prefix for all emitted metrics (e.g., "datahub.lineage")
+   */
+  public static CascadeOperationContext beginWithoutMDC(
+      @Nullable MetricUtils metricUtils,
+      String operationType,
+      @Nullable Urn triggerUrn,
+      int estimatedTotal,
+      String metricPrefix) {
+    return new CascadeOperationContext(
+        metricUtils,
+        operationType,
+        triggerUrn,
+        estimatedTotal,
+        DEFAULT_SLOW_THRESHOLD_MS,
+        false,
+        metricPrefix);
+  }
+
+  /** Record that one entity was successfully processed. */
+  public void recordEntityProcessed() {
+    entitiesProcessed.incrementAndGet();
+  }
+
+  /**
+   * Add a low-cardinality dimension to the duration timer and to the completion log line. Setting
+   * the same key again overwrites it, so callers can set a default at begin and refine it later.
+   * Prometheus requires every series of one meter name to carry the same tag keys, so every emitter
+   * of a given prefix must set the same keys on every path.
+   */
+  public CascadeOperationContext tag(String key, String value) {
+    synchronized (tags) {
+      tags.put(key, value);
+    }
+    return this;
+  }
+
+  /**
+   * Add time spent in a named stage to the log lines as {@code <phase>Ms=N}. Repeated calls for the
+   * same phase add up.
+   */
+  public void recordPhase(String phase, long durationNanos) {
+    synchronized (phaseNanos) {
+      phaseNanos.merge(phase, durationNanos, Long::sum);
+    }
+  }
+
+  /**
+   * Log completions under the slow threshold at INFO instead of DEBUG, so every operation of this
+   * kind leaves a line. Opt-in because cascades and query rewrites run far more often than walks.
+   */
+  public CascadeOperationContext logCompletionAtInfo() {
+    this.logCompletionAtInfo = true;
+    return this;
+  }
+
+  /**
+   * Record completion of one BFS hop that queried {@code frontierSize} entities. Only the largest
+   * frontier is kept, so the completion log line stays one value long however deep the walk. There
+   * is deliberately no size-less variant, so every walk logs {@code maxPerHop} alongside {@code
+   * hops}.
+   */
+  public void recordHop(int frontierSize) {
+    hopsCompleted.incrementAndGet();
+    maxFrontierSize.accumulateAndGet(frontierSize, Math::max);
+  }
+
+  /** Record multiple entities processed in bulk (e.g., per-hop batch count). */
+  public void recordEntitiesProcessed(int count) {
+    entitiesProcessed.addAndGet(count);
+  }
+
+  /**
+   * Record an error during cascade processing.
+   *
+   * @param errorType a low-cardinality error type string for metric tagging
+   */
+  public void recordError(String errorType) {
+    errorCount.incrementAndGet();
+    this.lastErrorType = errorType;
+  }
+
+  /**
+   * A kept or otherwise non-failed result. Not an error: it does not increment {@code
+   * datahub.cascade.errors} and does not mark the cascade completed with errors.
+   */
+  public void recordOutcome(String outcome) {
+    if (outcome == null) {
+      return;
+    }
+    outcomeCounts.computeIfAbsent(outcome, ignored -> new AtomicInteger()).incrementAndGet();
+  }
+
+  /**
+   * Attach the cascade operation ID to a SystemMetadata instance for cross-service correlation.
+   * Mutates the SystemMetadata in-place. Safe to call on PatchItemImpl's SystemMetadata since both
+   * the item and its backing MCP share the same object reference.
+   *
+   * @param systemMetadata the metadata to annotate (properties map created if null)
+   */
+  public void attachToSystemMetadata(@Nullable SystemMetadata systemMetadata) {
+    if (systemMetadata == null) {
+      return;
+    }
+    if (systemMetadata.getProperties() == null) {
+      systemMetadata.setProperties(new com.linkedin.data.template.StringMap());
+    }
+    systemMetadata.getProperties().put(SYSTEM_METADATA_CASCADE_ID_KEY, operationId);
+  }
+
+  /** Returns the cascade operation ID for this context. */
+  public String getOperationId() {
+    return operationId;
+  }
+
+  /**
+   * Emit metrics and conditional log, then restore MDC. Idempotent — safe to call multiple times;
+   * only the first invocation emits metrics and logs. Never throws — metric/logging failures are
+   * caught internally to avoid breaking the cascade operation.
+   */
+  @Override
+  public void close() {
+    if (!closed.compareAndSet(false, true)) {
+      return; // already closed — skip duplicate metric/log emission
+    }
+    try {
+      long durationNanos = System.nanoTime() - startNanos;
+      long durationMs = TimeUnit.NANOSECONDS.toMillis(durationNanos);
+      int processed = entitiesProcessed.get();
+      int errors = errorCount.get();
+      String status = errors > 0 ? "completed_with_errors" : "completed";
+
+      int hops = hopsCompleted.get();
+
+      // No trigger_urn_type on the timer: multiplied by the custom tags it splits every duration
+      // series by entity type. The counters below keep it.
+      final List<String> timerTags =
+          new ArrayList<>(List.of("operation_type", operationType, "status", status));
+      final StringBuilder logTags = new StringBuilder();
+      int maxPerHop = maxFrontierSize.get();
+      if (maxPerHop >= 0) {
+        logTags.append(", maxPerHop=").append(maxPerHop);
+      }
+      synchronized (tags) {
+        tags.forEach(
+            (key, value) -> {
+              timerTags.add(key);
+              timerTags.add(value);
+              logTags.append(", ").append(key).append('=').append(value);
+            });
+      }
+      synchronized (phaseNanos) {
+        phaseNanos.forEach(
+            (phase, nanos) ->
+                logTags
+                    .append(", ")
+                    .append(phase)
+                    .append("Ms=")
+                    .append(TimeUnit.NANOSECONDS.toMillis(nanos)));
+      }
+
+      // Emit metrics (always, regardless of log level)
+      if (metricUtils != null) {
+        metricUtils.recordTimer(
+            metricPrefix + ".duration", durationNanos, timerTags.toArray(new String[0]));
+        metricUtils.incrementMicrometer(
+            metricPrefix + ".entities_processed",
+            processed,
+            "operation_type",
+            operationType,
+            "trigger_urn_type",
+            triggerUrnType);
+        if (hops > 0) {
+          metricUtils.incrementMicrometer(
+              metricPrefix + ".hops",
+              hops,
+              "operation_type",
+              operationType,
+              "trigger_urn_type",
+              triggerUrnType);
+        }
+        if (errors > 0) {
+          metricUtils.incrementMicrometer(
+              metricPrefix + ".errors",
+              errors,
+              "operation_type",
+              operationType,
+              "trigger_urn_type",
+              triggerUrnType,
+              "error_type",
+              lastErrorType != null ? lastErrorType : "unknown");
+        }
+        outcomeCounts.forEach(
+            (outcome, count) ->
+                metricUtils.incrementMicrometer(
+                    metricPrefix + ".outcomes",
+                    count.get(),
+                    "operation_type",
+                    operationType,
+                    "trigger_urn_type",
+                    triggerUrnType,
+                    "outcome",
+                    outcome));
+      }
+
+      // Conditional logging per PR #16577/#16578 guidelines
+      if (errors > 0) {
+        log.warn(
+            "Cascade completed with errors: type={}, entities={}, hops={}, errors={}, duration={}ms{}",
+            operationType,
+            processed,
+            hops,
+            errors,
+            durationMs,
+            logTags);
+      } else if (durationMs >= slowThresholdMs) {
+        log.info(
+            "Cascade completed (slow): type={}, entities={}, hops={}, duration={}ms{}",
+            operationType,
+            processed,
+            hops,
+            durationMs,
+            logTags);
+      } else if (logCompletionAtInfo) {
+        log.info(
+            "Cascade completed: type={}, entities={}, hops={}, duration={}ms{}",
+            operationType,
+            processed,
+            hops,
+            durationMs,
+            logTags);
+      } else {
+        log.debug(
+            "Cascade completed: type={}, entities={}, hops={}, duration={}ms{}",
+            operationType,
+            processed,
+            hops,
+            durationMs,
+            logTags);
+      }
+    } catch (Exception e) {
+      // Never propagate — observability failures must not break the cascade
+      log.debug("Failed to emit cascade metrics", e);
+    } finally {
+      if (manageMDC) {
+        restoreMDC(MDC_CASCADE_OPERATION_ID, prevOperationId);
+        restoreMDC(MDC_CASCADE_TRIGGER_URN, prevTriggerUrn);
+        restoreMDC(MDC_CASCADE_OPERATION_TYPE, prevOperationType);
+      }
+    }
+  }
+
+  private static void restoreMDC(String key, @Nullable String previousValue) {
+    if (previousValue != null) {
+      MDC.put(key, previousValue);
+    } else {
+      MDC.remove(key);
+    }
+  }
+}

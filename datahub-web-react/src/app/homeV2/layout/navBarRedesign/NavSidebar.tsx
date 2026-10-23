@@ -1,0 +1,545 @@
+import { AppWindow } from '@phosphor-icons/react/dist/csr/AppWindow';
+import { BookBookmark } from '@phosphor-icons/react/dist/csr/BookBookmark';
+import { FileText } from '@phosphor-icons/react/dist/csr/FileText';
+import { Gear } from '@phosphor-icons/react/dist/csr/Gear';
+import { Globe } from '@phosphor-icons/react/dist/csr/Globe';
+import { HardDrives } from '@phosphor-icons/react/dist/csr/HardDrives';
+import { Plugs } from '@phosphor-icons/react/dist/csr/Plugs';
+import { Question } from '@phosphor-icons/react/dist/csr/Question';
+import { Sigma } from '@phosphor-icons/react/dist/csr/Sigma';
+import { SignOut } from '@phosphor-icons/react/dist/csr/SignOut';
+import { SquaresFour } from '@phosphor-icons/react/dist/csr/SquaresFour';
+import { Storefront } from '@phosphor-icons/react/dist/csr/Storefront';
+import { Tag } from '@phosphor-icons/react/dist/csr/Tag';
+import { TextColumns } from '@phosphor-icons/react/dist/csr/TextColumns';
+import { TrendUp } from '@phosphor-icons/react/dist/csr/TrendUp';
+import { UserCircle } from '@phosphor-icons/react/dist/csr/UserCircle';
+import React, { useContext, useEffect, useMemo } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useLocation } from 'react-router-dom';
+import styled, { useTheme } from 'styled-components';
+
+import analytics, { EventType } from '@app/analytics';
+import { useUserContext } from '@app/context/useUserContext';
+import { useNavBarContext } from '@app/homeV2/layout/navBarRedesign/NavBarContext';
+import NavBarHeader from '@app/homeV2/layout/navBarRedesign/NavBarHeader';
+import NavBarMenu from '@app/homeV2/layout/navBarRedesign/NavBarMenu';
+import NavSkeleton from '@app/homeV2/layout/navBarRedesign/NavBarSkeleton';
+import {
+    NavBarMenuDropdownItem,
+    NavBarMenuDropdownItemElement,
+    NavBarMenuGroup,
+    NavBarMenuItemTypes,
+    NavBarMenuItems,
+} from '@app/homeV2/layout/navBarRedesign/types';
+import useSelectedKey from '@app/homeV2/layout/navBarRedesign/useSelectedKey';
+import { useShowHomePageRedesign } from '@app/homeV3/context/hooks/useShowHomePageRedesign';
+import { useMFEConfigFromBackend } from '@app/mfeframework/mfeConfigLoader';
+import { getMfeMenuDropdownItems, getMfeMenuItems } from '@app/mfeframework/mfeNavBarMenuUtils';
+import OnboardingContext from '@app/onboarding/OnboardingContext';
+import { useOnboardingTour } from '@app/onboarding/OnboardingTourContext.hooks';
+import {
+    NAV_SIDEBAR_COLLAPSE_TRANSITION_MS,
+    NAV_SIDEBAR_ID,
+    NAV_SIDEBAR_WIDTH_COLLAPSED,
+    NAV_SIDEBAR_WIDTH_EXPANDED,
+} from '@app/sharedV2/constants';
+import { useIsHomePage } from '@app/sharedV2/useIsHomePage';
+import { useAppConfig, useBusinessAttributesFlag, useIsContextDocumentsEnabled } from '@app/useAppConfig';
+import useGetLogoutHandler from '@src/app/auth/useGetLogoutHandler';
+import { HOME_PAGE_INGESTION_ID } from '@src/app/onboarding/config/HomePageOnboardingConfig';
+import { useHandleOnboardingTour } from '@src/app/onboarding/useHandleOnboardingTour';
+import { useUpdateEducationStepsAllowList } from '@src/app/onboarding/useUpdateEducationStepsAllowList';
+import { useEntityRegistry } from '@src/app/useEntityRegistry';
+import { HelpLinkRoutes, PageRoutes } from '@src/conf/Global';
+import { EntityType } from '@src/types.generated';
+import { resolveRuntimePath } from '@utils/runtimeBasePath';
+
+import AcrylIcon from '@images/datahublogo.svg?react';
+
+const Container = styled.div`
+    height: 100vh;
+    background-color: ${(props) => props.theme.colors.bgSurfaceNewNav};
+    display: flex;
+    flex: column;
+    align-items: center;
+`;
+
+const Content = styled.div<{ $isCollapsed: boolean }>`
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    width: ${(props) => (props.$isCollapsed ? `${NAV_SIDEBAR_WIDTH_COLLAPSED}px` : `${NAV_SIDEBAR_WIDTH_EXPANDED}px`)};
+    /* ease-out feels snappier than ease-in-out for toggle expand/collapse —
+       it starts fast and decelerates rather than easing in slowly. */
+    transition: width ${NAV_SIDEBAR_COLLAPSE_TRANSITION_MS}ms ease-out;
+    will-change: width;
+    overflow-x: hidden;
+`;
+
+const Header = styled.div`
+    padding: 17px 8px 8px 16px;
+`;
+
+const ScrollableContent = styled.div`
+    display: flex;
+    flex-direction: column;
+    padding: 0px 8px 17px 16px;
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    min-height: 0;
+
+    /* Custom scrollbar styling */
+    &::-webkit-scrollbar {
+        width: 6px;
+    }
+
+    &::-webkit-scrollbar-track {
+        background: transparent;
+    }
+
+    &::-webkit-scrollbar-thumb {
+        background: ${(props) => props.theme.colors.scrollbarThumbOnDarkBg};
+        border-radius: 3px;
+    }
+
+    &::-webkit-scrollbar-thumb:hover {
+        background: ${(props) => props.theme.colors.scrollbarThumbHover};
+    }
+
+    scrollbar-width: thin;
+    scrollbar-color: ${(props) => props.theme.colors.scrollbarThumbOnDarkBg} transparent;
+`;
+
+const CustomLogo = styled.img`
+    object-fit: contain;
+    max-height: 26px;
+    max-width: 26px;
+    min-height: 20px;
+    min-width: 20px;
+`;
+
+const DEFAULT_LOGO = 'assets/logos/datahublogo.svg';
+
+const MenuWrapper = styled.div<{ $noTopMargin?: boolean }>`
+    margin-top: ${(props) => (props.$noTopMargin ? '0' : '14px')};
+    display: flex;
+    flex-direction: column;
+`;
+
+/**
+ * Pushes the footer (Account) menu to the bottom of the sidebar when there's
+ * room. With `min-height: 0`, the spacer collapses entirely once main-content
+ * fills the available height, letting Account flow naturally below the other
+ * groups (and scroll with them) instead of forcing an artificial gap.
+ */
+const Spacer = styled.div`
+    flex: 1;
+    min-height: 0;
+`;
+
+export const NavSidebar = () => {
+    const { t } = useTranslation('home.v2');
+    const entityRegistry = useEntityRegistry();
+    const themeConfig = useTheme();
+
+    const { toggle, isCollapsed, selectedKey, setSelectedKey } = useNavBarContext();
+    const appConfig = useAppConfig();
+    const me = useUserContext();
+    const isHomePage = useIsHomePage();
+    const location = useLocation();
+    const showHomepageRedesign = useShowHomePageRedesign();
+    const isContextDocumentsEnabled = useIsContextDocumentsEnabled();
+
+    const { isUserInitializing, isOnboardingAvailable } = useContext(OnboardingContext);
+    const { triggerModalTour } = useOnboardingTour();
+    const { showOnboardingTour } = useHandleOnboardingTour();
+    const { config } = useAppConfig();
+    const logout = useGetLogoutHandler();
+
+    const showAnalytics = (config?.analyticsConfig?.enabled && me && me?.platformPrivileges?.viewAnalytics) || false;
+    const showStructuredProperties =
+        config?.featureFlags?.showManageStructuredProperties &&
+        (me.platformPrivileges?.manageStructuredProperties || me.platformPrivileges?.viewStructuredPropertiesPage);
+    const showManageTags =
+        config?.featureFlags?.showManageTags &&
+        (me.platformPrivileges?.manageTags || me.platformPrivileges?.viewManageTags);
+    const businessAttributesFlag = useBusinessAttributesFlag();
+
+    const showDataSources =
+        config.managedIngestionConfig.enabled &&
+        me &&
+        me.platformPrivileges?.manageIngestion &&
+        me.platformPrivileges?.manageSecrets;
+
+    // Update education steps allow list
+    useUpdateEducationStepsAllowList(!!showDataSources, HOME_PAGE_INGESTION_ID);
+
+    const customLogoUrl = appConfig.config.visualConfig.logoUrl;
+    const hasCustomLogo = customLogoUrl && customLogoUrl !== DEFAULT_LOGO;
+    const logoComponent = hasCustomLogo ? <CustomLogo alt={t('navBar.logoAlt')} src={customLogoUrl} /> : <AcrylIcon />;
+
+    const HelpContentMenuItems = themeConfig.content.menu.items.map((value) => ({
+        title: value.label,
+        description: value.description || '',
+        link: value.path,
+        isHidden: false,
+        isExternalLink: true,
+        key: `helpMenu${value.label}`,
+    })) as NavBarMenuDropdownItemElement[];
+
+    // --- MFE YAML CONFIG ---
+    const mfeConfig: any = useMFEConfigFromBackend();
+
+    // MFE section (dropdown or spread)
+    let mfeSection: any[] = [];
+    if (mfeConfig) {
+        if (mfeConfig.subNavigationMode) {
+            mfeSection = [
+                {
+                    type: NavBarMenuItemTypes.Dropdown,
+                    title: mfeConfig.topLevelMenuTitle || t('navBar.mfeAppsDefault'),
+                    icon: <AppWindow />,
+                    key: 'mfe-dropdown',
+                    items: getMfeMenuDropdownItems(mfeConfig),
+                } as NavBarMenuDropdownItem,
+            ];
+        } else {
+            mfeSection = [
+                {
+                    type: NavBarMenuItemTypes.Group,
+                    key: 'mfe-group',
+                    title: mfeConfig.topLevelMenuTitle || t('navBar.mfeAppsDefault'),
+                    items: getMfeMenuItems(mfeConfig),
+                } as NavBarMenuGroup,
+            ];
+        }
+    }
+    function handleHomeclick() {
+        if (isHomePage && showHomepageRedesign) {
+            toggle();
+        }
+    }
+
+    const headerMenu: NavBarMenuItems = {
+        items: [
+            {
+                type: NavBarMenuItemTypes.Item,
+                title: t('navLinks.home'),
+                icon: <SquaresFour />,
+                selectedIcon: <SquaresFour weight="fill" />,
+                key: 'home',
+                link: PageRoutes.ROOT,
+                onlyExactPathMapping: true,
+                onClick: () => handleHomeclick(),
+                dataTestId: 'nav-bar-item-home',
+            },
+        ],
+    };
+
+    const mainContentMenu: NavBarMenuItems = {
+        items: [
+            ...mfeSection,
+            {
+                type: NavBarMenuItemTypes.Group,
+                key: 'context',
+                title: t('navLinks.context.title'),
+                isHidden: !isContextDocumentsEnabled,
+                items: [
+                    {
+                        type: NavBarMenuItemTypes.Item,
+                        title: t('navLinks.context.documents'),
+                        key: 'contextDocuments',
+                        icon: <FileText />,
+                        selectedIcon: <FileText weight="fill" />,
+                        link: PageRoutes.CONTEXT_DOCUMENTS,
+                        additionalLinksForPathMatching: [`/${entityRegistry.getPathName(EntityType.Document)}/:urn`],
+                        badge: {
+                            /* untranslated-text -- "BETA" is a product-status badge label, conventionally left untranslated across locales */
+                            label: 'BETA',
+                            show: true,
+                            showDot: false,
+                        },
+                    },
+                ],
+            },
+            {
+                type: NavBarMenuItemTypes.Group,
+                key: 'govern',
+                title: t('navLinks.govern.title'),
+                items: [
+                    {
+                        type: NavBarMenuItemTypes.Item,
+                        title: t('navLinks.govern.glossary'),
+                        key: 'glossary',
+                        icon: <BookBookmark />,
+                        selectedIcon: <BookBookmark weight="fill" />,
+                        link: PageRoutes.GLOSSARY,
+                        additionalLinksForPathMatching: entityRegistry
+                            .getGlossaryEntities()
+                            .map((entity) => `/${entity.getPathName()}/:urn`),
+                    },
+                    {
+                        type: NavBarMenuItemTypes.Item,
+                        title: t('navLinks.metrics'),
+                        key: 'metrics',
+                        icon: <Sigma />,
+                        selectedIcon: <Sigma weight="fill" />,
+                        link: PageRoutes.METRICS,
+                        dataTestId: 'nav-menu-item-metrics',
+                        isHidden: !config?.featureFlags?.metricsEnabled,
+                        badge: {
+                            label: 'BETA',
+                            show: true,
+                            showDot: false,
+                        },
+                    },
+                    {
+                        type: NavBarMenuItemTypes.Item,
+                        title: t('navLinks.marketplace'),
+                        key: 'marketplace',
+                        icon: <Storefront />,
+                        selectedIcon: <Storefront weight="fill" />,
+                        link: PageRoutes.MARKETPLACE,
+                        additionalLinksForPathMatching: [`${PageRoutes.DATA_PRODUCT_ENTITY}/:urn`],
+                    },
+                    {
+                        type: NavBarMenuItemTypes.Item,
+                        title: t('navLinks.govern.tags'),
+                        key: 'tag',
+                        icon: <Tag />,
+                        selectedIcon: <Tag weight="fill" />,
+                        link: PageRoutes.MANAGE_TAGS,
+                        isHidden: !showManageTags,
+                    },
+                    {
+                        type: NavBarMenuItemTypes.Item,
+                        title: t('navLinks.govern.businessAttributes'),
+                        key: 'businessAttributes',
+                        icon: <HardDrives />,
+                        selectedIcon: <HardDrives weight="fill" />,
+                        link: PageRoutes.BUSINESS_ATTRIBUTE,
+                        isHidden: !businessAttributesFlag,
+                    },
+                    {
+                        type: NavBarMenuItemTypes.Item,
+                        title: t('navLinks.govern.applications'),
+                        key: 'applications',
+                        icon: <AppWindow />,
+                        selectedIcon: <AppWindow weight="fill" />,
+                        link: PageRoutes.MANAGE_APPLICATIONS,
+                        isHidden: !(appConfig.config.visualConfig.application?.showApplicationInNavigation ?? false),
+                    },
+                    {
+                        type: NavBarMenuItemTypes.Item,
+                        title: t('navLinks.govern.domains'),
+                        key: 'domains',
+                        icon: <Globe />,
+                        selectedIcon: <Globe weight="fill" />,
+                        link: PageRoutes.DOMAINS,
+                        additionalLinksForPathMatching: [`/${entityRegistry.getPathName(EntityType.Domain)}/:urn`],
+                    },
+                    {
+                        type: NavBarMenuItemTypes.Item,
+                        title: t('navLinks.govern.structuredProperties'),
+                        key: 'structuredProperties',
+                        isHidden: !showStructuredProperties,
+                        icon: <TextColumns />,
+                        selectedIcon: <TextColumns weight="fill" />,
+                        link: PageRoutes.STRUCTURED_PROPERTIES,
+                    },
+                ],
+            },
+            {
+                type: NavBarMenuItemTypes.Group,
+                key: 'admin',
+                title: t('navLinks.admin.title'),
+                items: [
+                    {
+                        type: NavBarMenuItemTypes.Item,
+                        title: t('navLinks.admin.dataSources'),
+                        key: 'dataSources',
+                        isHidden: !showDataSources,
+                        icon: <Plugs />,
+                        selectedIcon: <Plugs weight="fill" />,
+                        link: PageRoutes.INGESTION,
+                    },
+                    {
+                        type: NavBarMenuItemTypes.Item,
+                        title: t('navLinks.admin.analytics'),
+                        icon: <TrendUp />,
+                        selectedIcon: <TrendUp weight="fill" />,
+                        key: 'analytics',
+                        isHidden: !showAnalytics,
+                        link: PageRoutes.ANALYTICS,
+                    },
+                ],
+            },
+        ],
+    };
+
+    const isProductTourAvailable = useMemo(() => {
+        if (isHomePage) return true;
+        return isOnboardingAvailable;
+    }, [isOnboardingAvailable, isHomePage]);
+
+    const productTourMenuItems: NavBarMenuDropdownItemElement[] = isProductTourAvailable
+        ? [
+              {
+                  type: NavBarMenuItemTypes.DropdownElement,
+                  title: t('navLinks.help.productTour'),
+                  description: t('navLinks.help.productTourDescription'),
+                  disabled: !isProductTourAvailable,
+                  key: 'helpProductTour',
+                  onClick: () => {
+                      if (isHomePage) {
+                          triggerModalTour();
+                      } else {
+                          // Track Product Tour button click for non-home pages
+                          analytics.event({
+                              type: EventType.ProductTourButtonClickEvent,
+                              originPage: location.pathname,
+                          });
+                          showOnboardingTour();
+                      }
+                  },
+              },
+          ]
+        : [];
+
+    const footerMenu: NavBarMenuItems = {
+        items: [
+            {
+                type: NavBarMenuItemTypes.Group,
+                key: 'account',
+                title: t('navLinks.account.title'),
+                items: [
+                    {
+                        type: NavBarMenuItemTypes.Item,
+                        title: t('navLinks.account.profile'),
+                        icon: <UserCircle />,
+                        selectedIcon: <UserCircle weight="fill" />,
+                        key: 'profile',
+                        link: `/${entityRegistry.getPathName(EntityType.CorpUser)}/${me.urn}`,
+                    },
+                    {
+                        type: NavBarMenuItemTypes.Item,
+                        title: t('navLinks.account.settings'),
+                        icon: <Gear />,
+                        selectedIcon: <Gear weight="fill" />,
+                        key: 'settings',
+                        link: '/settings',
+                    },
+                    {
+                        type: NavBarMenuItemTypes.Dropdown,
+                        title: t('navLinks.account.resources'),
+                        icon: <Question />,
+                        selectedIcon: <Question weight="fill" />,
+                        key: 'help',
+                        items: [
+                            ...productTourMenuItems,
+                            {
+                                type: NavBarMenuItemTypes.DropdownElement,
+                                title: t('navLinks.help.graphql'),
+                                description: t('navLinks.help.graphqlDescription'),
+                                link: resolveRuntimePath(HelpLinkRoutes.GRAPHIQL),
+                                isExternalLink: true,
+                                key: 'helpGraphQL',
+                            },
+                            {
+                                type: NavBarMenuItemTypes.DropdownElement,
+                                title: t('navLinks.help.openapi'),
+                                description: t('navLinks.help.openapiDescription'),
+                                link: resolveRuntimePath(HelpLinkRoutes.OPENAPI),
+                                isExternalLink: true,
+                                key: 'helpOpenAPI',
+                            },
+                            ...HelpContentMenuItems,
+                            {
+                                type: NavBarMenuItemTypes.DropdownElement,
+                                title: config?.appVersion || '',
+                                isHidden: !config?.appVersion,
+                                isExternalLink: true,
+                                key: 'helpAppVersion',
+                                disabled: true,
+                            },
+                        ],
+                    },
+                    {
+                        type: NavBarMenuItemTypes.Item,
+                        title: t('navLinks.account.signOut'),
+                        icon: <SignOut data-testid="log-out-menu-item" />,
+                        key: 'signOut',
+                        onClick: logout,
+                        href: resolveRuntimePath('/logOut'),
+                        dataTestId: 'nav-sidebar-sign-out',
+                    },
+                ],
+            },
+        ],
+    };
+
+    // Combine all menus for selected key calculation
+    const allMenuItems: NavBarMenuItems = {
+        items: [...headerMenu.items, ...mainContentMenu.items, ...footerMenu.items],
+    };
+    const sk = useSelectedKey(allMenuItems);
+
+    useEffect(() => setSelectedKey(sk), [sk, setSelectedKey]);
+
+    const showSkeleton = isUserInitializing || !appConfig.loaded || !me.loaded;
+
+    const renderSvgSelectedGradientForReusingInIcons = () => {
+        return (
+            <svg
+                style={{ width: 0, height: 0, position: 'absolute', visibility: 'hidden' }}
+                aria-hidden="true"
+                focusable="false"
+            >
+                <linearGradient id="menu-item-selected-gradient" x2="1" y2="1">
+                    <stop offset="1%" stopColor={themeConfig.colors.textBrand} />
+                    <stop offset="99%" stopColor={themeConfig.colors.buttonFillBrand} />
+                </linearGradient>
+            </svg>
+        );
+    };
+
+    return (
+        <Container>
+            {renderSvgSelectedGradientForReusingInIcons()}
+            <Content
+                id={NAV_SIDEBAR_ID}
+                data-testid="nav-sidebar"
+                data-collapsed={isCollapsed}
+                $isCollapsed={isCollapsed}
+            >
+                {showSkeleton ? (
+                    <NavSkeleton isCollapsed={isCollapsed} />
+                ) : (
+                    <>
+                        <Header>
+                            <NavBarHeader logotype={logoComponent} />
+                            <MenuWrapper>
+                                <NavBarMenu selectedKey={selectedKey} isCollapsed={isCollapsed} menu={headerMenu} />
+                            </MenuWrapper>
+                        </Header>
+                        <ScrollableContent>
+                            <MenuWrapper>
+                                <NavBarMenu
+                                    selectedKey={selectedKey}
+                                    isCollapsed={isCollapsed}
+                                    menu={mainContentMenu}
+                                />
+                            </MenuWrapper>
+                            <Spacer />
+                            <MenuWrapper $noTopMargin>
+                                <NavBarMenu selectedKey={selectedKey} isCollapsed={isCollapsed} menu={footerMenu} />
+                            </MenuWrapper>
+                        </ScrollableContent>
+                    </>
+                )}
+            </Content>
+        </Container>
+    );
+};

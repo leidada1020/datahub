@@ -1,0 +1,117 @@
+apply plugin: 'com.github.node-gradle.node'
+apply from: "${rootProject.projectDir}/gradle/python/python-uv.gradle"
+
+ext {
+  python_executable = 'python3'
+  venv_name = 'venv'
+}
+
+node {
+
+  // If true, it will download node using above parameters.
+  // If false, it will try to use globally installed node.
+  if (project.hasProperty('useSystemNode') && project.getProperty('useSystemNode').toBoolean()) {
+    download = false
+  } else {
+    download = true
+  }
+
+  // Version of node to use.
+  version = rootProject.ext.nodeVersion
+
+  // Version of Yarn to use.
+  yarnVersion = rootProject.ext.yarnVersion
+
+  distBaseUrl = gradle.ext['datahub.dependencies.node.distBaseUrl']
+
+  // Set the work directory for unpacking node
+  workDir = file("${project.projectDir}/.gradle/nodejs")
+
+  // Set the work directory for NPM
+  yarnWorkDir = file("${project.projectDir}/.gradle/yarn")
+
+  // Set the work directory where node_modules should be located
+  nodeProjectDir = file("${project.projectDir}")
+
+}
+
+task installDev(type: Exec) {
+    inputs.file file('pyproject.toml')
+    inputs.file file('requirements.txt')
+    outputs.file("${venv_name}/.build_install_dev_sentinel")
+    commandLine 'bash', '-c',
+        "set -x && " +
+        "${python_executable} -m venv ${venv_name} && " +
+        "${venv_name}/bin/python -m pip install --upgrade uv && " +
+        "set +x && source ${venv_name}/bin/activate && set -x && " +
+        "uv pip install -r requirements.txt && " +
+        "touch ${venv_name}/.build_install_dev_sentinel"
+}
+
+task pythonLint(type: Exec, dependsOn: installDev) {
+    commandLine 'bash', '-c',
+        "source ${venv_name}/bin/activate && set -x && " +
+        "ruff check . && " +
+        "ruff format --check . && " +
+        "mypy ."
+}
+
+task pythonLintFix(type: Exec, dependsOn: installDev) {
+  commandLine 'bash', '-c',
+        "source ${venv_name}/bin/activate && set -x && " +
+        "ruff check --fix . && " +
+        "ruff format . && " +
+        "mypy ."
+}
+
+// CPU tests — no quickstart. ./gradlew :smoke-test:stackFreePytest
+task stackFreePytest(type: Exec, dependsOn: [installDev, ':metadata-ingestion:codegen']) {
+    workingDir = project.projectDir
+    commandLine 'bash', '-c',
+            "source ${venv_name}/bin/activate && set -x && " +
+            "python -m pytest tests/unit --junit-xml=test-results/junit.stack-free.xml"
+}
+
+/**
+ * The following tasks assume an already running quickstart.
+ * ./gradlew quickstart (or another variation `quickstartDebug`)
+ */
+//  ./gradlew :smoke-test:pytest -PbatchNumber=2 (default 0)
+task pytest(type: Exec, dependsOn: [installDev, ':metadata-ingestion:installDev']) {
+    // Get BATCH_NUMBER from command line argument with default value of 0
+    def batchNumber = project.hasProperty('batchNumber') ? project.property('batchNumber') : '0'
+
+    environment 'RUN_QUICKSTART', 'false'
+    environment 'TEST_STRATEGY', 'pytests'
+    environment 'BATCH_COUNT', 3
+    environment 'BATCH_NUMBER', batchNumber
+
+    workingDir = project.projectDir
+    commandLine 'bash', '-c',
+            "source ${venv_name}/bin/activate && set -x && " +
+            "./smoke.sh"
+}
+
+task lint {
+    dependsOn pythonLint
+}
+
+task lintFix {
+    dependsOn pythonLintFix
+}
+
+task cleanPythonCache(type: Exec) {
+  commandLine 'bash', '-c',
+    "find . -type f -name '*.py[co]' -delete -o -type d -name __pycache__ -delete -o -type d -empty -delete"
+}
+
+
+clean {
+  delete venv_name
+  delete 'build'
+  delete 'dist'
+  delete '.ruff_cache'
+  delete '.mypy_cache'
+  delete '.pytest_cache'
+}
+clean.dependsOn cleanPythonCache

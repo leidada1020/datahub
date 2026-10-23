@@ -1,0 +1,25 @@
+**/node_modules/
+*/build/
+*/*/build/
+**/venv/
+**/.tox/
+**/.mypy_cache/
+**/.pytest_cache/
+**/.ruff_cache/
+**/__pycache__/
+out
+**/*.class
+# Have to copy gradle/wrapper/gradle-wrapper.jar, can't exclude ALL jars
+**/build/**/*.jar
+# Jars/Wars that are final outputs of java projects.
+!**/build/libs/*.war
+!**/build/libs/*.jar
+!datahub-frontend/build/stage/main/**
+
+# Just ignore the heavy parts that are not used
+.git
+.gradle
+
+/metadata-ingestion/tests
+/metadata-ingestion/examples
+/metadata-ingestion/docs

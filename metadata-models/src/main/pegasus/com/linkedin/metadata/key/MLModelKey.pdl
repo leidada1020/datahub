@@ -1,0 +1,48 @@
+namespace com.linkedin.metadata.key
+
+import com.linkedin.common.Urn
+import com.linkedin.common.FabricType
+
+/**
+ * Key for an ML model
+ */
+@Aspect = {
+  "name": "mlModelKey"
+}
+record MLModelKey {
+  /**
+  * Standardized platform urn for the model
+  */
+  platform: Urn
+
+  /**
+  * Name of the MLModel
+  */
+  @Searchable = {
+    "fieldName": "id",
+    "fieldType": "WORD_GRAM",
+    "enableAutocomplete": true,
+    "boostScore": 10.0,
+    "fieldNameAliases": [ "_entityName" ],
+    "v3": {
+      "searchLabel": "name",
+      "mappings": [
+        { "type": "KEYWORD" },
+        { "subfield": "text", "type": "TEXT" },
+        { "subfield": "stemmed", "type": "STEMMED" }
+      ]
+    }
+  }
+  name: string
+
+  /**
+  * Fabric type where model belongs to or where it was generated
+  */
+  @Searchable = {
+    "fieldType": "TEXT_PARTIAL",
+    "addToFilters": true,
+    "filterNameOverride": "Environment",
+    "queryByDefault": false
+  }
+  origin: FabricType
+}

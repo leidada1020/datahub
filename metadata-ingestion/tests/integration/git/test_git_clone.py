@@ -1,0 +1,216 @@
+import os
+import pathlib
+import socket
+import threading
+import time
+
+import git
+import pytest
+from pydantic import SecretStr
+
+import datahub.ingestion.source.git.git_import
+from datahub.configuration.common import ConfigurationWarning
+from datahub.configuration.git import GitInfo, GitReference
+from datahub.ingestion.source.git.git_import import GitClone
+from datahub.testing.doctest import assert_doctest
+
+LOOKML_TEST_SSH_KEY = os.environ.get("DATAHUB_LOOKML_GIT_TEST_SSH_KEY")
+
+
+def test_base_url_guessing() -> None:
+    # Basic GitHub repo.
+    config = GitInfo(repo="https://github.com/datahub-project/datahub", branch="master")
+    assert config.repo_ssh_locator == "git@github.com:datahub-project/datahub.git"
+
+    # Defaults to GitHub.
+    config = GitInfo(repo="datahub-project/datahub", branch="master")
+    assert (
+        config.get_url_for_file_path("docker/README.md")
+        == "https://github.com/datahub-project/datahub/blob/master/docker/README.md"
+    )
+    assert config.repo_ssh_locator == "git@github.com:datahub-project/datahub.git"
+
+    # GitLab repo (notice the trailing slash).
+    config_ref = GitReference(
+        repo="https://gitlab.com/gitlab-tests/sample-project/", branch="master"
+    )
+    assert (
+        config_ref.get_url_for_file_path("hello_world.md")
+        == "https://gitlab.com/gitlab-tests/sample-project/-/blob/master/hello_world.md"
+    )
+
+    # Three-tier GitLab repo.
+    config = GitInfo(
+        repo="https://gitlab.com/gitlab-com/gl-infra/reliability", branch="master"
+    )
+    assert (
+        config.get_url_for_file_path("onboarding/gitlab.nix")
+        == "https://gitlab.com/gitlab-com/gl-infra/reliability/-/blob/master/onboarding/gitlab.nix"
+    )
+    assert (
+        config.repo_ssh_locator == "git@gitlab.com:gitlab-com/gl-infra/reliability.git"
+    )
+
+    # Overrides.
+    config = GitInfo(
+        repo="https://gitea.com/gitea/tea",
+        branch="main",
+        url_template="https://gitea.com/gitea/tea/src/branch/{branch}/{file_path}",
+        repo_ssh_locator="https://gitea.com/gitea/tea.git",
+    )
+    assert (
+        config.get_url_for_file_path("cmd/admin.go")
+        == "https://gitea.com/gitea/tea/src/branch/main/cmd/admin.go"
+    )
+    assert config.repo_ssh_locator == "https://gitea.com/gitea/tea.git"
+
+    with pytest.warns(ConfigurationWarning, match="base_url is deprecated"):
+        config = GitInfo.model_validate(
+            dict(
+                repo="https://github.com/datahub-project/datahub",
+                branch="master",
+                base_url="http://mygithubmirror.local",
+            )
+        )
+
+
+def test_github_branch() -> None:
+    config = GitInfo(
+        repo="owner/repo",
+    )
+    assert config.branch_for_clone is None
+
+    config = GitInfo(
+        repo="owner/repo",
+        branch="main",
+    )
+    assert config.branch_for_clone == "main"
+
+
+def test_url_subdir() -> None:
+    git_ref = GitReference(repo="https://github.com/org/repo", url_subdir="dbt")
+    assert (
+        git_ref.get_url_for_file_path("model.sql")
+        == "https://github.com/org/repo/blob/main/dbt/model.sql"
+    )
+
+    git_ref = GitReference(repo="https://gitlab.com/org/repo", url_subdir="dbt")
+    assert (
+        git_ref.get_url_for_file_path("model.sql")
+        == "https://gitlab.com/org/repo/-/blob/main/dbt/model.sql"
+    )
+
+    git_ref = GitReference(repo="https://github.com/org/repo", url_subdir="")
+    assert (
+        git_ref.get_url_for_file_path("model.sql")
+        == "https://github.com/org/repo/blob/main/model.sql"
+    )
+
+    git_ref = GitReference(repo="https://github.com/org/repo", url_subdir="dbt/models")
+    assert (
+        git_ref.get_url_for_file_path("model.sql")
+        == "https://github.com/org/repo/blob/main/dbt/models/model.sql"
+    )
+
+
+def test_clone_timeout_integration(tmp_path: pathlib.Path) -> None:
+    """Verify the clone timeout is actually enforced end-to-end.
+
+    Spins up a TCP server that accepts connections but never speaks SSH,
+    simulating a hung or firewalled port. The SSH ConnectTimeout should
+    cause the clone to fail within the configured timeout.
+    """
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+
+    def accept_and_hang() -> None:
+        try:
+            conn, _ = server.accept()
+            time.sleep(30)
+        except Exception:
+            pass
+        finally:
+            server.close()
+
+    threading.Thread(target=accept_and_hang, daemon=True).start()
+
+    git_clone = GitClone(str(tmp_path))
+    start = time.monotonic()
+    with pytest.raises((RuntimeError, git.GitCommandError)):
+        git_clone.clone(
+            ssh_key=None,
+            repo_url=f"ssh://git@127.0.0.1:{port}/org/repo.git",
+            timeout=3,
+        )
+    elapsed = time.monotonic() - start
+    assert elapsed < 10, f"Clone took {elapsed:.1f}s — timeout was not enforced"
+
+
+def test_clone_error_messages() -> None:
+    def make_error(stderr: str) -> git.GitCommandError:
+        return git.GitCommandError("git clone", 128, stderr)
+
+    assert "deploy key" in GitClone._clone_error_message(
+        make_error("Permission denied (publickey).")
+    )
+    assert "port 22" in GitClone._clone_error_message(
+        make_error("ssh: connect to host github.com port 22: Connection refused")
+    )
+    assert "hostname" in GitClone._clone_error_message(
+        make_error("Could not resolve hostname github.com")
+    )
+    assert (
+        "not found"
+        in GitClone._clone_error_message(
+            make_error("ERROR: Repository not found.")
+        ).lower()
+    )
+
+
+def test_sanitize_repo_url() -> None:
+    assert_doctest(datahub.ingestion.source.git.git_import)
+
+
+def test_git_clone_public(tmp_path: pathlib.Path) -> None:
+    git_clone = GitClone(str(tmp_path))
+    checkout_dir = git_clone.clone(
+        ssh_key=None,
+        repo_url="https://gitlab.com/gitlab-tests/sample-project",
+        branch="90c439634077a85bcf42d38c2c79cd94664a94ad",
+    )
+    assert checkout_dir.exists()
+    assert set(os.listdir(checkout_dir)) == {
+        ".git",
+        "README.md",
+        "hello_world.md",
+        "fork-sample-project.png",
+    }
+
+
+@pytest.mark.skipif(
+    not LOOKML_TEST_SSH_KEY,
+    reason="DATAHUB_LOOKML_GIT_TEST_SSH_KEY env variable is not configured",
+)
+def test_git_clone_private(tmp_path: pathlib.Path) -> None:
+    git_clone = GitClone(str(tmp_path))
+    secret_key = SecretStr(LOOKML_TEST_SSH_KEY) if LOOKML_TEST_SSH_KEY else None
+
+    checkout_dir = git_clone.clone(
+        ssh_key=secret_key,
+        repo_url="git@github.com:acryldata/long-tail-companions-looker",
+        branch="d380a2b777ec6f4653626f39c68dba85893faa74",
+    )
+    assert checkout_dir.exists()
+    assert set(os.listdir(checkout_dir)) == {
+        ".datahub",
+        "models",
+        "README.md",
+        ".github",
+        ".git",
+        "views",
+        "manifest_lock.lkml",
+        "manifest.lkml",
+    }

@@ -1,0 +1,347 @@
+import { ArrowsClockwise } from '@phosphor-icons/react/dist/csr/ArrowsClockwise';
+import { FileText } from '@phosphor-icons/react/dist/csr/FileText';
+import { ListBullets } from '@phosphor-icons/react/dist/csr/ListBullets';
+import { Share } from '@phosphor-icons/react/dist/csr/Share';
+import { Swap } from '@phosphor-icons/react/dist/csr/Swap';
+import { TreeStructure } from '@phosphor-icons/react/dist/csr/TreeStructure';
+import { WarningCircle } from '@phosphor-icons/react/dist/csr/WarningCircle';
+import i18next from 'i18next';
+import * as React from 'react';
+
+import { GenericEntityProperties } from '@app/entity/shared/types';
+import { Entity, EntityCapabilityType, IconStyleType, PreviewType } from '@app/entityV2/Entity';
+import { DataFlowEntity } from '@app/entityV2/dataFlow/DataFlowEntity';
+import { Preview } from '@app/entityV2/dataJob/preview/Preview';
+import { EntityMenuItems } from '@app/entityV2/shared/EntityDropdown/EntityMenuActions';
+import { TYPE_ICON_CLASS_NAME } from '@app/entityV2/shared/components/subtypes';
+import { EntityTabPath } from '@app/entityV2/shared/constants';
+import { getDataForEntityType } from '@app/entityV2/shared/containers/profile/entityData';
+import { lazyProfileComponent } from '@app/entityV2/shared/lazyEntityProfile';
+import {
+    DataProductSection,
+    DocumentationTab,
+    EntityProfile,
+    IncidentTab,
+    LineageTab,
+    PropertiesTab,
+    RunsTab,
+    SidebarAboutSection,
+    SidebarApplicationSection,
+    SidebarDomainSection,
+    SidebarEntityHeader,
+    SidebarGlossaryTermsSection,
+    SidebarLineageSection,
+    SidebarNotesSection,
+    SidebarOwnerSection,
+    SidebarQueryOperationsSection,
+    SidebarStructuredProperties,
+    SidebarTagsSection,
+    StatusSection,
+} from '@app/entityV2/shared/profileChunks';
+import { SidebarTitleActionType, getFirstSubType, isOutputPort } from '@app/entityV2/shared/utils';
+import { EntityAndType } from '@app/lineage/types';
+import { capitalizeFirstLetterOnly } from '@app/sharedV2/textUtil';
+
+import { GetDataJobQuery, useGetDataJobQuery, useUpdateDataJobMutation } from '@graphql/dataJob.generated';
+import { DataJob, DataProcessInstanceResult, EntityType, SearchResult } from '@types';
+
+const SidebarDataJobTransformationLogicSection = lazyProfileComponent('SidebarDataJobTransformationLogicSection', () =>
+    import('@app/entityV2/shared/containers/profile/sidebar/SidebarLogicSection').then((module) => ({
+        default: module.SidebarDataJobTransformationLogicSection,
+    })),
+);
+const DataJobFlowTab = lazyProfileComponent('DataJobFlowTab', () =>
+    import('@app/entityV2/shared/tabs/Entity/DataJobFlowTab').then((module) => ({
+        default: module.DataJobFlowTab,
+    })),
+);
+
+const getPlatformForDataJob = (data?: DataJob | null) => {
+    return data?.platform || data?.dataFlow?.platform;
+};
+
+const getDataJobPlatformName = (data?: DataJob | null): string => {
+    const platform = getPlatformForDataJob(data);
+    return platform?.properties?.displayName || capitalizeFirstLetterOnly(platform?.name) || '';
+};
+
+const headerDropdownItems = new Set([
+    EntityMenuItems.SHARE,
+    EntityMenuItems.UPDATE_DEPRECATION,
+    EntityMenuItems.ANNOUNCE,
+]);
+
+/**
+ * Definition of the DataHub DataJob entity.
+ */
+export class DataJobEntity implements Entity<DataJob> {
+    type: EntityType = EntityType.DataJob;
+
+    icon = (fontSize?: number, styleType?: IconStyleType, color?: string) => {
+        return (
+            <Swap
+                className={TYPE_ICON_CLASS_NAME}
+                size={fontSize || 14}
+                color={color || 'currentColor'}
+                weight={styleType === IconStyleType.HIGHLIGHT ? 'fill' : 'regular'}
+            />
+        );
+    };
+
+    isSearchEnabled = () => true;
+
+    isBrowseEnabled = () => false;
+
+    isLineageEnabled = () => true;
+
+    getAutoCompleteFieldName = () => 'name';
+
+    getGraphName = () => 'dataJob';
+
+    getPathName = () => 'tasks';
+
+    getEntityName = () => i18next.t('entity.types:dataJob.name');
+
+    getCollectionName = () => i18next.t('entity.types:dataJob.namePlural');
+
+    useEntityQuery = useGetDataJobQuery;
+
+    renderProfile = (urn: string) => (
+        <EntityProfile
+            urn={urn}
+            entityType={EntityType.DataJob}
+            useEntityQuery={useGetDataJobQuery}
+            useUpdateQuery={useUpdateDataJobMutation}
+            getOverrideProperties={this.getOverridePropertiesFromEntity}
+            headerDropdownItems={headerDropdownItems}
+            tabs={[
+                {
+                    name: i18next.t('entity.types:tab.documentation'),
+                    path: EntityTabPath.DOCUMENTATION,
+                    component: DocumentationTab,
+                    icon: FileText,
+                },
+                {
+                    name: i18next.t('entity.types:dataFlow.name'),
+                    path: EntityTabPath.PIPELINE,
+                    component: DataJobFlowTab,
+                    icon: Share,
+                },
+                {
+                    name: i18next.t('entity.types:tab.lineage'),
+                    path: EntityTabPath.LINEAGE,
+                    component: LineageTab,
+                    icon: TreeStructure,
+                    supportsFullsize: true,
+                },
+                {
+                    name: i18next.t('entity.types:tab.properties'),
+                    path: EntityTabPath.PROPERTIES,
+                    component: PropertiesTab,
+                    icon: ListBullets,
+                },
+                {
+                    name: i18next.t('entity.types:tab.runs'),
+                    path: EntityTabPath.RUNS,
+                    component: RunsTab,
+                    icon: ArrowsClockwise,
+                    display: {
+                        visible: (_, _1) => true,
+                        enabled: (_, dataJob: GetDataJobQuery) => (dataJob?.dataJob?.runs?.total || 0) !== 0,
+                    },
+                },
+                {
+                    name: i18next.t('entity.types:tab.incidents'),
+                    path: EntityTabPath.INCIDENTS,
+                    icon: WarningCircle,
+                    component: IncidentTab,
+                    getCount: (_, dataJob) => {
+                        return dataJob?.dataJob?.activeIncidents?.total;
+                    },
+                },
+            ]}
+            sidebarSections={this.getSidebarSections()}
+            sidebarTabs={this.getSidebarTabs()}
+        />
+    );
+
+    getSidebarSections = () => [
+        { component: SidebarEntityHeader },
+        { component: SidebarQueryOperationsSection },
+        { component: SidebarAboutSection },
+        { component: SidebarNotesSection },
+        { component: SidebarLineageSection },
+        { component: SidebarDataJobTransformationLogicSection },
+        { component: SidebarOwnerSection },
+        { component: SidebarDomainSection },
+        { component: SidebarApplicationSection },
+        { component: DataProductSection },
+        { component: SidebarGlossaryTermsSection },
+        { component: SidebarTagsSection },
+        {
+            component: SidebarStructuredProperties,
+        },
+        { component: StatusSection },
+    ];
+
+    getSidebarTabs = () => [
+        {
+            name: i18next.t('entity.types:tab.lineage'),
+            component: LineageTab,
+            description: i18next.t('entity.types:sidebar.lineageDescription'),
+            icon: TreeStructure,
+            properties: {
+                actionType: SidebarTitleActionType.LineageExplore,
+            },
+        },
+        {
+            name: i18next.t('entity.types:tab.properties'),
+            component: PropertiesTab,
+            description: i18next.t('entity.types:sidebar.propertiesDescription'),
+            icon: ListBullets,
+        },
+    ];
+
+    getOverridePropertiesFromEntity = (dataJob?: DataJob | null): GenericEntityProperties => {
+        // TODO: Get rid of this once we have correctly formed platform coming back.
+        const name = dataJob?.properties?.name;
+        const externalUrl = dataJob?.properties?.externalUrl;
+        return {
+            name,
+            externalUrl,
+            platform: getPlatformForDataJob(dataJob),
+            lastRun: ((dataJob as any).lastRun as DataProcessInstanceResult)?.runs?.[0],
+            lastRunEvent: ((dataJob as any).lastRun as DataProcessInstanceResult)?.runs?.[0]?.state?.[0],
+        };
+    };
+
+    renderPreview = (previewType: PreviewType, data: DataJob) => {
+        const genericProperties = this.getGenericEntityProperties(data);
+        return (
+            <Preview
+                urn={data.urn}
+                data={genericProperties}
+                name={data.properties?.name || ''}
+                subtype={getFirstSubType(data)}
+                description={data.editableProperties?.description || data.properties?.description}
+                platformName={getDataJobPlatformName(data)}
+                platformLogo={getPlatformForDataJob(data)?.properties?.logoUrl || ''}
+                owners={data.ownership?.owners}
+                globalTags={data.globalTags || null}
+                externalUrl={data.properties?.externalUrl}
+                headerDropdownItems={headerDropdownItems}
+                previewType={previewType}
+                browsePaths={data?.browsePathV2 || undefined}
+            />
+        );
+    };
+
+    renderSearch = (result: SearchResult) => {
+        const data = result.entity as DataJob;
+        const genericProperties = this.getGenericEntityProperties(data);
+        return (
+            <Preview
+                urn={data.urn}
+                data={genericProperties}
+                name={data.properties?.name || ''}
+                subtype={getFirstSubType(data)}
+                description={data.editableProperties?.description || data.properties?.description}
+                platformName={getDataJobPlatformName(data)}
+                platformLogo={getPlatformForDataJob(data)?.properties?.logoUrl || ''}
+                platformInstanceId={data.dataPlatformInstance?.instanceId}
+                owners={data.ownership?.owners}
+                globalTags={data.globalTags}
+                deprecation={data.deprecation}
+                insights={result.insights}
+                externalUrl={data.properties?.externalUrl}
+                lastRunTimeMs={
+                    ((data as any).lastRun?.runs?.length && (data as any).lastRun?.runs[0]?.created?.time) || undefined
+                }
+                degree={(result as any).degree}
+                paths={(result as any).paths}
+                isOutputPort={isOutputPort(result)}
+                headerDropdownItems={headerDropdownItems}
+                browsePaths={data?.browsePathV2 || undefined}
+                parentContainers={data.parentContainers}
+                previewType={PreviewType.SEARCH}
+            />
+        );
+    };
+
+    getExpandedNameForDataJob = (entity: DataJob): string => {
+        const name = this.displayName(entity);
+        const flowName = entity?.dataFlow ? new DataFlowEntity().displayName(entity?.dataFlow) : undefined;
+
+        // if we have no name, just return blank. this should not happen, so dont try & construct a name
+        if (!name) {
+            return '';
+        }
+
+        // if we have a flow name, return the full name of flow.task
+        if (flowName) {
+            return `${flowName}.${name}`;
+        }
+
+        // otherwise, just return the task name (same as non-expanded)
+        return name;
+    };
+
+    getLineageVizConfig = (entity: DataJob) => {
+        return {
+            urn: entity?.urn,
+            name: this.displayName(entity),
+            expandedName: this.getExpandedNameForDataJob(entity),
+            type: EntityType.DataJob,
+            icon: getPlatformForDataJob(entity)?.properties?.logoUrl || undefined, // eslint-disable-next-line @typescript-eslint/dot-notation
+            downstreamChildren: entity?.['downstream']?.relationships?.map(
+                (relationship) =>
+                    ({
+                        entity: relationship.entity,
+                        type: relationship.entity.type,
+                    }) as EntityAndType,
+            ), // eslint-disable-next-line @typescript-eslint/dot-notation
+            upstreamChildren: entity?.['upstream']?.relationships?.map(
+                (relationship) =>
+                    ({
+                        entity: relationship.entity,
+                        type: relationship.entity.type,
+                    }) as EntityAndType,
+            ),
+            platform: getPlatformForDataJob(entity),
+        };
+    };
+
+    displayName = (data: DataJob) => {
+        return data.properties?.name || data.urn;
+    };
+
+    getGenericEntityProperties = (data: DataJob) => {
+        return getDataForEntityType({
+            data,
+            entityType: this.type,
+            getOverrideProperties: this.getOverridePropertiesFromEntity,
+        });
+    };
+
+    supportedCapabilities = () => {
+        return new Set([
+            EntityCapabilityType.OWNERS,
+            EntityCapabilityType.GLOSSARY_TERMS,
+            EntityCapabilityType.TAGS,
+            EntityCapabilityType.DOMAINS,
+            EntityCapabilityType.DEPRECATION,
+            EntityCapabilityType.SOFT_DELETE,
+            EntityCapabilityType.DATA_PRODUCTS,
+            EntityCapabilityType.TEST,
+            EntityCapabilityType.LINEAGE,
+            EntityCapabilityType.HEALTH,
+            EntityCapabilityType.APPLICATIONS,
+            EntityCapabilityType.RELATED_DOCUMENTS,
+            EntityCapabilityType.FORMS,
+        ]);
+    };
+
+    getPlatformProperties = (data: DataJob) => {
+        return data?.dataFlow?.platform;
+    };
+}

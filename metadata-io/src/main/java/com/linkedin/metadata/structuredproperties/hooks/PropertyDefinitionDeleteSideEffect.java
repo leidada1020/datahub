@@ -1,0 +1,169 @@
+package com.linkedin.metadata.structuredproperties.hooks;
+
+import static com.linkedin.metadata.Constants.STRUCTURED_PROPERTIES_ASPECT_NAME;
+import static com.linkedin.metadata.Constants.STRUCTURED_PROPERTY_DEFINITION_ASPECT_NAME;
+import static com.linkedin.metadata.Constants.STRUCTURED_PROPERTY_KEY_ASPECT_NAME;
+
+import com.datahub.context.OperationFingerprint;
+import com.linkedin.common.AuditStamp;
+import com.linkedin.common.urn.Urn;
+import com.linkedin.entity.Aspect;
+import com.linkedin.metadata.aspect.RetrieverContext;
+import com.linkedin.metadata.aspect.batch.ChangeMCP;
+import com.linkedin.metadata.aspect.batch.MCLItem;
+import com.linkedin.metadata.aspect.batch.MCPItem;
+import com.linkedin.metadata.aspect.patch.GenericJsonPatch;
+import com.linkedin.metadata.aspect.patch.PatchOperationType;
+import com.linkedin.metadata.aspect.plugins.config.AspectPluginConfig;
+import com.linkedin.metadata.aspect.plugins.hooks.MCPSideEffect;
+import com.linkedin.metadata.entity.ebean.batch.PatchItemImpl;
+import com.linkedin.metadata.models.EntitySpec;
+import com.linkedin.metadata.structuredproperties.util.EntityWithPropertyIterator;
+import com.linkedin.metadata.utils.metrics.CascadeOperationContext;
+import com.linkedin.metadata.utils.metrics.MetricUtils;
+import com.linkedin.structured.StructuredPropertyDefinition;
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+import java.util.Spliterator;
+import java.util.Spliterators;
+import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+import lombok.Getter;
+import lombok.Setter;
+import lombok.experimental.Accessors;
+import lombok.extern.slf4j.Slf4j;
+
+@Slf4j
+@Getter
+@Setter
+@Accessors(chain = true)
+public class PropertyDefinitionDeleteSideEffect extends MCPSideEffect {
+  public static final Integer SEARCH_SCROLL_SIZE = 1000;
+  @Nonnull private AspectPluginConfig config;
+  @Nullable private MetricUtils metricUtils;
+
+  @Override
+  protected Stream<ChangeMCP> applyMCPSideEffect(
+      @Nonnull OperationFingerprint operationContext,
+      Collection<ChangeMCP> changeMCPS,
+      @Nonnull RetrieverContext retrieverContext) {
+    return Stream.of();
+  }
+
+  @Override
+  protected Stream<MCPItem> postMCPSideEffect(
+      @Nonnull OperationFingerprint operationContext,
+      Collection<MCLItem> mclItems,
+      @Nonnull RetrieverContext retrieverContext) {
+    return mclItems.stream()
+        .flatMap(item -> generatePatchRemove(operationContext, item, retrieverContext));
+  }
+
+  private Stream<MCPItem> generatePatchRemove(
+      OperationFingerprint operationFingerprint,
+      MCLItem mclItem,
+      @Nonnull RetrieverContext retrieverContext) {
+
+    if (STRUCTURED_PROPERTY_DEFINITION_ASPECT_NAME.equals(mclItem.getAspectName())) {
+      return generatePatchMCPs(
+          operationFingerprint,
+          mclItem.getUrn(),
+          mclItem.getPreviousAspect(StructuredPropertyDefinition.class),
+          mclItem.getAuditStamp(),
+          retrieverContext);
+    } else if (STRUCTURED_PROPERTY_KEY_ASPECT_NAME.equals(mclItem.getAspectName())) {
+      // Hard delete emits only a key-aspect DELETE MCL after deleteUrn wipes the DB. Cleanup is
+      // driven by a companion propertyDefinition DELETE MCL with previousAspect (see
+      // EntityServiceImpl.deleteAspectWithoutMCL).
+      Aspect definitionAspect =
+          retrieverContext
+              .getAspectRetriever()
+              .getLatestAspectObject(
+                  operationFingerprint,
+                  mclItem.getUrn(),
+                  STRUCTURED_PROPERTY_DEFINITION_ASPECT_NAME);
+      if (definitionAspect == null) {
+        log.debug(
+            "Skipping assignment cleanup for {} key delete; definition already removed",
+            mclItem.getUrn());
+        return Stream.empty();
+      }
+      return generatePatchMCPs(
+          operationFingerprint,
+          mclItem.getUrn(),
+          new StructuredPropertyDefinition(definitionAspect.data()),
+          mclItem.getAuditStamp(),
+          retrieverContext);
+    }
+    log.warn(
+        "Expected either {} or {} aspects but got {}",
+        STRUCTURED_PROPERTY_DEFINITION_ASPECT_NAME,
+        STRUCTURED_PROPERTY_KEY_ASPECT_NAME,
+        mclItem.getAspectName());
+    return Stream.empty();
+  }
+
+  private Stream<MCPItem> generatePatchMCPs(
+      @Nullable OperationFingerprint operationFingerprint,
+      Urn propertyUrn,
+      @Nullable StructuredPropertyDefinition definition,
+      @Nullable AuditStamp auditStamp,
+      @Nonnull RetrieverContext retrieverContext) {
+    if (definition == null) {
+      log.debug("Skipping assignment cleanup for {}; no propertyDefinition available", propertyUrn);
+      return Stream.empty();
+    }
+    EntityWithPropertyIterator iterator =
+        EntityWithPropertyIterator.builder()
+            .propertyUrn(propertyUrn)
+            .definition(definition)
+            .searchRetriever(retrieverContext.getSearchRetriever())
+            .count(SEARCH_SCROLL_SIZE)
+            .build();
+
+    CascadeOperationContext cascade =
+        CascadeOperationContext.beginWithoutMDC(
+            metricUtils, "propertyDefinitionDelete", propertyUrn, -1);
+
+    return StreamSupport.stream(
+            Spliterators.spliteratorUnknownSize(iterator, Spliterator.ORDERED), false)
+        .flatMap(
+            scrollResult ->
+                scrollResult.getEntities().stream()
+                    .map(
+                        entity -> {
+                          GenericJsonPatch.PatchOp patchOp = new GenericJsonPatch.PatchOp();
+                          patchOp.setOp(PatchOperationType.REMOVE.getValue());
+                          patchOp.setPath(String.format("/properties/%s", propertyUrn.toString()));
+
+                          EntitySpec entitySpec =
+                              retrieverContext
+                                  .getAspectRetriever()
+                                  .getEntityRegistry()
+                                  .getEntitySpec(entity.getEntity().getEntityType());
+                          MCPItem item =
+                              PatchItemImpl.builder()
+                                  .urn(entity.getEntity())
+                                  .entitySpec(entitySpec)
+                                  .aspectName(STRUCTURED_PROPERTIES_ASPECT_NAME)
+                                  .aspectSpec(
+                                      entitySpec.getAspectSpec(STRUCTURED_PROPERTIES_ASPECT_NAME))
+                                  .patch(
+                                      GenericJsonPatch.builder()
+                                          .arrayPrimaryKeys(
+                                              Map.of("properties", List.of("propertyUrn")))
+                                          .patch(List.of(patchOp))
+                                          .build()
+                                          .getJsonPatch())
+                                  .auditStamp(auditStamp)
+                                  .build(retrieverContext.getAspectRetriever().getEntityRegistry());
+                          cascade.recordEntityProcessed();
+                          cascade.attachToSystemMetadata(item.getSystemMetadata());
+                          return item;
+                        }))
+        .onClose(cascade::close);
+  }
+}

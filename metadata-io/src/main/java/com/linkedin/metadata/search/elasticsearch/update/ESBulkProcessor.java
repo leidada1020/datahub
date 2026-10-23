@@ -1,0 +1,290 @@
+package com.linkedin.metadata.search.elasticsearch.update;
+
+import com.linkedin.metadata.utils.elasticsearch.SearchClientShim;
+import com.linkedin.metadata.utils.metrics.MetricUtils;
+import io.datahubproject.metadata.context.OperationContext;
+import java.io.Closeable;
+import java.io.IOException;
+import java.util.Optional;
+import javax.annotation.Nonnull;
+import lombok.Builder;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+import org.opensearch.action.DocWriteRequest;
+import org.opensearch.action.support.WriteRequest;
+import org.opensearch.client.RequestOptions;
+import org.opensearch.common.Nullable;
+import org.opensearch.common.unit.TimeValue;
+import org.opensearch.index.query.QueryBuilder;
+import org.opensearch.index.reindex.BulkByScrollResponse;
+import org.opensearch.index.reindex.DeleteByQueryRequest;
+import org.opensearch.index.reindex.UpdateByQueryRequest;
+import org.opensearch.script.Script;
+
+@Slf4j
+@Builder(builderMethodName = "hiddenBuilder")
+public class ESBulkProcessor implements Closeable {
+  private static final String ES_WRITES_METRIC = "num_elasticSearch_writes";
+  private static final String ES_BATCHES_METRIC = "num_elasticSearch_batches_submitted";
+  private static final String ES_DELETE_EXCEPTION_METRIC = "delete_by_query";
+  private static final String ES_UPDATE_EXCEPTION_METRIC = "update_by_query";
+  private static final String ES_SUBMIT_DELETE_EXCEPTION_METRIC = "submit_delete_by_query_task";
+  private static final String ES_SUBMIT_REINDEX_METRIC = "reindex_submit";
+  private static final String ES_REINDEX_SUCCESS_METRIC = "reindex_success";
+  private static final String ES_REINDEX_FAILED_METRIC = "reindex_failed";
+
+  public static ESBulkProcessor.ESBulkProcessorBuilder builder(
+      SearchClientShim<?> searchClient, MetricUtils metricUtils) {
+    return hiddenBuilder().metricUtils(metricUtils).searchClient(searchClient);
+  }
+
+  @Nonnull private final SearchClientShim<?> searchClient;
+  @Builder.Default @Nonnull private Boolean async = false;
+  @Builder.Default @Nonnull private Boolean batchDelete = false;
+  @Builder.Default private Integer bulkRequestsLimit = 500;
+  @Builder.Default private Integer bulkFlushPeriod = 1;
+  @Builder.Default private Integer numRetries = 3;
+  @Builder.Default private Long retryInterval = 1L;
+  @Builder.Default private Integer threadCount = 1; // Default to single processor
+  @Builder.Default private TimeValue defaultTimeout = TimeValue.timeValueMinutes(1);
+  @Builder.Default private Boolean itemRequeueEnabled = true;
+  @Builder.Default private Integer itemRequeueMaxAttempts = 3;
+  @Builder.Default private Boolean ackAfterTransfer = false;
+  @Builder.Default private Integer ackAfterTransferTimeoutSeconds = 60;
+
+  /**
+   * HTTP {@link RequestOptions} for by-query operations (delete/update-by-query, async submit,
+   * etc.). Same tuning for GMS and MAE ({@code
+   * elasticsearch.bulkProcessor.slowByQueryOperationTimeoutSeconds}); MAE-specific RestClient
+   * settings are configured separately on {@link SearchClientShim}.
+   */
+  @Builder.Default @Nonnull private RequestOptions byQueryRequestOptions = RequestOptions.DEFAULT;
+
+  @Getter private final WriteRequest.RefreshPolicy writeRequestRefreshPolicy;
+
+  private final MetricUtils metricUtils;
+
+  private ESBulkProcessor(
+      @Nonnull SearchClientShim<?> searchClient,
+      @Nonnull Boolean async,
+      @Nonnull Boolean batchDelete,
+      Integer bulkRequestsLimit,
+      Integer bulkFlushPeriod,
+      Integer numRetries,
+      Long retryInterval,
+      Integer threadCount,
+      TimeValue defaultTimeout,
+      Boolean itemRequeueEnabled,
+      Integer itemRequeueMaxAttempts,
+      Boolean ackAfterTransfer,
+      Integer ackAfterTransferTimeoutSeconds,
+      @Nonnull RequestOptions byQueryRequestOptions,
+      WriteRequest.RefreshPolicy writeRequestRefreshPolicy,
+      MetricUtils metricUtils) {
+    this.searchClient = searchClient;
+    this.async = async;
+    this.batchDelete = batchDelete;
+    this.bulkRequestsLimit = bulkRequestsLimit;
+    this.bulkFlushPeriod = bulkFlushPeriod;
+    this.numRetries = numRetries;
+    this.retryInterval = retryInterval;
+    this.threadCount = threadCount;
+    this.defaultTimeout = defaultTimeout;
+    this.itemRequeueEnabled = itemRequeueEnabled != null ? itemRequeueEnabled : true;
+    this.itemRequeueMaxAttempts =
+        itemRequeueMaxAttempts != null ? itemRequeueMaxAttempts : numRetries;
+    this.ackAfterTransfer = ackAfterTransfer != null ? ackAfterTransfer : false;
+    this.ackAfterTransferTimeoutSeconds =
+        ackAfterTransferTimeoutSeconds != null ? ackAfterTransferTimeoutSeconds : 60;
+    this.byQueryRequestOptions = byQueryRequestOptions;
+    this.writeRequestRefreshPolicy = writeRequestRefreshPolicy;
+    searchClient.configureBulkProcessorWriteOptions(
+        this.itemRequeueEnabled, this.itemRequeueMaxAttempts);
+    if (async) {
+      searchClient.generateAsyncBulkProcessor(
+          writeRequestRefreshPolicy,
+          metricUtils,
+          bulkRequestsLimit,
+          bulkFlushPeriod,
+          retryInterval,
+          numRetries,
+          threadCount);
+    } else {
+      searchClient.generateBulkProcessor(
+          writeRequestRefreshPolicy,
+          metricUtils,
+          bulkRequestsLimit,
+          bulkFlushPeriod,
+          retryInterval,
+          numRetries,
+          threadCount);
+    }
+    this.metricUtils = metricUtils;
+  }
+
+  /**
+   * Add a request with URN-based routing for entity document consistency. This method routes all
+   * operations for the same URN to the same BulkProcessor to ensure consistent ordering and avoid
+   * conflicts when updating the same entity.
+   *
+   * @param urn the URN of the entity being updated
+   * @param request the document write request
+   * @return this ESBulkProcessor instance
+   */
+  public ESBulkProcessor add(
+      @Nonnull OperationContext opContext,
+      @Nonnull String urn,
+      @Nonnull DocWriteRequest<?> request) {
+    if (metricUtils != null) metricUtils.increment(this.getClass(), ES_WRITES_METRIC, 1);
+    searchClient.addBulk(opContext, urn, request);
+    log.debug(
+        "Added URN-aware request urn: {}, id: {}, operation type: {}, index: {}",
+        urn,
+        request.id(),
+        request.opType(),
+        request.index());
+    return this;
+  }
+
+  public Optional<BulkByScrollResponse> deleteByQuery(
+      @Nonnull OperationContext opContext, QueryBuilder queryBuilder, String... indices) {
+    return deleteByQuery(opContext, queryBuilder, true, bulkRequestsLimit, defaultTimeout, indices);
+  }
+
+  public Optional<BulkByScrollResponse> deleteByQuery(
+      @Nonnull OperationContext opContext,
+      QueryBuilder queryBuilder,
+      boolean refresh,
+      String... indices) {
+    return deleteByQuery(
+        opContext, queryBuilder, refresh, bulkRequestsLimit, defaultTimeout, indices);
+  }
+
+  public Optional<BulkByScrollResponse> updateByQuery(
+      @Nonnull OperationContext opContext,
+      Script script,
+      QueryBuilder queryBuilder,
+      String... indices) {
+    UpdateByQueryRequest updateByQuery = new UpdateByQueryRequest(indices);
+    updateByQuery.setQuery(queryBuilder);
+    updateByQuery.setScript(script);
+
+    try {
+      final BulkByScrollResponse updateResponse =
+          searchClient.updateByQuery(opContext, updateByQuery, byQueryRequestOptions);
+      if (metricUtils != null)
+        metricUtils.increment(this.getClass(), ES_WRITES_METRIC, updateResponse.getTotal());
+      return Optional.of(updateResponse);
+    } catch (Exception e) {
+      log.error("ERROR: Failed to update by query. See stacktrace for a more detailed error:", e);
+      if (metricUtils != null)
+        metricUtils.exceptionIncrement(ESBulkProcessor.class, ES_UPDATE_EXCEPTION_METRIC, e);
+    }
+
+    return Optional.empty();
+  }
+
+  public Optional<BulkByScrollResponse> deleteByQuery(
+      @Nonnull OperationContext opContext,
+      QueryBuilder queryBuilder,
+      boolean refresh,
+      int limit,
+      TimeValue timeout,
+      String... indices) {
+    DeleteByQueryRequest deleteByQueryRequest =
+        new DeleteByQueryRequest()
+            .setQuery(queryBuilder)
+            .setBatchSize(limit)
+            .setMaxRetries(numRetries)
+            .setRetryBackoffInitialTime(TimeValue.timeValueSeconds(retryInterval))
+            .setTimeout(timeout)
+            .setRefresh(refresh);
+    deleteByQueryRequest.indices(indices);
+
+    try {
+      if (!batchDelete) {
+        searchClient.flushBulkProcessor();
+      }
+      final BulkByScrollResponse deleteResponse =
+          searchClient.deleteByQuery(opContext, deleteByQueryRequest, byQueryRequestOptions);
+      if (metricUtils != null)
+        metricUtils.increment(this.getClass(), ES_WRITES_METRIC, deleteResponse.getTotal());
+      return Optional.of(deleteResponse);
+    } catch (Exception e) {
+      log.error("ERROR: Failed to delete by query. See stacktrace for a more detailed error:", e);
+      if (metricUtils != null)
+        metricUtils.exceptionIncrement(ESBulkProcessor.class, ES_DELETE_EXCEPTION_METRIC, e);
+    }
+
+    return Optional.empty();
+  }
+
+  public Optional<String> deleteByQueryAsync(
+      @Nonnull OperationContext opContext,
+      QueryBuilder queryBuilder,
+      boolean refresh,
+      int limit,
+      @Nullable TimeValue timeout,
+      String... indices) {
+    DeleteByQueryRequest deleteByQueryRequest =
+        new DeleteByQueryRequest()
+            .setQuery(queryBuilder)
+            .setBatchSize(limit)
+            .setMaxRetries(numRetries)
+            .setRetryBackoffInitialTime(TimeValue.timeValueSeconds(retryInterval))
+            .setRefresh(refresh);
+    if (timeout != null) {
+      deleteByQueryRequest.setTimeout(timeout);
+    }
+    deleteByQueryRequest.setConflicts("proceed");
+    deleteByQueryRequest.indices(indices);
+    try {
+      searchClient.flushBulkProcessor();
+      String resp =
+          searchClient.submitDeleteByQueryTask(
+              opContext, deleteByQueryRequest, byQueryRequestOptions);
+      if (metricUtils != null) metricUtils.increment(this.getClass(), ES_BATCHES_METRIC, 1);
+      return Optional.of(resp);
+    } catch (Exception e) {
+      log.error(
+          "ERROR: Failed to submit a delete by query task. See stacktrace for a more detailed error:",
+          e);
+      if (metricUtils != null)
+        metricUtils.exceptionIncrement(ESBulkProcessor.class, ES_SUBMIT_DELETE_EXCEPTION_METRIC, e);
+    }
+    return Optional.empty();
+  }
+
+  @Override
+  public void close() throws IOException {
+    flush();
+    searchClient.closeBulkProcessor();
+  }
+
+  public void flush() {
+    searchClient.flushBulkProcessor();
+  }
+
+  /**
+   * Flush pending bulks and wait until tracked items reach a terminal outcome. Throws {@link
+   * BulkTransferException} if unrecovered transfer failures occurred. Version-conflict LWW
+   * exhaustion does not fail this call.
+   */
+  public void flushAndWait(java.time.Duration timeout)
+      throws InterruptedException, java.util.concurrent.TimeoutException {
+    searchClient.flushAndAwaitBulkTransfer(timeout.toMillis());
+    long failures = searchClient.drainBulkTransferFailures();
+    if (failures > 0) {
+      throw new BulkTransferException(
+          failures, "Bulk transfer completed with " + failures + " unrecovered item failure(s)");
+    }
+  }
+
+  public boolean isAckAfterTransfer() {
+    return Boolean.TRUE.equals(ackAfterTransfer);
+  }
+
+  public int getAckAfterTransferTimeoutSeconds() {
+    return ackAfterTransferTimeoutSeconds != null ? ackAfterTransferTimeoutSeconds : 60;
+  }
+}

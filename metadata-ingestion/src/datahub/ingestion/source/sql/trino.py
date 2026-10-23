@@ -1,0 +1,696 @@
+import functools
+import json
+import logging
+import uuid
+from textwrap import dedent
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
+
+import sqlalchemy
+import trino
+from packaging import version
+from pydantic.fields import Field
+from sqlalchemy import exc, sql
+from sqlalchemy.engine import reflection
+from sqlalchemy.engine.base import Connection, Engine
+from sqlalchemy.engine.reflection import Inspector
+from sqlalchemy.sql import sqltypes
+from sqlalchemy.types import TypeEngine
+from trino.sqlalchemy import datatype
+from trino.sqlalchemy.dialect import TrinoDialect
+
+from datahub.configuration.common import HiddenFromDocs
+from datahub.configuration.source_common import (
+    EnvConfigMixin,
+    PlatformInstanceConfigMixin,
+)
+from datahub.emitter.mce_builder import (
+    make_dataset_urn_with_platform_instance,
+    make_schema_field_urn,
+)
+from datahub.emitter.mcp import MetadataChangeProposalWrapper
+from datahub.ingestion.api.common import PipelineContext
+from datahub.ingestion.api.decorators import (
+    SourceCapability,
+    SupportStatus,
+    capability,
+    config_class,
+    platform_name,
+    support_status,
+)
+from datahub.ingestion.api.workunit import MetadataWorkUnit
+from datahub.ingestion.extractor import schema_util
+from datahub.ingestion.source.common.data_reader import DataReader
+from datahub.ingestion.source.common.subtypes import SourceCapabilityModifier
+from datahub.ingestion.source.sql.sql_common import (
+    SQLAlchemySource,
+    SqlWorkUnit,
+    register_custom_type,
+)
+from datahub.ingestion.source.sql.sql_config import (
+    BasicSQLAlchemyConfig,
+    SQLCommonConfig,
+)
+from datahub.metadata.com.linkedin.pegasus2avro.common import Siblings
+from datahub.metadata.com.linkedin.pegasus2avro.dataset import (
+    DatasetLineageType,
+    Upstream,
+    UpstreamLineage,
+)
+from datahub.metadata.com.linkedin.pegasus2avro.schema import (
+    MapTypeClass,
+    NumberTypeClass,
+    RecordTypeClass,
+    SchemaField,
+)
+from datahub.metadata.schema_classes import (
+    FineGrainedLineageClass,
+    FineGrainedLineageDownstreamTypeClass,
+    FineGrainedLineageUpstreamTypeClass,
+    SchemaMetadataClass,
+)
+from datahub.specific.dataset import DatasetPatchBuilder
+from datahub.utilities.urns.field_paths import (
+    get_simple_field_path_from_v2_field_path,
+)
+
+register_custom_type(datatype.ROW, RecordTypeClass)
+register_custom_type(datatype.MAP, MapTypeClass)
+register_custom_type(datatype.DOUBLE, NumberTypeClass)
+
+
+KNOWN_CONNECTOR_PLATFORM_MAPPING = {
+    "clickhouse": "clickhouse",
+    "hive": "hive",
+    "glue": "glue",
+    "iceberg": "iceberg",
+    "mysql": "mysql",
+    "postgresql": "postgres",
+    "redshift": "redshift",
+    "bigquery": "bigquery",
+    "snowflake_distributed": "snowflake",
+    "snowflake_parallel": "snowflake",
+    "snowflake_jdbc": "snowflake",
+    "oracle": "oracle",
+    "starrocks": "starrocks",
+}
+
+# Default tier layout used when no connector_database is configured for a catalog:
+# connectors listed here build two-tier (schema.table) URNs, others build three-tier.
+# Oracle defaults to two-tier (matching the `oracle` source with
+# add_database_name_to_urn=false); setting connector_database overrides this to force a
+# three-tier URN (e.g. Oracle with add_database_name_to_urn=true, or StarRocks reached
+# via the mysql connector).
+TWO_TIER_CONNECTORS = ["clickhouse", "hive", "glue", "mysql", "iceberg", "oracle"]
+
+PROPERTIES_TABLE_SUPPORTED_CONNECTORS = ["hive", "iceberg", "lakehouse", "delta_lake"]
+
+
+def normalize_connector_database(platform: str, database: str) -> str:
+    """Normalize a configured connector_database the way the native source would.
+
+    Oracle stores unquoted identifiers in uppercase and the `oracle` source lowercases
+    them via SQLAlchemy's ``normalize_name``, so a `connector_database` copied verbatim
+    from Oracle (e.g. ``ORCLPDB1``) would otherwise build a URN the native ingestion
+    never produces. The rule is deliberately duplicated from ``oracle.normalize_db_name``
+    rather than imported: that module imports ``oracledb`` at module scope, which the
+    trino plugin does not depend on.
+
+    Only applied to Oracle -- the uppercase-means-unquoted convention is Oracle-specific
+    and would corrupt names for platforms that fold the other way (e.g. Snowflake).
+    """
+    if platform == "oracle":
+        return database.lower() if database.isupper() else database
+    return database
+
+
+# Type JSON was introduced in trino sqlalchemy dialect in version 0.317.0
+if version.parse(trino.__version__) >= version.parse("0.317.0"):
+    register_custom_type(datatype.JSON, RecordTypeClass)
+
+
+@functools.lru_cache
+def gen_catalog_connector_dict(engine: Engine) -> Dict[str, str]:
+    query = dedent(
+        """
+        SELECT *
+        FROM "system"."metadata"."catalogs"
+    """
+    ).strip()
+    with engine.connect() as conn:
+        res = conn.execute(sql.text(query))
+        return {row.catalog_name: row.connector_name for row in res}
+
+
+def get_catalog_connector_name(engine: Engine, catalog_name: str) -> Optional[str]:
+    return gen_catalog_connector_dict(engine).get(catalog_name)
+
+
+# Read only table names and skip view names, as view names will also be returned
+# from get_view_names
+@reflection.cache  # type: ignore
+def get_table_names(
+    self: Any, connection: Connection, schema: Optional[str] = None, **kw: Any
+) -> List[str]:
+    schema = schema or self._get_default_schema_name(connection)
+    if schema is None:
+        raise exc.NoSuchTableError("schema is required")
+    query = dedent(
+        """
+        SELECT "table_name"
+        FROM "information_schema"."tables"
+        WHERE "table_schema" = :schema and "table_type" != 'VIEW'
+    """
+    ).strip()
+    res = connection.execute(sql.text(query), {"schema": schema})
+    return [row.table_name for row in res]
+
+
+# Include all table properties instead of only "comment" property
+@reflection.cache  # type: ignore
+def get_table_comment(
+    self: Any,
+    connection: Connection,
+    table_name: str,
+    schema: Optional[str] = None,
+    **kw: Any,
+) -> Dict[str, Any]:
+    try:
+        catalog_name = self._get_default_catalog_name(connection)
+        if catalog_name is None:
+            raise exc.NoSuchTableError("catalog is required in connection")
+        connector_name = get_catalog_connector_name(connection.engine, catalog_name)
+        if (
+            connector_name is not None
+            and connector_name in PROPERTIES_TABLE_SUPPORTED_CONNECTORS
+        ):
+            properties_table = self._get_full_table(f"{table_name}$properties", schema)
+            query = f"SELECT * FROM {properties_table}"
+            # .mappings() yields dict-like rows so the key-membership and
+            # column-name indexing below work on SQLAlchemy 2.0 (Row dropped
+            # __contains__/__getitem__-by-name and .items()).
+            rows = connection.execute(sql.text(query)).mappings().fetchall()
+
+            # Generate properties dictionary.
+            properties = {}
+
+            if len(rows) == 0:
+                # No properties found, return empty dictionary
+                return {}
+
+            # Table properties can be returned in different formats depending on the connector, so we need to handle different cases.
+            # Lakehouse is a proxy for hive, iceberg and delta lake connectors. It can contain both formats.
+            if (
+                connector_name in ["iceberg", "lakehouse", "delta_lake"]
+                and len(rows[0]) == 2
+                and "key" in rows[0]
+                and "value" in rows[0]
+            ):
+                # https://trino.io/docs/current/connector/iceberg.html#properties-table
+                # https://trino.io/docs/current/connector/delta-lake.html#properties-table
+                for row in rows:
+                    if row["value"] is not None:
+                        properties[row["key"]] = row["value"]
+                return {"text": properties.get("comment"), "properties": properties}
+            elif (
+                connector_name in ["hive", "lakehouse"]
+                and len(rows[0]) > 1
+                and len(rows) == 1
+            ):
+                # https://trino.io/docs/current/connector/hive.html#properties-table
+                row = rows[0]
+                for col_name, col_value in row.items():
+                    if col_value is not None:
+                        properties[col_name] = col_value
+                return {"text": properties.get("comment"), "properties": properties}
+
+            # If we can't get the properties we still fallback to the default
+        return self.get_table_comment_default(connection, table_name, schema)
+    except Exception as e:
+        logging.warning(
+            f"Failed to get table comment for {table_name} in {schema}: {e}"
+        )
+        return {}
+
+
+# Include column comment, original trino datatype as full_type
+@reflection.cache  # type: ignore
+def _get_columns(
+    self: Any,
+    connection: Connection,
+    table_name: str,
+    schema: Optional[str] = None,
+    **kw: Any,
+) -> List[Dict[str, Any]]:
+    schema = schema or self._get_default_schema_name(connection)
+    query = dedent(
+        """
+        SELECT
+            "column_name",
+            "data_type",
+            "column_default",
+            UPPER("is_nullable") AS "is_nullable",
+            "comment"
+        FROM "information_schema"."columns"
+        WHERE "table_schema" = :schema
+            AND "table_name" = :table
+        ORDER BY "ordinal_position" ASC
+    """
+    ).strip()
+    res = connection.execute(sql.text(query), {"schema": schema, "table": table_name})
+    columns = []
+    for record in res:
+        column = dict(
+            name=record.column_name,
+            type=datatype.parse_sqltype(record.data_type),
+            nullable=record.is_nullable == "YES",
+            default=record.column_default,
+            comment=record.comment,
+        )
+        columns.append(column)
+    return columns
+
+
+TrinoDialect.get_table_comment_default = TrinoDialect.get_table_comment
+TrinoDialect.get_table_names = get_table_names
+TrinoDialect.get_table_comment = get_table_comment
+TrinoDialect._get_columns = _get_columns
+
+
+class ConnectorDetail(PlatformInstanceConfigMixin, EnvConfigMixin):
+    connector_database: Optional[str] = Field(default=None, description="")
+    connector_platform: Optional[str] = Field(
+        default=None,
+        description="A connector's actual platform name. If not provided, will take from metadata tables"
+        "Eg: hive catalog can have a connector platform as 'hive' or 'glue' or some other metastore.",
+    )
+
+
+class TrinoConfig(BasicSQLAlchemyConfig):
+    # defaults
+    scheme: HiddenFromDocs[str] = Field(default="trino")
+    database: str = Field(description="database (catalog)")
+
+    catalog_to_connector_details: Dict[str, ConnectorDetail] = Field(
+        default={},
+        description="A mapping of trino catalog to its connector details like connector database, env and platform instance."
+        "This configuration is used to build lineage to the underlying connector. Use catalog name as key.",
+    )
+
+    ingest_lineage_to_connectors: bool = Field(
+        default=True,
+        description="Whether lineage of datasets to connectors should be ingested",
+    )
+
+    include_column_lineage: bool = Field(
+        default=True,
+        description="When emitting upstreamLineage to connector sources (e.g. Iceberg, Hive), "
+        "include column-level (fine-grained) lineage. Requires schema to be available.",
+    )
+
+    trino_as_primary: bool = Field(
+        default=True,
+        description="Experimental feature. Whether trino dataset should be primary entity of the set of siblings",
+    )
+
+    def get_identifier(self: BasicSQLAlchemyConfig, schema: str, table: str) -> str:
+        return f"{self.database}.{schema}.{table}"
+
+
+@platform_name("Trino", doc_order=1)
+@config_class(TrinoConfig)
+@support_status(SupportStatus.GA)
+@capability(SourceCapability.DOMAINS, "Supported via the `domain` config field")
+@capability(SourceCapability.DATA_PROFILING, "Optionally enabled via configuration")
+@capability(
+    SourceCapability.LINEAGE_COARSE,
+    "Extract table-level lineage",
+    subtype_modifier=[
+        SourceCapabilityModifier.TABLE,
+        SourceCapabilityModifier.VIEW,
+    ],
+)
+@capability(
+    SourceCapability.LINEAGE_FINE,
+    "Column-level lineage when emitting lineage to connector sources (e.g. Iceberg, Hive)",
+    subtype_modifier=[
+        SourceCapabilityModifier.TABLE,
+        SourceCapabilityModifier.VIEW,
+    ],
+)
+@capability(
+    SourceCapability.PROBE,
+    "Check what a recipe would ingest before running it, with `datahub recipe probe`",
+)
+class TrinoSource(SQLAlchemySource):
+    """
+    Extracts metadata and two distinct relations to connector datasets (e.g. Iceberg, Hive):
+
+    - **Siblings**: Same logical dataset in two platforms (Trino catalog table ↔ connector table).
+    - **UpstreamLineage**: This Trino dataset reads from the connector dataset (table or view).
+      Optionally includes column-level lineage (fineGrainedLineages) when schema is available.
+
+    Also extracts: databases, schemas, tables, column types, optional profiling.
+    """
+
+    config: TrinoConfig
+
+    def __init__(
+        self, config: TrinoConfig, ctx: PipelineContext, platform: str = "trino"
+    ):
+        super().__init__(config, ctx, platform)
+
+    def get_db_name(self, inspector: Inspector) -> str:
+        if self.config.database:
+            return f"{self.config.database}"
+        else:
+            return super().get_db_name(inspector)
+
+    def _get_source_dataset_urn(
+        self,
+        dataset_name: str,
+        inspector: Inspector,
+        schema: str,
+        table: str,
+    ) -> Optional[str]:
+        catalog_name = dataset_name.split(".")[0]
+        connector_name = get_catalog_connector_name(inspector.engine, catalog_name)
+        if not connector_name:
+            return None
+        connector_details = self.config.catalog_to_connector_details.get(
+            catalog_name, ConnectorDetail()
+        )
+        connector_platform_name = KNOWN_CONNECTOR_PLATFORM_MAPPING.get(
+            connector_details.connector_platform or connector_name
+        )
+        if not connector_platform_name:
+            logging.debug(f"Platform '{connector_platform_name}' is not yet supported.")
+            return None
+
+        # An explicit connector_database always produces a three-tier
+        # (database.schema.table) URN, taking precedence over TWO_TIER_CONNECTORS. This
+        # lets connectors DataHub can model either way opt into three-tier without a
+        # hard-coded assumption here -- e.g. Oracle ingested with
+        # add_database_name_to_urn=true. Without connector_database, a connector listed
+        # in TWO_TIER_CONNECTORS falls back to a two-tier (schema.table) URN.
+        if connector_details.connector_database:  # three tier
+            connector_database = normalize_connector_database(
+                connector_platform_name, connector_details.connector_database
+            )
+            return make_dataset_urn_with_platform_instance(
+                platform=connector_platform_name,
+                name=f"{connector_database}.{schema}.{table}",
+                platform_instance=connector_details.platform_instance,
+                env=connector_details.env,
+            )
+        elif connector_platform_name in TWO_TIER_CONNECTORS:  # two tier
+            return make_dataset_urn_with_platform_instance(
+                platform=connector_platform_name,
+                name=f"{schema}.{table}",
+                platform_instance=connector_details.platform_instance,
+                env=connector_details.env,
+            )
+        else:
+            logging.warning(f"Connector database missing for Catalog '{catalog_name}'.")
+        return None
+
+    def gen_siblings_workunit(
+        self,
+        dataset_urn: str,
+        source_dataset_urn: str,
+    ) -> Iterable[MetadataWorkUnit]:
+        """
+        Generate sibling workunit for both trino dataset and its connector source dataset
+        """
+        yield MetadataChangeProposalWrapper(
+            entityUrn=dataset_urn,
+            aspect=Siblings(
+                primary=self.config.trino_as_primary, siblings=[source_dataset_urn]
+            ),
+        ).as_workunit()
+
+        # The connector dataset belongs to the native source (e.g. the `oracle` source),
+        # not to Trino. Patch its Siblings rather than upserting the aspect, so an
+        # existing pairing (e.g. dbt <-> Oracle) is not overwritten, and mark the
+        # workunit non-primary so stateful ingestion does not record the native dataset
+        # in Trino's checkpoint -- otherwise Trino would soft-delete a dataset another
+        # source owns once the URN stops being emitted.
+        patch = DatasetPatchBuilder(source_dataset_urn)
+        patch.add_sibling(dataset_urn, primary=not self.config.trino_as_primary)
+        for mcp in patch.build():
+            yield MetadataWorkUnit(
+                id=MetadataWorkUnit.generate_workunit_id(mcp),
+                mcp_raw=mcp,
+                is_primary_source=False,
+            )
+
+    def gen_lineage_workunit(
+        self,
+        dataset_urn: str,
+        source_dataset_urn: str,
+        schema_metadata: Optional[SchemaMetadataClass] = None,
+    ) -> Iterable[MetadataWorkUnit]:
+        """
+        Emit upstreamLineage from this Trino dataset to the connector dataset.
+        When include_column_lineage is True and schema_metadata has fields,
+        also emits fineGrainedLineages (column-level lineage) with 1:1 field mapping.
+        """
+        fine_grained_lineages: Optional[List[FineGrainedLineageClass]] = None
+        if (
+            self.config.include_column_lineage
+            and schema_metadata is not None
+            and schema_metadata.fields
+        ):
+            fine_grained_lineages = []
+            for field in schema_metadata.fields:
+                try:
+                    path = get_simple_field_path_from_v2_field_path(field.fieldPath)
+                    fine_grained_lineages.append(
+                        FineGrainedLineageClass(
+                            upstreamType=FineGrainedLineageUpstreamTypeClass.FIELD_SET,
+                            upstreams=[make_schema_field_urn(source_dataset_urn, path)],
+                            downstreamType=FineGrainedLineageDownstreamTypeClass.FIELD,
+                            downstreams=[make_schema_field_urn(dataset_urn, path)],
+                        )
+                    )
+                except Exception as e:
+                    logging.debug(
+                        "Skipping column lineage for field %s: %s",
+                        field.fieldPath,
+                        e,
+                    )
+        yield MetadataChangeProposalWrapper(
+            entityUrn=dataset_urn,
+            aspect=UpstreamLineage(
+                upstreams=[
+                    Upstream(dataset=source_dataset_urn, type=DatasetLineageType.VIEW)
+                ],
+                fineGrainedLineages=fine_grained_lineages,
+            ),
+        ).as_workunit()
+
+    def _emit_connector_lineage(
+        self,
+        dataset_name: str,
+        inspector: Inspector,
+        schema: str,
+        entity: str,
+        schema_metadata: Optional[SchemaMetadataClass],
+    ) -> Iterable[MetadataWorkUnit]:
+        if not self.config.ingest_lineage_to_connectors:
+            return
+        dataset_urn = make_dataset_urn_with_platform_instance(
+            self.platform,
+            dataset_name,
+            self.config.platform_instance,
+            self.config.env,
+        )
+        source_dataset_urn = self._get_source_dataset_urn(
+            dataset_name, inspector, schema, entity
+        )
+        if source_dataset_urn:
+            yield from self.gen_siblings_workunit(dataset_urn, source_dataset_urn)
+            yield from self.gen_lineage_workunit(
+                dataset_urn, source_dataset_urn, schema_metadata
+            )
+
+    def _process_table(
+        self,
+        dataset_name: str,
+        inspector: Inspector,
+        schema: str,
+        table: str,
+        sql_config: SQLCommonConfig,
+        data_reader: Optional[DataReader],
+    ) -> Iterable[Union[SqlWorkUnit, MetadataWorkUnit]]:
+        schema_metadata: Optional[SchemaMetadataClass] = None
+        for wu in super()._process_table(
+            dataset_name, inspector, schema, table, sql_config, data_reader
+        ):
+            sm = wu.get_aspect_of_type(SchemaMetadataClass)
+            if sm is not None:
+                schema_metadata = sm
+            yield wu
+
+        yield from self._emit_connector_lineage(
+            dataset_name, inspector, schema, table, schema_metadata
+        )
+
+    def _process_view(
+        self,
+        dataset_name: str,
+        inspector: Inspector,
+        schema: str,
+        view: str,
+        sql_config: SQLCommonConfig,
+    ) -> Iterable[Union[SqlWorkUnit, MetadataWorkUnit]]:
+        schema_metadata: Optional[SchemaMetadataClass] = None
+        for wu in super()._process_view(
+            dataset_name, inspector, schema, view, sql_config
+        ):
+            sm = wu.get_aspect_of_type(SchemaMetadataClass)
+            if sm is not None:
+                schema_metadata = sm
+            yield wu
+
+        yield from self._emit_connector_lineage(
+            dataset_name, inspector, schema, view, schema_metadata
+        )
+
+    @classmethod
+    def create(cls, config_dict, ctx):
+        config = TrinoConfig.model_validate(config_dict)
+        return cls(config, ctx)
+
+    def get_schema_fields_for_column(
+        self,
+        dataset_name: str,
+        column: Mapping[str, Any],
+        inspector: Inspector,
+        pk_constraints: Optional[Mapping[str, Any]] = None,
+        partition_keys: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+    ) -> List[SchemaField]:
+        fields = super().get_schema_fields_for_column(
+            dataset_name,
+            column,
+            inspector,
+            pk_constraints,
+        )
+
+        if isinstance(column["type"], (datatype.ROW, sqltypes.ARRAY, datatype.MAP)):
+            assert len(fields) == 1
+            field = fields[0]
+            # Get avro schema for subfields along with parent complex field
+            avro_schema = self.get_avro_schema_from_data_type(
+                column["type"], column["name"]
+            )
+
+            newfields = schema_util.avro_schema_to_mce_fields(
+                json.dumps(avro_schema), default_nullable=True
+            )
+
+            # First field is the parent complex field
+            newfields[0].nullable = field.nullable
+            newfields[0].description = field.description
+            newfields[0].isPartOfKey = field.isPartOfKey
+            return newfields
+
+        return fields
+
+    def get_avro_schema_from_data_type(
+        self, column_type: TypeEngine, column_name: str
+    ) -> Dict[str, Any]:
+        # Below Record structure represents the dataset level
+        # Inner fields represent the complex field (struct/array/map/union)
+        return {
+            "type": "record",
+            "name": "__struct_",
+            "fields": [{"name": column_name, "type": _parse_datatype(column_type)}],
+        }
+
+
+_all_atomic_types = {
+    sqltypes.BOOLEAN: "boolean",
+    sqltypes.SMALLINT: "int",
+    sqltypes.INTEGER: "int",
+    sqltypes.BIGINT: "long",
+    sqltypes.REAL: "float",
+    datatype.DOUBLE: "double",  # type: ignore
+    sqltypes.VARCHAR: "string",
+    sqltypes.CHAR: "string",
+    sqltypes.JSON: "record",
+}
+
+
+def _parse_datatype(s):
+    if isinstance(s, sqlalchemy.types.ARRAY):
+        return {
+            "type": "array",
+            "items": _parse_datatype(s.item_type),
+            "native_data_type": repr(s),
+        }
+    elif isinstance(s, datatype.MAP):
+        kt = _parse_datatype(s.key_type)
+        vt = _parse_datatype(s.value_type)
+        # keys are assumed to be strings in avro map
+        return {
+            "type": "map",
+            "values": vt,
+            "native_data_type": repr(s),
+            "key_type": kt,
+            "key_native_data_type": repr(s.key_type),
+        }
+    elif isinstance(s, datatype.ROW):
+        return _parse_struct_fields(s.attr_types)
+    else:
+        return _parse_basic_datatype(s)
+
+
+def _parse_struct_fields(parts):
+    fields = []
+    for name_and_type in parts:
+        field_name = name_and_type[0].strip()
+        field_type = _parse_datatype(name_and_type[1])
+        fields.append({"name": field_name, "type": field_type})
+    return {
+        "type": "record",
+        "name": "__struct_{}".format(str(uuid.uuid4()).replace("-", "")),
+        "fields": fields,
+        "native_data_type": f"ROW({parts})",
+    }
+
+
+def _parse_basic_datatype(s):
+    for sql_type in _all_atomic_types:
+        if isinstance(s, sql_type):
+            return {
+                "type": _all_atomic_types[sql_type],
+                "native_data_type": repr(s),
+                "_nullable": True,
+            }
+
+    if isinstance(s, sqlalchemy.types.DECIMAL):
+        return {
+            "type": "bytes",
+            "logicalType": "decimal",
+            "precision": s.precision,  # type: ignore
+            "scale": s.scale,  # type: ignore
+            "native_data_type": repr(s),
+            "_nullable": True,
+        }
+    elif isinstance(s, sqlalchemy.types.Date):
+        return {
+            "type": "int",
+            "logicalType": "date",
+            "native_data_type": repr(s),
+            "_nullable": True,
+        }
+    elif isinstance(s, (sqlalchemy.types.DATETIME, sqlalchemy.types.TIMESTAMP)):
+        return {
+            "type": "int",
+            "logicalType": "timestamp-millis",
+            "native_data_type": repr(s),
+            "_nullable": True,
+        }
+
+    return {"type": "null", "native_data_type": repr(s)}

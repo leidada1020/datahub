@@ -1,0 +1,89 @@
+import { Icon, Text, Tooltip } from '@components';
+import { Binary } from '@phosphor-icons/react/dist/csr/Binary';
+import { ChartLine } from '@phosphor-icons/react/dist/csr/ChartLine';
+import { Clock } from '@phosphor-icons/react/dist/csr/Clock';
+import { Hash } from '@phosphor-icons/react/dist/csr/Hash';
+import { Image } from '@phosphor-icons/react/dist/csr/Image';
+import { List } from '@phosphor-icons/react/dist/csr/List';
+import { ListNumbers } from '@phosphor-icons/react/dist/csr/ListNumbers';
+import { Microphone } from '@phosphor-icons/react/dist/csr/Microphone';
+import { Prohibit } from '@phosphor-icons/react/dist/csr/Prohibit';
+import { Question } from '@phosphor-icons/react/dist/csr/Question';
+import { TextT } from '@phosphor-icons/react/dist/csr/TextT';
+import { VideoCamera } from '@phosphor-icons/react/dist/csr/VideoCamera';
+import React from 'react';
+import styled from 'styled-components';
+
+import { capitalizeFirstLetter } from '@app/sharedV2/textUtil';
+
+import { MlFeatureDataType } from '@types';
+
+const TypeIconContainer = styled.div`
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    text-align: center;
+    margin-top: 2.5px;
+    width: 70px;
+`;
+
+const TypeSubtitle = styled(Text)<{ hasicon?: string }>`
+    font-size: 8px;
+    text-align: center;
+    text-transform: uppercase;
+    ${(props) => (props.hasicon ? '' : 'margin-top: 4px;')}
+`;
+
+type PhosphorIcon = React.ComponentType<any>;
+
+/* untranslated-text -- ML feature data-type enum display labels, mirror GraphQL MlFeatureDataType enum */
+const DATA_TYPE_ICON_MAP: Record<MlFeatureDataType, { icon: PhosphorIcon | null; size: number; text: string }> = {
+    [MlFeatureDataType.Byte]: { icon: Binary, size: 18, text: 'Byte' },
+    [MlFeatureDataType.Time]: { icon: Clock, size: 18, text: 'Time' },
+    [MlFeatureDataType.Set]: { icon: List, size: 18, text: 'Set' },
+    [MlFeatureDataType.Unknown]: { icon: Question, size: 16, text: 'Unknown' },
+    [MlFeatureDataType.Map]: { icon: List, size: 14, text: 'Map' },
+    [MlFeatureDataType.Useless]: { icon: Prohibit, size: 18, text: 'Useless' },
+    [MlFeatureDataType.Nominal]: { icon: Hash, size: 14, text: 'Nominal' },
+    [MlFeatureDataType.Ordinal]: { icon: ListNumbers, size: 18, text: 'Ordinal' },
+    [MlFeatureDataType.Binary]: { icon: Binary, size: 16, text: 'Binary' },
+    [MlFeatureDataType.Count]: { icon: Hash, size: 14, text: 'Count' },
+    [MlFeatureDataType.Interval]: { icon: Clock, size: 16, text: 'Interval' },
+    [MlFeatureDataType.Image]: { icon: Image, size: 16, text: 'Image' },
+    [MlFeatureDataType.Video]: { icon: VideoCamera, size: 16, text: 'Video' },
+    [MlFeatureDataType.Audio]: { icon: Microphone, size: 16, text: 'Audio' },
+    [MlFeatureDataType.Text]: { icon: TextT, size: 18, text: 'Text' },
+    [MlFeatureDataType.Sequence]: { icon: ListNumbers, size: 16, text: 'Sequence' },
+    [MlFeatureDataType.Continuous]: { icon: ChartLine, size: 16, text: 'Continuous' },
+};
+
+type Props = {
+    dataType?: MlFeatureDataType;
+};
+
+export default function MlFeatureDataTypeIcon({ dataType }: Props) {
+    const { icon: IconComponent, size, text } = DATA_TYPE_ICON_MAP[dataType || MlFeatureDataType.Unknown];
+
+    // eslint-disable-next-line react/prop-types
+    const NativeDataTypeTooltip = ({ children }) => (
+        <Tooltip placement="top" title={capitalizeFirstLetter(text)}>
+            {children}
+        </Tooltip>
+    );
+
+    return (
+        <NativeDataTypeTooltip>
+            <TypeIconContainer>
+                {IconComponent && <Icon icon={IconComponent} style={{ fontSize: size }} />}
+                <TypeSubtitle
+                    type="span"
+                    color="textSecondary"
+                    /* eslint-disable-next-line i18next/no-literal-string -- (untranslated-text) programmatic flag value for styled-component prop, not user-facing copy */
+                    hasicon={IconComponent ? 'yes' : undefined}
+                >
+                    {text}
+                </TypeSubtitle>
+            </TypeIconContainer>
+        </NativeDataTypeTooltip>
+    );
+}
