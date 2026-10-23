@@ -38,7 +38,7 @@ jobs:
       commit_sha: ${{ steps.create_branch.outputs.commit_sha }}
     steps:
       - name: Check out release scripts
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: .github/scripts
           sparse-checkout-cone-mode: true
@@ -83,7 +83,7 @@ jobs:
           permission-workflows: write
 
       - name: Check out source commit
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.sha != '' && inputs.sha || steps.branches.outputs.source }}
           # App token required: a ref created by GITHUB_TOKEN does not trigger
@@ -144,7 +144,7 @@ jobs:
       contents: read
     steps:
       - name: Check out release scripts
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: |
             .github/scripts
